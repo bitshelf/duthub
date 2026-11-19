@@ -1,0 +1,38 @@
+[package]
+name = "duthub-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+duthub-core = { path = "../duthub-core" }
+http = "1"
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
+rmcp = { version = "=3.10.0", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+    "client",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+schemars = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "time", "sync"] }
+tower-service = "0.3"
+
+[dev-dependencies]
+rmcp = { version = "=3.10.0", features = ["transport-child-process"] }
+tempfile.workspace = true
+
+[[bin]]
+name = "duthub-mcp"
+path = "src/main.rs"

@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/duthub-core",
+    "crates/duthub-sandbox",
+    "crates/duthub-device",
+    "crates/duthub-adb",
+    "crates/duthub-control",
+    "crates/duthub-flash",
+    "crates/duthub-mcp",
+    "crates/duthub-a2a",
+    "crates/duthub-agent",
+    "crates/duthub-transfer",
+    "crates/duthub-tooldown",
+    "apps/desktop",
+]
+# Exclude standalone local reference crate.
+exclude = ["docs/rust-reference"]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+future_incompatible = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+collection_is_never_read = "warn"
+inefficient_to_string = "warn"
+flat_map_option = "warn"
+
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+gpui-kit = "0.9.1"
+reqwest = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.6"
+tempfile = "3"
+tokio = "1"
+tokio-serial = "5"
+tracing = "0.1"
+tracing-chrome = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+windows-sys = "0.61"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[profile.dev]
+# Line-tables-only debuginfo preserves backtraces while cutting Windows PDB size
+# and link time significantly in the shared repository target/ directory.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

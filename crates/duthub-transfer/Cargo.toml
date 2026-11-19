@@ -1,0 +1,37 @@
+[package]
+name = "duthub-transfer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Board image receiving endpoint: tus 1.0.0 resumable uploads published under duthub-data/images"
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3 = { version = "1.8", features = ["mmap", "rayon"] }
+chrono = { workspace = true, features = ["std"] }
+duthub-core = { path = "../duthub-core" }
+fs4 = "1.1"
+salvo = { version = "1.2.1", default-features = false, features = [
+    "fix-http1-request-uri",
+    "http1",
+    "http2",
+    "http2-cleartext",
+    "server",
+    "server-handle",
+    "tus",
+] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+bytes = "1"
+futures-util = { version = "0.3", default-features = false }
+reqwest = { workspace = true, features = ["json", "stream", "http2"] }

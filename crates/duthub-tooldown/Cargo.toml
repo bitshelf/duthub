@@ -1,0 +1,24 @@
+[package]
+name = "duthub-tooldown"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tool download kernel: pinned-sha256 HTTP downloads, zip-safe extraction and atomic installs for external tools (adb, ffmpeg, ...)"
+
+[lints]
+workspace = true
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+reqwest = { workspace = true, features = ["rustls", "socks"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+tracing.workspace = true
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net"] }

@@ -1,0 +1,40 @@
+﻿# z-order walk debug
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class ZD {
+  [DllImport("user32.dll")] public static extern IntPtr GetTopWindow();
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int idx);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder t, int c);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  public struct RECT { public int L, T, R, B; }
+}
+"@
+$h = [ZD]::GetTopWindow()
+Write-Output ("top hwnd: " + $h)
+$count = 0
+$printed = 0
+while ($h -ne [IntPtr]::Zero -and $count -lt 80) {
+    $p2 = 0
+    [ZD]::GetWindowThreadProcessId($h, [ref]$p2) | Out-Null
+    $proc = Get-Process -Id $p2 -ErrorAction SilentlyContinue
+    $pn = if ($proc) { $proc.ProcessName } else { "?" }
+    $sb = New-Object System.Text.StringBuilder 128
+    [ZD]::GetWindowText($h, $sb, 128) | Out-Null
+    $r = New-Object ZD+RECT
+    [ZD]::GetWindowRect($h, [ref]$r) | Out-Null
+    $ex = [ZD]::GetWindowLong($h, -20)
+    $vis = [ZD]::IsWindowVisible($h)
+    $area = ($r.R - $r.L) * ($r.B - $r.T)
+    if ($vis -and $area -gt 5000 -and $printed -lt 25) {
+        Write-Output ('z{0} pid={1} proc={2} vis={3} ex=0x{4:X} rect=({5},{6})-({7},{8}) title=[{9}] hwnd={10}' -f $count, $p2, $pn, $vis, $ex, $r.L, $r.T, $r.R, $r.B, $sb.ToString(), $h)
+        $printed++
+    }
+    $h = [ZD]::GetWindow($h, 2)
+    $count++
+}
+Write-Output ("iterated: " + $count + " printed: " + $printed)

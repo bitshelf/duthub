@@ -1,0 +1,70 @@
+[package]
+name = "duthub-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "duthub_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "duthub"
+path = "src/main.rs"
+
+[features]
+default = ["no-console", "real-hardware"]
+no-console = []
+real-hardware = ["duthub-device/real-hardware", "duthub-control/real-hardware"]
+
+[dependencies]
+alacritty_terminal.workspace = true
+axum.workspace = true
+chrono.workspace = true
+duthub-a2a = { path = "../../crates/duthub-a2a" }
+duthub-adb = { path = "../../crates/duthub-adb" }
+duthub-agent = { path = "../../crates/duthub-agent" }
+duthub-control = { path = "../../crates/duthub-control", optional = true }
+duthub-core = { path = "../../crates/duthub-core" }
+duthub-device = { path = "../../crates/duthub-device" }
+duthub-flash = { path = "../../crates/duthub-flash" }
+duthub-mcp = { path = "../../crates/duthub-mcp" }
+duthub-sandbox = { path = "../../crates/duthub-sandbox" }
+duthub-tooldown = { path = "../../crates/duthub-tooldown" }
+futures-util = "0.3"
+gpui-kit.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+nucleo-matcher = "0.3.1"
+portable-pty = "0.9"
+raw-window-handle = "0.6"
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true
+smallvec = "1"
+sys-locale = "0.3"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tracing.workspace = true
+tracing-chrome.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winresource = "0.1"

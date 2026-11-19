@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# duthub 统一回归门槛（docs/README.md）
+# Local checks do not open the desktop window unless requested.
+set -euo pipefail
+usage="Usage: scripts/regression [--desktop-self-test]"
+desktop_self_test=false
+case "$#:${1:-}" in
+    0:) ;;
+    1:--desktop-self-test) desktop_self_test=true ;;
+    1:--help|1:-h) echo "$usage"; exit 0 ;;
+    *) echo "$usage" >&2; exit 2 ;;
+esac
+# Resolve the repository root with shell builtins only. When Git Bash is spawned
+# directly by a Windows process, PATH may not contain the MSYS bin directory, so
+# `dirname` fails and `cd` silently lands in an unrelated directory.
+case "$0" in
+    */*) script_dir="${0%/*}" ;;
+    *) script_dir=. ;;
+esac
+cd "$script_dir/.."
+if [ ! -f Cargo.toml ]; then
+    echo "regression: Cargo.toml not found in $PWD" >&2
+    exit 1
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+# This host commits about 72 GiB and the desktop PDB alone is ~760 MiB, so a
+# default 16-way build exhausts the commit charge and rustc dies with
+# E0786 "failed to mmap ... page file too small (os error 1455)" while reading
+# large rlibs. Cap build parallelism; callers can still override the value.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+echo "cargo build jobs: $CARGO_BUILD_JOBS"
+
+steps=3
+if $desktop_self_test; then
+    steps=4
+fi
+
+echo "[1/$steps] cargo fmt --check"
+cargo fmt --all --check
+
+echo "[2/$steps] cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "[3/$steps] cargo test --workspace"
+cargo test --workspace --quiet
+
+if $desktop_self_test; then
+    echo "[4/$steps] desktop self-test"
+    cargo run -q -p duthub-desktop -- --self-test
+fi
+
+echo "REGRESSION OK"

@@ -1,0 +1,67 @@
+duthub
+======
+
+Copyright 2026 the duthub contributors
+
+duthub is licensed under the Apache License, Version 2.0. See LICENSE for the
+full license text.
+
+Third-party component: goose (downloaded at the user's request)
+--------------------------------------------------------------
+
+duthub does not bundle, embed or redistribute goose. The goose agent CLI from
+the AAIF/goose project (formerly block/goose) is installed on demand through the
+in-app "tool downloads" page, using duthub's own downloader (duthub-tooldown),
+and runs as a separate process. No goose bytes are compiled into `duthub.exe`
+or shipped next to it.
+
+  Source:    https://github.com/aaif-goose/goose
+  Release:   https://github.com/aaif-goose/goose/releases
+  Artifact:  goose-x86_64-pc-windows-msvc.zip (rolling "latest" release asset)
+  License:   Apache License, Version 2.0
+  Copyright: Copyright the AAIF/goose contributors
+
+The downloaded program is not modified by duthub. The full Apache-2.0 license
+text and any upstream NOTICE ship with the upstream release package, which is
+the copy installed on this machine (and are also available from the source URL
+above).
+
+duthub does not pin a checksum for the rolling asset. The installer records the
+measured SHA-256 of the downloaded archive in
+`<config dir>/tools/goose/manifest.json` and marks it `checksumVerified: false`
+(unverified download, stated honestly); the runtime re-hashes the installed
+executable against that record before launch. Version gate: >= 1.60.2.
+
+Each release ships a machine-readable provenance statement as
+`licenses/goose/PROVENANCE.md` (source: `apps/desktop/assets/goose-distribution.md`).
+See `docs/decisions/ADR-3-GOOSE-BUNDLE.md` §9 for the distribution contract and
+`scripts/release-gate.ps1` for the release checks.
+
+Third-party Rust crates inside duthub itself are covered by the CycloneDX SBOM
+and cargo-audit report shipped under `sbom/`. Third-party crates inside goose
+are the upstream release's responsibility; duthub does not audit them at release
+time and says so explicitly (`sbom/goose-audit-status.txt` is marked
+UNVERIFIED).
+
+--------------------------------------------------------------------------------
+openai/codex — codex-rs/windows-sandbox-rs (Apache-2.0)
+
+Portions of `crates/duthub-sandbox/src/windows/` are derived from the
+openai/codex project, `codex-rs/windows-sandbox-rs`:
+  https://github.com/openai/codex/tree/main/codex-rs/windows-sandbox-rs
+  Copyright OpenAI and contributors, licensed under the Apache License 2.0.
+
+Derived files (each carries a header naming this provenance):
+  src/windows/identity.rs       (identity.rs, setup.rs)
+  src/windows/dpapi.rs          (dpapi.rs)
+  src/windows/token.rs          (token.rs, cap.rs)
+  src/windows/deny_read_acl.rs  (deny_read_acl.rs)
+  src/windows/no_reparse_dir.rs (no_reparse_dir.rs)
+  src/windows/process.rs        (process.rs — process creation and stdio plumbing)
+
+Changes made by duthub: the AppContainer cell policy, the per-DUT capability
+store moved out of the writable cell, `SandboxError`-based fail-closed error
+handling, and the `status()` capability probe. duthub does not vendor or run
+Codex itself; only these mechanisms were ported.
+
+Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0

@@ -1,0 +1,24 @@
+[package]
+name = "duthub-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+duthub-core = { path = "../duthub-core" }
+tokio = { workspace = true, features = ["rt", "sync", "time", "io-util", "macros"] }
+tokio-serial = { workspace = true, optional = true }
+serialport = { version = "4", optional = true, default-features = false }
+
+[features]
+default = []
+real-hardware = ["dep:tokio-serial", "dep:serialport"]
+
+[dev-dependencies]
+duthub-device = { path = "../duthub-device" }
+tokio = { workspace = true, features = ["test-util"] }

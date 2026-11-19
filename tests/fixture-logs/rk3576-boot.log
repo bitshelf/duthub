@@ -1,0 +1,10 @@
+[  0.000000] Linux version 6.1.118 (builder@lab) (aarch64-linux-gnu-gcc) #1 SMP PREEMPT
+[  0.412003] Machine model: Rockchip RK3576 board
+[  0.988441] eMMC: mmc1: new high speed DDR52 card
+[  1.201556] usb 2-1.1: new high-speed USB device number 3 using xhci-hcd
+[  1.644203] usb 2-1.1: USB Serial Device converter registered
+[  2.004117] random: crng init done
+[  2.512004] EXT4-fs (mmcblk1p5): mounted filesystem with ordered data mode
+[  3.088001] systemd[1]: Detected architecture arm64.
+[  3.512009] systemd[1]: Started Serial Getty on ttyS2.
+[  4.100322] Network interface eth0 configured (10.66.7.20).

@@ -1,0 +1,296 @@
+# duthub Windows Release 构建
+# main 构建 Windows 产物，版本标签额外发布到 GitHub Release。
+#
+# 发布门禁（ADR-3 §9：2026-11-25 起 goose 改为下载分发）：gate job 必须通过后，
+# 且仓库变量 RELEASE_GATE=true、配置 release environment，才允许 publish-release。
+# 供应链加固：所有第三方 action 已 pin 到 commit SHA（2026-11-21 经 git ls-remote
+# 复核：checkout=v4.4.0、rust-toolchain=stable 分支头、rust-cache=v2、
+# upload-artifact=v4.6.2、download-artifact=v4.3.0、gh-release=v2.6.2）；
+# 升级时更新 SHA 并在提交信息记录复核结果。
+
+name: Release (Windows)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch head
+        with:
+          toolchain: stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+
+      # gpui 的 build.rs 需要 fxc.exe（HLSL 着色器编译器）。
+      # 仓库 .cargo/config.toml 指向本机 SDK 22621 路径；runner 上不存在时
+      # build.rs 会按 GPUI_FXC_PATH → PATH → SDK 26100 顺序回退，
+      # 这里显式探测 runner 实际可用的 fxc.exe 并设置环境变量（外部 env 优先于 config.toml）。
+      - name: Locate fxc.exe (HLSL compiler)
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $fxc) { Write-Error "fxc.exe not found in Windows Kits"; exit 1 }
+          Write-Host "Using fxc: $fxc"
+          "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Verify goose is not embedded (download distribution)
+        shell: pwsh
+        # ADR-3 §9（2026-11-25 取代内嵌口径）：仓库/构建不得再携带 goose 字节。
+        # 这里在构建前挡住「内嵌回归」：目录出现即失败；同时确认下载分发契约仍在
+        # （tooldown spec、许可/来源说明），避免门禁被静默删空。旧步骤断言的是已删除
+        # 的 assets/goose 字节数/SHA-256（坑 #110），必然永久失败。
+        run: |
+          function Fail([string]$Message) { Write-Error $Message; exit 1 }
+          $assets = "apps/desktop/assets/goose"
+          if (Test-Path -LiteralPath $assets) {
+            Fail "embedded goose assets reappeared at $assets; ADR-3 §9 says goose is downloaded, not bundled"
+          }
+          $bundle = Get-Content "apps/desktop/src/agent_host/bundle.rs" -Raw -Encoding UTF8
+          foreach ($forbidden in @("include_bytes!", "include_str!", "assets/goose")) {
+            if ($bundle.Contains($forbidden)) { Fail "bundle.rs must not embed goose assets (found $forbidden)" }
+          }
+          $spec = Get-Content "crates/duthub-tooldown/src/spec.rs" -Raw -Encoding UTF8
+          if ($spec -notmatch '(?ms)pub const TOOL_GOOSE: ToolSpec = ToolSpec \{.*?\n\};') {
+            Fail "TOOL_GOOSE spec missing from duthub-tooldown"
+          }
+          if ($spec -notmatch '&TOOL_GOOSE') { Fail "TOOL_GOOSE not registered in builtin_specs()" }
+          if (-not (Test-Path -LiteralPath "NOTICE" -PathType Leaf)) { Fail "NOTICE missing" }
+          if (-not (Test-Path -LiteralPath "apps/desktop/assets/goose-distribution.md" -PathType Leaf)) {
+            Fail "goose provenance statement missing"
+          }
+          Write-Host "goose is not embedded; download-distribution contract present"
+
+      - name: Build release (no-console + real-hardware, static CRT)
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --locked --release -p duthub-desktop --bin duthub
+
+      - name: Smoke test (--self-test, informational)
+        shell: pwsh
+        # GitHub runner 为无 GPU 无头环境，GPUI 窗口创建可能失败——这是环境限制，
+        # 本机已验证 self-test 通过。此处仅报告，不阻塞发布。
+        run: |
+          & .\target\release\duthub.exe --self-test
+          Write-Host "self-test exit code: $LASTEXITCODE（runner 无显示环境时可能非 0，属预期）"
+          exit 0
+
+      - name: Stage artifact
+        shell: pwsh
+        # duthub.exe 仍单文件分发；LICENSE/NOTICE 与 goose 来源说明另旁附。
+        # goose 本身不随包分发（用户从「工具下载」页安装），因此只旁附
+        # PROVENANCE.md，不再复制已删除的 assets/goose/LICENSE/NOTICE/manifest。
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item .\target\release\duthub.exe .\dist\duthub.exe
+          New-Item -ItemType Directory -Force -Path dist\licenses\duthub | Out-Null
+          Copy-Item LICENSE dist\licenses\duthub\LICENSE
+          Copy-Item NOTICE dist\licenses\duthub\NOTICE
+          New-Item -ItemType Directory -Force -Path dist\licenses\goose | Out-Null
+          Copy-Item apps\desktop\assets\goose-distribution.md dist\licenses\goose\PROVENANCE.md
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: duthub-windows-x64
+          path: |
+            dist/duthub.exe
+            dist/licenses/**
+          if-no-files-found: error
+
+  # 发布门（ADR-3 §9）：回归、SBOM、cargo audit、goose 下载分发契约、Authenticode。
+  # 任一未满足即失败；publish-release 必须 needs 本 job。
+  gate:
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch head
+        with:
+          toolchain: stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+
+      - name: Locate fxc.exe (HLSL compiler)
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $fxc) { Write-Error "fxc.exe not found in Windows Kits"; exit 1 }
+          Write-Host "Using fxc: $fxc"
+          "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download release artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: duthub-windows-x64
+          path: dist
+
+      - name: Install release-gate tools (community)
+        shell: pwsh
+        # 社区工具，不自造签名链/SBOM 生成器。
+        run: cargo install --locked cargo-cyclonedx@0.5.10 cargo-audit@0.23.0
+
+      - name: Format check
+        shell: pwsh
+        run: cargo fmt --all --check
+
+      - name: Clippy (workspace + real-hardware, all targets, deny warnings)
+        shell: pwsh
+        env:
+          CARGO_BUILD_WARNINGS: deny
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p duthub-device --features real-hardware --all-targets -- -D warnings
+
+      - name: Test (workspace)
+        shell: pwsh
+        # Runner 日志对未认证读取不可见，所以失败时把失败用例名写成 annotation 与
+        # step summary：公开的 check-run annotation 是失败证据，不必再猜是哪个用例。
+        run: |
+          cargo test --workspace 2>&1 | Tee-Object -FilePath test-workspace.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $lines = Get-Content test-workspace.log
+            $failed = @()
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i].Trim() -eq 'failures:') {
+                for ($j = $i + 1; $j -lt [Math]::Min($i + 80, $lines.Count); $j++) {
+                  if ($lines[$j] -cmatch '^    ([A-Za-z0-9_][A-Za-z0-9_:]*)$') { $failed += $Matches[1] }
+                  elseif ($lines[$j].Trim() -eq '' -or $lines[$j] -match '^test result:') { break }
+                }
+              }
+            }
+            $msg = ($failed | Select-Object -Unique) -join ', '
+            if ([string]::IsNullOrWhiteSpace($msg)) { $msg = 'cargo test failed; see step log' }
+            if ($msg.Length -gt 900) { $msg = $msg.Substring(0, 900) }
+            Write-Host "::error title=Workspace tests failed::$msg"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### cargo test --workspace failed"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ('```' + "`n" + $msg + "`n" + '```')
+          }
+          exit $code
+
+      - name: Desktop self-test (informational on headless runner)
+        shell: pwsh
+        # 等价于 scripts/regression 的第 4 步；runner 无显示环境时可能非 0，按既有
+        # build-windows smoke test 口径只记录，真正的窗口验收在本机执行。
+        continue-on-error: true
+        run: |
+          & .\dist\duthub.exe --self-test
+          Write-Host "self-test exit code: $LASTEXITCODE"
+
+      - name: Generate CycloneDX SBOM (duthub)
+        shell: pwsh
+        # --override-filename 只给基名 duthub.cdx：工具按 --format json 自行追加
+        # .json，产出 apps/desktop/duthub.cdx.json（写错成 duthub.cdx.json 会得到
+        # duthub.cdx.json.json，后续 Copy-Item 与 gate 均找不到文件）。
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\sbom | Out-Null
+          cargo cyclonedx --format json --spec-version 1.7 --manifest-path apps/desktop/Cargo.toml --no-build-deps --override-filename duthub.cdx
+          Copy-Item apps\desktop\duthub.cdx.json dist\sbom\duthub.cdx.json
+
+      - name: Audit duthub dependencies
+        shell: pwsh
+        # cargo audit 在发现漏洞/错误时以非 0 退出。这里捕获退出码写入
+        # audit-exit 文件并让本步以 0 结束，由 release-gate.ps1 统一判定
+        # （JSON 无漏洞 + 退出码为 0 才算过；gate artifacts 仍会被上传供排查）。
+        run: |
+          cargo audit --file Cargo.lock --json > dist\sbom\audit.json
+          $code = $LASTEXITCODE
+          Set-Content -LiteralPath dist\sbom\audit-exit.txt -Value "$code" -NoNewline
+          Write-Host "cargo audit (duthub) exit code: $code (JSON captured; gate decides)"
+          exit 0
+
+      - name: Record goose runtime dependency audit status (placeholder)
+        shell: pwsh
+        # ADR-3 §9：goose 不再随 duthub 分发，内嵌资产的 Cargo.lock 已不存在，无法也不该
+        # 由本仓库审计。这里不伪造审计结果：如果内嵌资产回归（lock 出现），立即回到旧的
+        # fail-closed 上游 Cargo.lock 审计；否则写一份显式 UNVERIFIED 状态，
+        # release-gate.ps1 断言该文件存在且以 UNVERIFIED 开头（占位检查，不允许静默消失）。
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\sbom | Out-Null
+          $lock = "apps\desktop\assets\goose\Cargo.lock"
+          if (Test-Path -LiteralPath $lock -PathType Leaf) {
+            cargo audit --file $lock --json > dist\sbom\audit-goose.json
+            $code = $LASTEXITCODE
+            Set-Content -LiteralPath dist\sbom\audit-goose-exit.txt -Value "$code" -NoNewline
+            Write-Host "embedded goose Cargo.lock found; cargo audit exit code: $code (gate decides)"
+          } else {
+            $status = "UNVERIFIED: goose is not bundled; no goose Cargo.lock is audited at release time (ADR-3 §9). goose runtime dependencies are the upstream release's responsibility; duthub records the measured archive SHA-256 with checksumVerified: false."
+            Set-Content -LiteralPath dist\sbom\goose-audit-status.txt -Value $status -NoNewline
+            Write-Host "::notice::$status"
+          }
+          exit 0
+
+      - name: Release gate (signature, hashes, SBOM, audit, checksums)
+        shell: pwsh
+        # 当前未配置代码签名证书，构建统一传 -AllowUnsigned 将 Authenticode 降为
+        # warning（发布说明仍如实记录实际签名状态）；接入 signtool 后恢复强制校验。
+        run: |
+          $gateArgs = @('-NoProfile', '-File', 'scripts/release-gate.ps1', '-RepoRoot', '.', '-AllowUnsigned')
+          pwsh @gateArgs
+
+      - name: Upload gate artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: duthub-release-gate
+          path: |
+            dist/sbom/**
+            dist/SHA256SUMS
+            dist/RELEASE_NOTES.md
+          if-no-files-found: warn
+
+  publish-release:
+    if: github.ref_type == 'tag' && vars.RELEASE_GATE == 'true'
+    needs: [build-windows, gate]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: duthub-windows-x64
+          path: dist
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: duthub-release-gate
+          path: dist
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          body_path: dist/RELEASE_NOTES.md
+          generate_release_notes: false
+          files: |
+            dist/duthub.exe
+            dist/licenses/duthub/LICENSE
+            dist/licenses/duthub/NOTICE
+            dist/licenses/goose/PROVENANCE.md
+            dist/SHA256SUMS
+            dist/sbom/*

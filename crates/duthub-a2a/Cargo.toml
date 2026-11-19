@@ -1,0 +1,30 @@
+[package]
+name = "duthub-a2a"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Per-DUT A2A loopback surface: Agent Card, JSON-RPC task gate and evidence executor"
+
+[lints]
+workspace = true
+
+[dependencies]
+a2a-lf = "=0.4.2"
+a2a-server-lf = { version = "=0.5.3", default-features = false }
+async-trait.workspace = true
+axum.workspace = true
+duthub-core = { path = "../duthub-core" }
+duthub-mcp = { path = "../duthub-mcp" }
+futures = "0.3"
+rmcp = { version = "=3.10.0", features = ["client", "server", "transport-io"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tower-http = { version = "0.6", features = ["limit"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

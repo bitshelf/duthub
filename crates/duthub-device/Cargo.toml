@@ -1,0 +1,30 @@
+[package]
+name = "duthub-device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+duthub-core = { path = "../duthub-core" }
+regex = "1"
+serde_json.workspace = true
+strsim = "0.11"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio-serial = { workspace = true, optional = true }
+tracing.workspace = true
+zerocopy.workspace = true
+
+[features]
+default = []
+real-hardware = ["dep:tokio-serial"]
+
+[dev-dependencies]
+duthub-control = { path = "../duthub-control", features = ["real-hardware"] }
+tempfile.workspace = true
