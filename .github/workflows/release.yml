@@ -1,0 +1,86 @@
+# duthub Windows Release 构建
+# main 构建 Windows 产物，版本标签额外发布到 GitHub Release。
+
+name: Release (Windows)
+
+on:
+  push:
+    branches: [main]
+    tags: ["0.01", "v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust build cache
+        uses: swatinem/rust-cache@v2
+
+      # gpui 的 build.rs 需要 fxc.exe（HLSL 着色器编译器）。
+      # 仓库 .cargo/config.toml 指向本机 SDK 22621 路径；runner 上不存在时
+      # build.rs 会按 GPUI_FXC_PATH → PATH → SDK 26100 顺序回退，
+      # 这里显式探测 runner 实际可用的 fxc.exe 并设置环境变量（外部 env 优先于 config.toml）。
+      - name: Locate fxc.exe (HLSL compiler)
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $fxc) { Write-Error "fxc.exe not found in Windows Kits"; exit 1 }
+          Write-Host "Using fxc: $fxc"
+          "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build release (no-console + real-hardware, static CRT)
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --locked --release -p duthub-desktop --bin duthub
+
+      - name: Smoke test (--self-test, informational)
+        shell: pwsh
+        # GitHub runner 为无 GPU 无头环境，GPUI 窗口创建可能失败——这是环境限制，
+        # 本机已验证 self-test 通过。此处仅报告，不阻塞发布。
+        run: |
+          & .\target\release\duthub.exe --self-test
+          Write-Host "self-test exit code: $LASTEXITCODE（runner 无显示环境时可能非 0，属预期）"
+          exit 0
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item .\target\release\duthub.exe .\dist\duthub.exe
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duthub-windows-x64
+          path: dist/duthub.exe
+          if-no-files-found: error
+
+  publish-release:
+    if: github.ref_type == 'tag'
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: duthub-windows-x64
+          path: dist
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/duthub.exe
+          generate_release_notes: true

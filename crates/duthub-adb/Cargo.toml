@@ -1,0 +1,10 @@
+[package]
+name = "duthub-adb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duthub-core = { path = "../duthub-core" }
+async-trait = "0.1"
+mozdevice = "0.5.5"

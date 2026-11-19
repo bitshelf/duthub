@@ -1,0 +1,14 @@
+[   42.900312]Unable to handle kernel paging request at virtual address ffffff8001234000
+[   42.901001]Mem abort info:
+[   42.901221]  ESR = 0x96000047
+[   42.902000]Oops: 96000047
+[   42.902330]CPU: 3 PID: 1289 Comm: tester Tainted: G O 6.1.118 #1
+[   42.903001]Hardware name: Rockchip RK3576 (DT)
+[   42.903988]pstate: 604000c9 (nZCv daIF +PAN -UAO -TCO -DIT -SSBS BTYPE=--)
+[   42.904551]pc : rockchip_test_write+0x2c/0x98 [rk_test]
+[   42.905002]lr : rk_test_ioctl+0x88/0x120 [rk_test]
+[   42.906000]Call trace:
+[   42.906100] rockchip_test_write+0x2c/0x98 [rk_test]
+[   42.906800] __arm64_sys_ioctl+0xa8/0x100
+[   42.907400]Kernel panic - not syncing: Fatal exception
+[   42.908001]Rebooting in 5 seconds..

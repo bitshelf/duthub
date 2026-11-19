@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/duthub-core",
+    "crates/duthub-device",
+    "crates/duthub-adb",
+    "crates/duthub-control",
+    "crates/duthub-flash",
+    "crates/duthub-mcp",
+    "crates/duthub-agent",
+    "apps/desktop",
+    "apps/tui",
+]
+# 排除本地保留的独立参考 crate。
+exclude = ["docs/rust-reference"]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 性能调试：tracing 门面 + Chrome Trace 导出（json 可直接拖进 ui.perfetto.dev）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-chrome = "0.7"
+
+# UI：GPUI 钉死版本（升级必须是独立任务并跑全量回归，见 IMPLEMENTATION_PLAN 风险表）
+gpui-kit = "0.9.1"

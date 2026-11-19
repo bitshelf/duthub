@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "hosts": [
+    {
+      "id": "windows-pc",
+      "label": "Windows · WORKSTATION",
+      "platform": "windows",
+      "address": "localhost",
+      "ports": [
+        {
+          "id": "COM3",
+          "detail": "USB-SERIAL CH340",
+          "vid": "1A86:7523"
+        },
+        {
+          "id": "COM7",
+          "detail": "Silicon Labs CP2102",
+          "vid": "10C4:EA60"
+        },
+        {
+          "id": "COM12",
+          "detail": "FTDI FT232R",
+          "vid": "0403:6001"
+        }
+      ],
+      "adbDevices": [
+        {
+          "id": "RK3576USB002",
+          "detail": "RK3576-02 · USB",
+          "state": "device"
+        },
+        {
+          "id": "A12BC34D5678",
+          "detail": "RK3576 · USB",
+          "state": "device"
+        }
+      ]
+    },
+    {
+      "id": "wayland-pc",
+      "label": "Wayland · DEV-PC",
+      "platform": "wayland",
+      "address": "localhost",
+      "ports": [
+        {
+          "id": "/dev/ttyUSB0",
+          "detail": "USB-SERIAL CH340",
+          "vid": "1A86:7523"
+        },
+        {
+          "id": "/dev/ttyUSB1",
+          "detail": "FTDI FT232R",
+          "vid": "0403:6001"
+        },
+        {
+          "id": "/dev/ttyACM0",
+          "detail": "USB CDC ACM",
+          "vid": "0483:5740"
+        }
+      ],
+      "adbDevices": [
+        {
+          "id": "RK3576USB003",
+          "detail": "RK3576-03 · USB",
+          "state": "device"
+        }
+      ]
+    },
+    {
+      "id": "lab-host-01",
+      "label": "Remote · lab-host-01",
+      "platform": "linux",
+      "address": "lab-host-01",
+      "ports": [
+        {
+          "id": "/dev/ttyUSB0",
+          "detail": "USB-SERIAL CH340",
+          "vid": "1A86:7523"
+        },
+        {
+          "id": "/dev/ttyUSB1",
+          "detail": "CP210x USB to UART",
+          "vid": "10C4:EA60"
+        },
+        {
+          "id": "/dev/ttyUSB2",
+          "detail": "CH340 Relay Adapter",
+          "vid": "1A86:7523"
+        }
+      ],
+      "adbDevices": [
+        {
+          "id": "ADB-LAB-001",
+          "detail": "DUT A · USB",
+          "state": "device"
+        },
+        {
+          "id": "ADB-LAB-002",
+          "detail": "DUT B · USB",
+          "state": "device"
+        }
+      ]
+    }
+  ],
+  "duts": [
+    {
+      "id": "d1",
+      "name": "RK3576",
+      "serial": {
+        "host": "wayland-pc",
+        "port": "/dev/ttyUSB0",
+        "baud": 115200,
+        "format": "8N1"
+      },
+      "adb": {
+        "mode": "usb",
+        "host": "wayland-pc",
+        "serial": "RK3576USB003"
+      },
+      "relay": {
+        "mode": "usb_serial",
+        "host": "wayland-pc",
+        "node": "/dev/ttyUSB1",
+        "driver": "CH340",
+        "channels": {
+          "power": 4,
+          "reset": 1,
+          "recovery": 3,
+          "maskrom": 2
+        }
+      },
+      "mcp": {
+        "transport": "streamable_http",
+        "url": "http://127.0.0.1:8787/mcp"
+      },
+      "flash": {
+        "executable": "upgrade_tool",
+        "testArgs": [
+          "--help"
+        ]
+      }
+    }
+  ]
+}

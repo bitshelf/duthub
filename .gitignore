@@ -1,0 +1,33 @@
+# Rust
+target/
+**/target/
+
+# Node (历史遗留防御)
+node_modules/
+
+# Python venv (遗留原型防御)
+.venv/
+
+# 构建产物
+dist/
+
+# 本地私有配置
+*.local.json
+.duthub/
+
+# IDE
+.idea/
+.vscode/
+
+# 运行时数据与便携产物
+duthub-data/
+duthub-GUI.exe
+/.zcode/
+__pycache__/
+/captures/
+/test-output/
+/docs/ARCHITECTURE_REVIEW.md
+/docs/AGENT_ACCESS_CONTROL_PLAN.md
+/docs/MCP_TEST_REPORT.md
+/docs/rust-reference/
+/scripts/mcp-fix-gate.sh

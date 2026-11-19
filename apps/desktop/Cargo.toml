@@ -1,0 +1,42 @@
+[package]
+name = "duthub-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "duthub"
+path = "src/main.rs"
+
+[features]
+default = ["no-console", "real-hardware"]
+no-console = []
+# real-hardware：真实串口会话（duthub-device）+ CH340 继电器驱动（duthub-control）
+real-hardware = ["duthub-device/real-hardware", "duthub-control/real-hardware"]
+
+[dependencies]
+duthub-core = { path = "../../crates/duthub-core" }
+duthub-adb = { path = "../../crates/duthub-adb" }
+duthub-flash = { path = "../../crates/duthub-flash" }
+duthub-device = { path = "../../crates/duthub-device" }
+duthub-control = { path = "../../crates/duthub-control", optional = true }
+duthub-mcp = { path = "../../crates/duthub-mcp" }
+tokio = { version = "1", features = ["rt", "net", "sync", "time"] }
+axum = "0.8"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+gpui-kit.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-chrome.workspace = true
+serde_json = "1"
+regex = "1"
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
+sys-locale = "0.3"
+
+
+[build-dependencies]
+winresource = "0.1"

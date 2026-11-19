@@ -1,0 +1,21 @@
+[package]
+name = "duthub-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duthub-core = { path = "../duthub-core" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "io-util", "macros"] }
+
+# 真实继电器串口（与 duthub-device 相同的 tokio-serial 栈；serialport 仅用于错误分类）
+tokio-serial = { version = "5", optional = true }
+serialport = { version = "4", optional = true, default-features = false }
+
+[features]
+default = []
+real-hardware = ["dep:tokio-serial", "dep:serialport"]
+
+[dev-dependencies]
+duthub-device = { path = "../duthub-device" }

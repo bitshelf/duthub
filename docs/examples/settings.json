@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "appearance": {
+    "theme": "dark",
+    "language": "system",
+    "platform": "wayland"
+  },
+  "terminal": {
+    "jumpToLatest": true,
+    "showCommandBar": true,
+    "tabNumbers": false,
+    "tabStatusIcons": true,
+    "includeAnsi": false,
+    "promptHighlight": {
+      "regex": "",
+      "color": "#edbe7a"
+    }
+  },
+  "commands": [
+    {
+      "name": "uname",
+      "value": "uname -a",
+      "icon": "terminal"
+    },
+    {
+      "name": "dmesg",
+      "value": "dmesg | tail -n 30",
+      "icon": "file-text"
+    },
+    {
+      "name": "reboot",
+      "value": "reboot",
+      "icon": "power"
+    }
+  ],
+  "flashTools": [
+    {
+      "name": "upgrade_tool",
+      "executable": "upgrade_tool",
+      "testArgs": "--help"
+    }
+  ],
+  "agent": {
+    "provider": "claude",
+    "fast": "haiku",
+    "slow": "opus",
+    "secondary": "",
+    "turns": 10,
+    "parallel": 4,
+    "compare": false,
+    "approve": true
+  },
+  "tools": {
+    "adbExecutable": "adb"
+  }
+}

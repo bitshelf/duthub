@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# duthub 统一回归门槛（docs/IMPLEMENTATION_PLAN.md §2.4）
+# 用法：scripts/regression  —— 全部通过输出 REGRESSION OK 并退出 0。
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
+
+echo "[1/4] cargo fmt --check"
+cargo fmt --all --check
+
+echo "[2/4] cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "[3/4] cargo test --workspace"
+cargo test --workspace --quiet
+
+echo "[4/4] desktop self-test"
+cargo run -q -p duthub-desktop -- --self-test
+
+echo "REGRESSION OK"

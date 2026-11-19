@@ -1,0 +1,5 @@
+# gpui 0.2.2 的 Windows build.rs 需要 fxc.exe（HLSL 着色器编译器）。
+# 它只查 GPUI_FXC_PATH / PATH / 硬编码的 SDK 10.0.26100；本机装的是 10.0.22621，故在此显式指定。
+# 若未来升级 Windows SDK，请同步更新此路径。
+[env]
+GPUI_FXC_PATH = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe'
