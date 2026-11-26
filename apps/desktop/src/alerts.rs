@@ -83,6 +83,10 @@ pub enum AlertSource {
     AgentNotice,
     /// Serial RX bytes look like a baud-rate mismatch (per-DUT opt-in).
     SerialGarbled,
+    /// Bound HDMI / capture device disconnected.
+    Media,
+    /// Bound USB debug (ADB / HDC) device disconnected.
+    UsbDebug,
 }
 
 impl AlertSource {
@@ -97,6 +101,8 @@ impl AlertSource {
             AlertSource::Relay => "relay",
             AlertSource::AgentNotice => "agentNotice",
             AlertSource::SerialGarbled => "serialGarbled",
+            AlertSource::Media => "media",
+            AlertSource::UsbDebug => "usbDebug",
         }
     }
 
@@ -111,6 +117,8 @@ impl AlertSource {
             "relay" => Some(AlertSource::Relay),
             "agentNotice" => Some(AlertSource::AgentNotice),
             "serialGarbled" => Some(AlertSource::SerialGarbled),
+            "media" => Some(AlertSource::Media),
+            "usbDebug" => Some(AlertSource::UsbDebug),
             _ => None,
         }
     }
@@ -126,6 +134,8 @@ impl AlertSource {
             AlertSource::Relay => crate::i18n::label("relaySource"),
             AlertSource::AgentNotice => crate::i18n::label("agentNoticeSource"),
             AlertSource::SerialGarbled => crate::i18n::label("serialGarbledSource"),
+            AlertSource::Media => crate::i18n::label("mediaSource"),
+            AlertSource::UsbDebug => crate::i18n::label("usbDebugSource"),
         }
     }
 }
@@ -283,6 +293,13 @@ impl AlertCenter {
         detail: impl Into<String>,
     ) -> Result<(), ReportRejection> {
         self.report_checked_at_for(now_unix_ms(), dut_id, source, level, title, detail)
+    }
+
+    /// Clear the dedup window for `(dut_id, source)` after a device recovers so
+    /// a subsequent disconnect alerts immediately instead of being dropped inside
+    /// [`DEDUP_WINDOW`].
+    pub fn clear_dedup_for(&mut self, dut_id: &str, source: AlertSource) {
+        self.last_accepted.remove(&(dut_id.to_owned(), source));
     }
 
     /// Non-mutating pre-flight in the fixed rejection order
@@ -578,6 +595,40 @@ pub fn agent_notice_alert_texts(title: Option<&str>, message: &str) -> (String, 
     (title.to_string(), message.to_string())
 }
 
+/// Alert texts for a disconnected HDMI / capture device.
+pub fn media_disconnect_alert_texts(
+    dut_name: &str,
+    source_label: &str,
+    device_name: &str,
+) -> (String, String) {
+    (
+        crate::i18n::label("mediaDisconnectedAlert").into(),
+        crate::i18n::message(
+            "mediaDisconnectedDetail",
+            &[
+                ("dut", dut_name),
+                ("source", source_label),
+                ("device", device_name),
+            ],
+        ),
+    )
+}
+
+/// Alert texts for a disconnected USB debug (ADB / HDC) device.
+pub fn usb_debug_disconnect_alert_texts(
+    dut_name: &str,
+    tool: &str,
+    serial: &str,
+) -> (String, String) {
+    (
+        crate::i18n::label("usbDebugDisconnectedAlert").into(),
+        crate::i18n::message(
+            "usbDebugDisconnectedDetail",
+            &[("dut", dut_name), ("tool", tool), ("serial", serial)],
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +684,19 @@ mod tests {
         assert_eq!(first.at, 1_000);
         assert_eq!(third.source, AlertSource::Serial);
         assert!(center.pop_next().is_none(), "队列取空");
+    }
+
+    #[test]
+    fn clear_dedup_for_allows_immediate_re_alert_after_recovery() {
+        let mut center = new_center();
+        assert!(center.report_at_for(1_000, "dut-1", AlertSource::Relay, "offline", "d1"));
+        // Still within the 30s dedup window before recovery.
+        assert!(!center.report_at_for(5_000, "dut-1", AlertSource::Relay, "offline", "d2"));
+        // Recovery clears dedup only for the recovered (dut_id, source) pair.
+        assert!(center.report_at_for(5_500, "dut-2", AlertSource::Relay, "offline", "d3"));
+        center.clear_dedup_for("dut-1", AlertSource::Relay);
+        assert!(center.report_at_for(6_000, "dut-1", AlertSource::Relay, "offline", "d4"));
+        assert!(!center.report_at_for(6_500, "dut-2", AlertSource::Relay, "offline", "d5"));
     }
 
     #[test]
@@ -694,6 +758,8 @@ mod tests {
             AlertSource::Relay,
             AlertSource::AgentNotice,
             AlertSource::SerialGarbled,
+            AlertSource::Media,
+            AlertSource::UsbDebug,
         ] {
             assert!(
                 !center.report_at_for(0, "dut-a", source, "t", "d"),
@@ -704,7 +770,7 @@ mod tests {
                 "没有 alertsByDut 条目的 DUT 缺省开启"
             );
         }
-        assert_eq!(center.pending_len(), 8);
+        assert_eq!(center.pending_len(), 10);
         // Re-enabling the DUT lets it report again.
         let mut enabled = BTreeMap::new();
         enabled.insert(

@@ -6,7 +6,7 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=duthub=/STACK:8388608");
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/app.ico");
-        res.set("FileDescription", "Duthub · 串口调试与 MCP Agent 工作台");
+        res.set("FileDescription", "duthub");
         res.set("ProductName", "Duthub");
         res.compile()
             .expect("嵌入 Windows 资源失败（需要 app.ico 存在于 assets/）");

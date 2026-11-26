@@ -12,6 +12,7 @@ mod alerts;
 mod boot_learning;
 mod components;
 mod data;
+mod device_watch;
 mod garble_ui;
 mod highlight;
 mod i18n;

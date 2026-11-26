@@ -183,23 +183,24 @@ mod platform {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Controls::{LIM_SMALL, LoadIconMetric};
     use windows::Win32::UI::Shell::{
-        NIF_GUID, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIIF_INFO,
-        NIIF_RESPECT_QUIET_TIME, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS,
-        NIM_SETVERSION, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NIN_SELECT,
+        NIF_GUID, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_NONE,
+        NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION,
+        NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NIN_SELECT,
         NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, QUNS_ACCEPTS_NOTIFICATIONS,
         QUNS_QUIET_TIME, SHQueryUserNotificationState, Shell_NotifyIconGetRect, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CopyIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-        DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMenuItemCount,
-        GetMenuItemID, GetMessageW, HCURSOR, HICON, HMENU, IDI_WARNING, IsWindow, IsWindowVisible,
-        KillTimer, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
-        PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SPI_GETCLIENTAREAANIMATION,
-        SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer,
-        ShowWindowAsync, SystemParametersInfoW, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-        TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP,
-        WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASS_STYLES, WNDCLASSW,
-        WS_EX_TOOLWINDOW, WS_POPUP,
+        DestroyMenu, DestroyWindow, DispatchMessageW, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG,
+        FLASHWINFO, FlashWindowEx, GetCursorPos, GetMenuItemCount, GetMenuItemID, GetMessageW,
+        HCURSOR, HICON, HMENU, IDI_WARNING, IsIconic, IsWindow, IsWindowVisible, KillTimer,
+        LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, PostThreadMessageW,
+        RegisterClassW, RegisterWindowMessageW, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOW,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer, ShowWindowAsync,
+        SystemParametersInfoW, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+        TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_QUIT,
+        WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASS_STYLES, WNDCLASSW, WS_EX_TOOLWINDOW,
+        WS_POPUP,
     };
     use windows::core::{BOOL, GUID, PCWSTR};
 
@@ -494,6 +495,46 @@ mod platform {
         /// Whether the main window is currently visible.
         pub fn main_visible(&self) -> bool {
             self.main_window_valid() && unsafe { IsWindowVisible(self.main_window()).as_bool() }
+        }
+
+        /// Whether the main window is currently minimized to the taskbar.
+        pub fn main_minimized(&self) -> bool {
+            self.main_window_valid() && unsafe { IsIconic(self.main_window()).as_bool() }
+        }
+
+        /// Flashes the main window's taskbar button until the window comes to
+        /// the foreground (no-op if the window is already foreground).
+        pub fn flash_taskbar(&self) {
+            if !self.main_window_valid() {
+                return;
+            }
+            let info = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd: self.main_window(),
+                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            unsafe {
+                let _ = FlashWindowEx(&info);
+            }
+        }
+
+        /// Stops any active taskbar button flash on the main window.
+        pub fn stop_taskbar_flash(&self) {
+            if !self.main_window_valid() {
+                return;
+            }
+            let info = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd: self.main_window(),
+                dwFlags: FLASHW_STOP,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            unsafe {
+                let _ = FlashWindowEx(&info);
+            }
         }
 
         /// Adds or removes the notification icon.
@@ -1460,11 +1501,9 @@ mod platform {
                 return;
             }
             let mut nid = self.nid_with_flags(NIF_INFO | NIF_GUID);
-            let mut flags = match notification.level {
-                TrayNotifyLevel::Info => NIIF_INFO,
-                TrayNotifyLevel::Warning => NIIF_WARNING,
-                TrayNotifyLevel::Error => NIIF_ERROR,
-            };
+            // Omit legacy Win32 warning/error triangles so Windows 11 renders
+            // a clean modern toast with the app's own brand icon in the header.
+            let mut flags = NIIF_NONE;
             if notification.respect_quiet_time {
                 flags |= NIIF_RESPECT_QUIET_TIME;
             }
@@ -1689,6 +1728,14 @@ mod platform {
         pub fn notify(&self, _title: &str, _body: &str, _level: TrayNotifyLevel) {}
 
         pub fn notify_balloon(&self, _notification: &TrayNotification) {}
+
+        pub fn main_minimized(&self) -> bool {
+            false
+        }
+
+        pub fn flash_taskbar(&self) {}
+
+        pub fn stop_taskbar_flash(&self) {}
 
         pub fn drain_events(&self) -> Vec<TrayEvent> {
             Vec::new()

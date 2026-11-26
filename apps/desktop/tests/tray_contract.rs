@@ -151,10 +151,10 @@ fn tray_is_installed_on_the_first_render_and_hidden_from_the_tick() {
         !render.contains("media.reconcile_bindings("),
         "media reconciliation already runs in MediaView::tick"
     );
-    // The visible-state alert glyph is enlarged on its own row.
+    // The visible-state alert dialog uses a 42px squircle badge and routes
+    // non-DUT suppression to the global list.
     let body = fn_block(&workspace, "fn render_alert_dialog_body(");
-    assert!(body.contains("size(px(44.))"), "alert icon is 44px");
-    assert!(!body.contains("size(px(25.))"), "the 25px icon is gone");
+    assert!(body.contains("w(px(42.))"), "alert badge is 42px");
     assert!(body.contains("if this.is_saved_dut_id(&dut_id)"));
     assert!(body.contains("this.suppress_alert_source_globally(source)"));
 }
@@ -296,7 +296,7 @@ fn non_dut_suppression_persists_without_a_settings_panel() {
     assert!(suppress.contains("suppressed_sources"));
     assert!(suppress.contains("persist_settings()"));
     assert!(suppress.contains("drop_source("));
-    let mute_action = chunk_after(&workspace, "dialog_button(\"alert-suppress\"", 1_350);
+    let mute_action = chunk_after(&workspace, "\"alert-suppress\"", 1_350);
     assert!(mute_action.contains("if this.is_saved_dut_id(&dut_id)"));
     assert!(mute_action.contains("this.suppress_alert_source_globally(source)"));
     let pages = source_of("pages.rs");

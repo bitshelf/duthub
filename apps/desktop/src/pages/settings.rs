@@ -423,7 +423,7 @@ pub(super) fn alerts_panel(
     }
     let garbled_on = w.dut_garbled_detection(&id).enabled;
     let garbled_id = id.clone();
-    let mut body = setting_row(
+    let mut rows = div().flex().flex_col().gap(px(10.)).child(setting_row(
         label("serialGarbledTitle"),
         label("serialGarbledHint"),
         toggle("opt-serial-garbled", garbled_on, p).on_click(cx.listener(
@@ -433,9 +433,68 @@ pub(super) fn alerts_panel(
             },
         )),
         p,
-    );
-    if !settings.suppressed_sources.is_empty() {
-        body = div().child(body).child(
+    ));
+    let source_toggles = [
+        (
+            "opt-alert-relay",
+            "relayAlertTitle",
+            "relayAlertHint",
+            crate::alerts::AlertSource::Relay,
+        ),
+        (
+            "opt-alert-media",
+            "mediaAlertTitle",
+            "mediaAlertHint",
+            crate::alerts::AlertSource::Media,
+        ),
+        (
+            "opt-alert-usb-debug",
+            "usbDebugAlertTitle",
+            "usbDebugAlertHint",
+            crate::alerts::AlertSource::UsbDebug,
+        ),
+        (
+            "opt-alert-agent-notice",
+            "agentNoticeAlertTitle",
+            "agentNoticeAlertHint",
+            crate::alerts::AlertSource::AgentNotice,
+        ),
+    ];
+    for (toggle_key, title_key, hint_key, source) in source_toggles {
+        let on = !settings
+            .suppressed_sources
+            .iter()
+            .any(|key| key == source.key());
+        let dut_id = id.clone();
+        rows = rows.child(setting_row(
+            label(title_key),
+            label(hint_key),
+            toggle(toggle_key, on, p).on_click(cx.listener(move |this, checked, _, cx| {
+                this.edit_dut_alerts(&dut_id, |cfg| {
+                    if *checked {
+                        cfg.suppressed_sources.retain(|key| key != source.key());
+                    } else if !cfg.suppressed_sources.iter().any(|key| key == source.key()) {
+                        cfg.suppressed_sources.push(source.key().into());
+                    }
+                });
+                cx.notify();
+            })),
+            p,
+        ));
+    }
+    let managed_keys = [
+        crate::alerts::AlertSource::Relay.key(),
+        crate::alerts::AlertSource::Media.key(),
+        crate::alerts::AlertSource::UsbDebug.key(),
+        crate::alerts::AlertSource::AgentNotice.key(),
+    ];
+    let has_other_suppressed = settings
+        .suppressed_sources
+        .iter()
+        .any(|key| !managed_keys.contains(&key.as_str()));
+    let mut body = rows;
+    if has_other_suppressed {
+        body = body.child(
             div().pt(px(8.)).child(
                 btn(
                     "opt-alerts-reset",

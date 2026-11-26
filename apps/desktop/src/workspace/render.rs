@@ -248,16 +248,26 @@ impl Workbench {
         // 叠加，避免 close_dialog 关错层）；「需要人工干预」弹窗禁用了 Esc/遮罩/
         // 右上角 X 关闭，只能经按钮收尾，alert_dialog_open 若因外部关闭残留
         //（如其他代码 close_all_dialogs）由本帧自愈复位。
-        // While hidden to the tray the dialog stays queued: the tick presents
-        // balloons/flashes instead, and the queue is drained after restore.
-        if !self.hidden && self.alert_dialog_open && !window.has_active_dialog(cx) {
+        // While hidden to the tray or minimized to the taskbar, the dialog stays
+        // queued: the tick flashes the taskbar/tray icon instead, and the queue
+        // is drained as soon as the window is visible on the desktop again.
+        let minimized = self
+            .tray
+            .as_ref()
+            .is_some_and(duthub_desktop::tray::TrayHandle::main_minimized);
+        if !self.hidden && !minimized && self.alert_dialog_open && !window.has_active_dialog(cx) {
             self.alert_dialog_open = false;
         }
-        if !self.hidden && !self.alert_dialog_open && !window.has_active_dialog(cx) {
+        if !self.hidden && !minimized && !self.alert_dialog_open && !window.has_active_dialog(cx) {
             let next = self.alerts.lock().unwrap().pop_next();
             if let Some(item) = next {
                 self.alert_dialog_open = true;
                 self.open_alert_dialog(item, window, cx);
+                // Flash the taskbar icon if the window is open on the desktop
+                // but currently behind another application (no-op when foreground).
+                if let Some(tray) = self.tray.as_ref() {
+                    tray.flash_taskbar();
+                }
             }
         }
         // kit Notification：渲染帧统一推送（Root 层管理生命周期/动画）
@@ -293,6 +303,7 @@ impl Workbench {
                 )
             });
             dialog
+                .w(px(440.))
                 .title(title)
                 .overlay_closable(false)
                 .keyboard(false)
@@ -302,7 +313,8 @@ impl Workbench {
         cx.notify();
     }
 
-    /// 「需要人工干预」弹窗正文：来源/时间 + 标题 + detail + 按钮排。
+    /// Modern alert dialog body: semantic icon badge + title/meta + accented
+    /// message card + hairline-separated footer actions.
     pub(super) fn render_alert_dialog_body(
         &mut self,
         item: &AlertItem,
@@ -312,88 +324,150 @@ impl Workbench {
         let source = item.source;
         let dut_id = item.dut_id.clone();
         let at = crate::alerts::format_alert_time(item.at, crate::alerts::now_ms());
-        let dialog_button = |id: &'static str, label: &'static str, primary: bool| {
-            let mut btn = div()
-                .id(SharedString::from(id))
-                .flex()
-                .items_center()
-                .justify_center()
-                .min_h(px(32.0))
-                .px(px(14.0))
-                .rounded(px(8.0))
-                .text_size(px(13.0))
-                .cursor_pointer();
-            btn = if primary {
-                btn.bg(p.accent)
-                    .font_weight(gpui_kit::FontWeight(700.0))
-                    .text_color(p.accent_contrast)
-                    .hover(|s| s.opacity(0.9))
-            } else {
-                btn.bg(p.raised)
-                    .border_1()
-                    .border_color(p.border)
-                    .text_color(p.text)
-                    .hover(|s| s.bg(p.hover))
-            };
-            btn.child(label)
+        let tone = match item.level {
+            crate::alerts::AlertLevel::Error => p.red,
+            crate::alerts::AlertLevel::Warning => p.warn,
+            crate::alerts::AlertLevel::Info => p.accent,
         };
-        let mut body = div().flex().flex_col().gap(px(10.)).w_full();
-        body = body
-            // The alert glyph gets its own row and a clearly enlarged size;
-            // every existing text/label below is unchanged.
+        let tint = |alpha: f32| gpui_kit::Rgba { a: alpha, ..tone };
+        let glyph = match source {
+            AlertSource::Agent | AlertSource::AgentNotice => "spark",
+            AlertSource::Media => "eye",
+            AlertSource::UsbDebug => "usb",
+            AlertSource::Relay | AlertSource::Control => "bolt",
+            _ => "alert",
+        };
+
+        let mut meta = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .child(icon("alert").size(px(44.)).text_color(p.red)),
+                    .px(px(8.))
+                    .py(px(2.))
+                    .rounded(px(999.))
+                    .bg(tint(0.14))
+                    .border_1()
+                    .border_color(tint(0.28))
+                    .text_size(px(11.))
+                    .font_weight(gpui_kit::FontWeight(550.0))
+                    .text_color(tone)
+                    .child(source.label()),
             )
+            .child(div().text_size(px(11.)).text_color(p.faint).child("·"))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .px(px(7.))
-                            .py(px(2.))
-                            .rounded(px(6.))
-                            .bg(p.accent_weak)
-                            .text_size(px(10.5))
-                            .text_color(p.accent)
-                            .child(crate::i18n::message(
-                                "alertSourceLabel",
-                                &[("source", source.label())],
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .font_family(theme::MONO_FONT)
-                            .text_color(p.faint)
-                            .child(SharedString::from(at)),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(13.5))
-                    .font_weight(gpui_kit::FontWeight(650.0))
-                    .text_color(p.text)
-                    .child(SharedString::from(item.title.clone())),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .line_height(px(19.))
-                    .text_color(p.muted)
-                    .child(SharedString::from(item.detail.clone())),
+                    .text_size(px(11.))
+                    .font_family(theme::MONO_FONT)
+                    .text_color(p.faint)
+                    .child(SharedString::from(at)),
             );
-        // Agent 来源附「打开面板」：切到串口工作台并展开 Agent 面板
+        if item.repeat > 0 {
+            meta = meta.child(
+                div()
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded(px(999.))
+                    .bg(p.raised)
+                    .border_1()
+                    .border_color(p.line)
+                    .text_size(px(10.5))
+                    .font_family(theme::MONO_FONT)
+                    .text_color(p.muted)
+                    .child(SharedString::from(format!("+{}", item.repeat))),
+            );
+        }
+
+        let header = div()
+            .flex()
+            .items_start()
+            .gap(px(14.))
+            .w_full()
+            .child(
+                div()
+                    .w(px(42.))
+                    .h(px(42.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.))
+                    .bg(tint(0.14))
+                    .border_1()
+                    .border_color(tint(0.28))
+                    .child(icon(glyph).size(px(20.)).text_color(tone)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui_kit::FontWeight(650.0))
+                            .line_height(px(21.))
+                            .text_color(p.text)
+                            .whitespace_normal()
+                            .child(SharedString::from(item.title.clone())),
+                    )
+                    .child(meta),
+            );
+
+        let mut body = div().flex().flex_col().gap(px(14.)).w_full().child(header);
+        if !item.detail.trim().is_empty() {
+            body = body.child(
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w_0()
+                    .rounded(px(10.))
+                    .bg(p.bg)
+                    .border_1()
+                    .border_color(p.line)
+                    .overflow_hidden()
+                    .child(div().w(px(3.)).flex_shrink_0().bg(tone))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(14.))
+                            .py(px(12.))
+                            .text_size(px(13.))
+                            .line_height(px(20.))
+                            .text_color(p.text)
+                            .whitespace_normal()
+                            .child(SharedString::from(item.detail.clone())),
+                    ),
+            );
+        }
+
+        // Agent source carries an "Open pane" action to jump straight to the Agent panel.
         let can_open_agent =
             source == AlertSource::Agent && self.sessions.iter().any(|view| view.dut_id == dut_id);
         let open_panel_btn = can_open_agent.then(|| {
             let target = dut_id.clone();
-            dialog_button("alert-open-panel", crate::i18n::label("openPane"), false).on_click(
-                cx.listener(move |this, _ev, window, cx| {
+            div()
+                .id("alert-open-panel")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(34.))
+                .px(px(14.))
+                .rounded(px(8.))
+                .bg(p.raised)
+                .border_1()
+                .border_color(p.border)
+                .text_size(px(13.))
+                .text_color(p.text)
+                .cursor_pointer()
+                .hover(|s| s.bg(p.hover))
+                .child(crate::i18n::label("openPane"))
+                .on_click(cx.listener(move |this, _ev, window, cx| {
                     if let Some(index) = this.sessions.iter().position(|view| view.dut_id == target)
                     {
                         this.active_session = index;
@@ -403,50 +477,79 @@ impl Workbench {
                     this.alert_dialog_open = false;
                     window.close_dialog(cx);
                     cx.notify();
-                }),
-            )
+                }))
         });
-        let mut row = div()
+
+        let mute_btn = div()
+            .id("alert-suppress")
             .flex()
             .items_center()
-            .justify_end()
-            .gap(px(10.0))
-            .mt(px(4.0));
-        if let Some(btn) = open_panel_btn {
-            row = row.child(btn);
-        }
-        row = row
-            .child(
-                dialog_button("alert-suppress", crate::i18n::label("muteAlertType"), false)
-                    .on_click(cx.listener(move |this, _ev, window, cx| {
-                        // A subject that is not a user-editable DUT (relay
-                        // board id, empty id from a generic-listener notice)
-                        // has no per-DUT settings row; `edit_dut_alerts` would
-                        // silently return, so route it to the global list.
-                        if this.is_saved_dut_id(&dut_id) {
-                            this.edit_dut_alerts(&dut_id, |cfg| {
-                                if !cfg.suppressed_sources.iter().any(|key| key == source.key()) {
-                                    cfg.suppressed_sources.push(source.key().into());
-                                }
-                            });
-                        } else {
-                            this.suppress_alert_source_globally(source);
+            .justify_center()
+            .h(px(32.))
+            .px(px(10.))
+            .rounded(px(8.))
+            .text_size(px(12.5))
+            .text_color(p.muted)
+            .cursor_pointer()
+            .hover(|s| s.bg(p.hover).text_color(p.text))
+            .child(crate::i18n::label("muteAlertType"))
+            .on_click(cx.listener(move |this, _ev, window, cx| {
+                // A subject that is not a user-editable DUT (relay board id,
+                // empty id from a generic-listener notice) has no per-DUT
+                // settings row; route it to the global suppression list.
+                if this.is_saved_dut_id(&dut_id) {
+                    this.edit_dut_alerts(&dut_id, |cfg| {
+                        if !cfg.suppressed_sources.iter().any(|key| key == source.key()) {
+                            cfg.suppressed_sources.push(source.key().into());
                         }
-                        this.alert_dialog_open = false;
-                        window.close_dialog(cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                dialog_button("alert-ack", crate::i18n::label("acknowledgeAlert"), true).on_click(
-                    cx.listener(move |this, _ev, window, cx| {
-                        this.alert_dialog_open = false;
-                        window.close_dialog(cx);
-                        cx.notify();
-                    }),
-                ),
-            );
-        body.child(row).into_any_element()
+                    });
+                } else {
+                    this.suppress_alert_source_globally(source);
+                }
+                this.alert_dialog_open = false;
+                window.close_dialog(cx);
+                cx.notify();
+            }));
+
+        let ack_btn = div()
+            .id("alert-ack")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(34.))
+            .px(px(18.))
+            .rounded(px(8.))
+            .bg(p.accent)
+            .font_weight(gpui_kit::FontWeight(650.0))
+            .text_size(px(13.))
+            .text_color(p.accent_contrast)
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.92))
+            .child(crate::i18n::label("acknowledgeAlert"))
+            .on_click(cx.listener(move |this, _ev, window, cx| {
+                this.alert_dialog_open = false;
+                window.close_dialog(cx);
+                cx.notify();
+            }));
+
+        let mut right_actions = div().flex().items_center().gap(px(8.));
+        if let Some(btn) = open_panel_btn {
+            right_actions = right_actions.child(btn);
+        }
+        right_actions = right_actions.child(ack_btn);
+
+        let footer = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.))
+            .pt(px(12.))
+            .border_t_1()
+            .border_color(p.line)
+            .child(mute_btn)
+            .child(right_actions);
+
+        body.child(footer).into_any_element()
     }
 
     /// 首页：居中品牌 + 创建连接 / 设备工具 + 历史连接磁贴（两行五列，最多 10 个）。

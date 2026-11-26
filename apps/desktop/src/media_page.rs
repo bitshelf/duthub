@@ -1921,12 +1921,12 @@ fn add_capture_device(media: &mut duthub_core::model::DutMediaConfig) {
 }
 
 #[derive(Debug)]
-struct VideoDevice {
-    name: String,
-    endpoint: Option<String>,
+pub(crate) struct VideoDevice {
+    pub name: String,
+    pub endpoint: Option<String>,
 }
 
-fn directshow_video_devices(output: &str) -> Vec<VideoDevice> {
+pub(crate) fn directshow_video_devices(output: &str) -> Vec<VideoDevice> {
     let mut devices: Vec<VideoDevice> = Vec::new();
     let mut video_pending = false;
     for line in output.lines() {
@@ -1976,7 +1976,7 @@ fn video_endpoint<'a>(devices: &'a [VideoDevice], configured: &str) -> Result<&'
     Ok(device.endpoint.as_deref().unwrap_or(&device.name))
 }
 
-fn detected_devices(output: &str, audio: bool) -> Vec<String> {
+pub(crate) fn detected_devices(output: &str, audio: bool) -> Vec<String> {
     let mut devices = Vec::new();
     for line in output.lines() {
         let kind = if audio { "(audio)" } else { "(video)" };

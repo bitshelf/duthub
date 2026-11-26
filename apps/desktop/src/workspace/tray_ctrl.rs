@@ -11,12 +11,32 @@ impl Workbench {
     pub(crate) fn tick_frame_pump(&mut self, cx: &mut Context<Self>) -> bool {
         let changed = self.frame_pump.tick(cx);
         if let Some(raw) = self.frame_pump.take_failure() {
-            let detail = self
-                .frame_pump
-                .key()
-                .cloned()
-                .and_then(|(dut_id, source)| self.media.capture_error(&dut_id, Some(source)))
+            let failed_key = self.frame_pump.key().cloned();
+            let detail = failed_key
+                .as_ref()
+                .and_then(|(dut_id, source)| self.media.capture_error(dut_id, Some(*source)))
                 .unwrap_or(raw);
+            if let Some((dut_id, source)) = failed_key {
+                let (dut_name, source_label) = self
+                    .duts
+                    .file
+                    .duts
+                    .iter()
+                    .find(|dut| dut.id == dut_id)
+                    .map(|dut| (dut.name.clone(), source.named_label(&dut.media).to_owned()))
+                    .unwrap_or_else(|| (dut_id.clone(), source.label().to_owned()));
+                let (title, alert_detail) =
+                    crate::alerts::media_disconnect_alert_texts(&dut_name, &source_label, &detail);
+                if let Ok(mut center) = self.alerts.lock() {
+                    let _ = center.report_checked_for(
+                        &dut_id,
+                        AlertSource::Media,
+                        crate::alerts::AlertLevel::Warning,
+                        title,
+                        alert_detail,
+                    );
+                }
+            }
             self.handle_monitor_event(duthub_desktop::capture_ui::MonitorEvent::PreviewFailed, cx);
             self.frame_pump.set_error(Some(detail));
             return true;
@@ -530,17 +550,63 @@ impl Workbench {
                 duthub_device::relay_watch::RelayBoardState::Offline => {
                     let (title, detail) =
                         crate::alerts::relay_board_alert_texts(&event.name, &event.detail);
+                    let bound_duts: Vec<String> = self
+                        .duts
+                        .file
+                        .duts
+                        .iter()
+                        .filter(|dut| {
+                            matches!(
+                                &dut.relay,
+                                duthub_core::model::RelayConfig::UsbBoard { board_id, channels }
+                                    if board_id == &event.board_id && channels.assigned().next().is_some()
+                            )
+                        })
+                        .map(|dut| dut.id.clone())
+                        .collect();
                     if let Ok(mut center) = self.alerts.lock() {
-                        let _ = center.report_checked_for(
-                            &event.board_id,
-                            AlertSource::Relay,
-                            crate::alerts::AlertLevel::Warning,
-                            title,
-                            detail,
-                        );
+                        if bound_duts.is_empty() {
+                            let _ = center.report_checked_for(
+                                &event.board_id,
+                                AlertSource::Relay,
+                                crate::alerts::AlertLevel::Warning,
+                                title,
+                                detail,
+                            );
+                        } else {
+                            for dut_id in bound_duts {
+                                let _ = center.report_checked_for(
+                                    &dut_id,
+                                    AlertSource::Relay,
+                                    crate::alerts::AlertLevel::Warning,
+                                    title.clone(),
+                                    detail.clone(),
+                                );
+                            }
+                        }
                     }
                 }
                 duthub_device::relay_watch::RelayBoardState::Recovered => {
+                    let bound_duts: Vec<String> = self
+                        .duts
+                        .file
+                        .duts
+                        .iter()
+                        .filter(|dut| {
+                            matches!(
+                                &dut.relay,
+                                duthub_core::model::RelayConfig::UsbBoard { board_id, channels }
+                                    if board_id == &event.board_id && channels.assigned().next().is_some()
+                            )
+                        })
+                        .map(|dut| dut.id.clone())
+                        .collect();
+                    if let Ok(mut center) = self.alerts.lock() {
+                        center.clear_dedup_for(&event.board_id, AlertSource::Relay);
+                        for dut_id in bound_duts {
+                            center.clear_dedup_for(&dut_id, AlertSource::Relay);
+                        }
+                    }
                     self.notify_toast(crate::i18n::message(
                         "relayRecoveredToast",
                         &[("board", &event.name)],
@@ -553,6 +619,150 @@ impl Workbench {
                     ));
                 }
                 duthub_device::relay_watch::RelayBoardState::Online => {}
+            }
+        }
+        changed
+    }
+
+    /// 50 ms tick: align the HDMI / capture and USB debug watch sets with saved
+    /// DUT bindings that currently have their corresponding alert enabled.
+    pub(super) fn sync_device_watch(&mut self) -> bool {
+        let mut media_targets = Vec::new();
+        let mut usb_targets = Vec::new();
+        let Ok(center) = self.alerts.lock() else {
+            return false;
+        };
+        for dut in &self.duts.file.duts {
+            if !center.enabled_for(&dut.id) {
+                continue;
+            }
+            if !center.is_suppressed_for(&dut.id, AlertSource::Media)
+                && let Some(media) = self.duts.saved_media(&dut.id)
+                && media.is_enabled()
+            {
+                for source in crate::media::Source::sources(media) {
+                    let input = source.input(media);
+                    if input.has_video() {
+                        media_targets.push(crate::device_watch::WatchedMedia {
+                            dut_id: dut.id.clone(),
+                            dut_name: dut.name.clone(),
+                            source,
+                            source_label: source.named_label(media).to_owned(),
+                            video: input.video.clone(),
+                        });
+                    }
+                }
+            }
+            if !center.is_suppressed_for(&dut.id, AlertSource::UsbDebug)
+                && let Some(usb) = self.duts.saved_usb(&dut.id)
+                && usb.mode.eq_ignore_ascii_case("usb")
+                && !usb.serial.trim().is_empty()
+            {
+                let tool = if usb.tool.eq_ignore_ascii_case("hdc") {
+                    "hdc"
+                } else {
+                    "adb"
+                };
+                usb_targets.push(crate::device_watch::WatchedUsb {
+                    dut_id: dut.id.clone(),
+                    dut_name: dut.name.clone(),
+                    tool: tool.to_owned(),
+                    serial: usb.serial.trim().to_owned(),
+                });
+            }
+        }
+        drop(center);
+        let adb_exe = duthub_desktop::tool_resolver::effective_spec(
+            &self.settings.tools.adb_executable,
+            "adb",
+        );
+        let hdc_exe = duthub_desktop::tool_resolver::effective_spec(
+            &self.settings.tools.hdc_executable,
+            "hdc",
+        );
+        self.device_watch.sync_targets(
+            media_targets,
+            usb_targets,
+            self.media.capture_settings().clone(),
+            adb_exe,
+            hdc_exe,
+        );
+        false
+    }
+
+    /// 50 ms tick: route HDMI / USB debug disconnect events into `AlertCenter`
+    /// and recovery edges into toasts.
+    pub(super) fn drain_device_watch_events(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(event) = self.device_watch_events.try_recv() {
+            changed = true;
+            match event {
+                crate::device_watch::DeviceWatchEvent::MediaOffline {
+                    dut_id,
+                    dut_name,
+                    source_label,
+                    device_name,
+                } => {
+                    let (title, detail) = crate::alerts::media_disconnect_alert_texts(
+                        &dut_name,
+                        &source_label,
+                        &device_name,
+                    );
+                    if let Ok(mut center) = self.alerts.lock() {
+                        let _ = center.report_checked_for(
+                            &dut_id,
+                            AlertSource::Media,
+                            crate::alerts::AlertLevel::Warning,
+                            title,
+                            detail,
+                        );
+                    }
+                }
+                crate::device_watch::DeviceWatchEvent::MediaRecovered {
+                    dut_id,
+                    dut_name,
+                    source_label,
+                } => {
+                    if let Ok(mut center) = self.alerts.lock() {
+                        center.clear_dedup_for(&dut_id, AlertSource::Media);
+                    }
+                    self.notify_toast(crate::i18n::message(
+                        "mediaRecoveredToast",
+                        &[("dut", &dut_name), ("source", &source_label)],
+                    ));
+                }
+                crate::device_watch::DeviceWatchEvent::UsbOffline {
+                    dut_id,
+                    dut_name,
+                    tool,
+                    serial,
+                } => {
+                    let (title, detail) =
+                        crate::alerts::usb_debug_disconnect_alert_texts(&dut_name, &tool, &serial);
+                    if let Ok(mut center) = self.alerts.lock() {
+                        let _ = center.report_checked_for(
+                            &dut_id,
+                            AlertSource::UsbDebug,
+                            crate::alerts::AlertLevel::Warning,
+                            title,
+                            detail,
+                        );
+                    }
+                }
+                crate::device_watch::DeviceWatchEvent::UsbRecovered {
+                    dut_id,
+                    dut_name,
+                    tool,
+                    serial,
+                } => {
+                    if let Ok(mut center) = self.alerts.lock() {
+                        center.clear_dedup_for(&dut_id, AlertSource::UsbDebug);
+                    }
+                    self.notify_toast(crate::i18n::message(
+                        "usbDebugRecoveredToast",
+                        &[("dut", &dut_name), ("tool", &tool), ("serial", &serial)],
+                    ));
+                }
             }
         }
         changed
@@ -585,10 +795,19 @@ impl Workbench {
                 center.pending_len() as u64,
             )
         };
+        let minimized = self
+            .tray
+            .as_ref()
+            .is_some_and(duthub_desktop::tray::TrayHandle::main_minimized);
+        let effectively_hidden = self.hidden || minimized;
+        let restored_from_hidden = self
+            .alert_eval_key
+            .is_some_and(|(_, prev_hidden, _)| prev_hidden)
+            && !effectively_hidden;
         // System notification state is only queried when there is something
         // new to evaluate (or a blink episode must be stopped on timeout);
         // polling `SHQueryUserNotificationState` at tick rate would be waste.
-        let eval_key = (generation, self.hidden, pending);
+        let eval_key = (generation, effectively_hidden, pending);
         let key_changed = self.alert_eval_key != Some(eval_key);
         let flash_expired = self.alert_router.flash_started().is_some_and(|started| {
             now.saturating_sub(started) >= duthub_desktop::tray_ui::FLASH_MAX_MS
@@ -598,7 +817,7 @@ impl Workbench {
         }
         self.alert_eval_key = Some(eval_key);
         let env = HiddenAlertEnv {
-            visible: !self.hidden,
+            visible: !effectively_hidden,
             dialog_open: self.dialog_open,
             pending,
             animations: duthub_desktop::tray::animations_enabled(),
@@ -607,12 +826,23 @@ impl Workbench {
                 .as_ref()
                 .is_some_and(|summary| summary.source != AlertSource::AgentNotice),
         };
+        let mut changed = restored_from_hidden && pending > 0;
         match self.alert_router.step(generation, env, now) {
-            HiddenAlertAction::None => false,
+            HiddenAlertAction::None => changed,
             HiddenAlertAction::Present {
                 presentation,
                 count,
             } => {
+                // When minimized to the taskbar, always flash the taskbar button
+                // in addition to the tray presentation so the user sees the icon
+                // bounce/highlight even if system tray notifications are quiet.
+                if minimized
+                    && !self.hidden
+                    && let Some(tray) = self.tray.as_ref()
+                {
+                    tray.flash_taskbar();
+                    changed = true;
+                }
                 // The coordinator expands the presentation into the ordered
                 // tray effects (`PresentAlert` then `StartFlash` for `Both`).
                 let transition = duthub_desktop::tray_lifecycle::on_event(
@@ -622,7 +852,6 @@ impl Workbench {
                         count,
                     },
                 );
-                let mut changed = false;
                 for action in transition.actions {
                     match action {
                         LifecycleAction::PresentAlert {
@@ -635,7 +864,7 @@ impl Workbench {
                 }
                 changed
             }
-            HiddenAlertAction::StopFlash => self.stop_alert_flash(),
+            HiddenAlertAction::StopFlash => changed | self.stop_alert_flash(),
         }
     }
 
@@ -657,13 +886,24 @@ impl Workbench {
         let Some(summary) = self.alerts.lock().ok().and_then(|center| center.latest()) else {
             return false;
         };
-        let body = if summary.detail.trim().is_empty() {
-            summary.title
+        let source_label = summary.source.label();
+        let detail = summary.detail.trim();
+        let title_base = if summary.title.trim().is_empty() {
+            crate::i18n::message("trayAlertTitle", &[("count", &count.to_string())])
         } else {
-            summary.detail
+            summary.title.trim().to_owned()
+        };
+        let title = if count > 1 && !summary.title.trim().is_empty() {
+            format!("{title_base} (+{})", count - 1)
+        } else {
+            title_base
+        };
+        let body = if detail.is_empty() {
+            source_label.to_owned()
+        } else {
+            format!("{source_label} · {detail}")
         };
         let body: String = body.chars().take(200).collect();
-        let title = crate::i18n::message("trayAlertTitle", &[("count", &count.to_string())]);
         let level = match summary.level {
             crate::alerts::AlertLevel::Info => duthub_desktop::tray::TrayNotifyLevel::Info,
             crate::alerts::AlertLevel::Warning => duthub_desktop::tray::TrayNotifyLevel::Warning,
@@ -683,6 +923,9 @@ impl Workbench {
     /// Starts (or restarts) the blinking episode and records its start.
     pub(super) fn start_alert_flash(&mut self, now: u64) -> bool {
         if let Some(tray) = self.tray.as_ref() {
+            if tray.main_minimized() {
+                tray.flash_taskbar();
+            }
             duthub_desktop::tray_lifecycle::run_tray_actions(tray, &[LifecycleAction::StartFlash]);
         }
         self.alert_router.set_flash_started(Some(now));
@@ -692,6 +935,7 @@ impl Workbench {
     /// Stops the blinking episode and restores the normal icon.
     pub(super) fn stop_alert_flash(&mut self) -> bool {
         if let Some(tray) = self.tray.as_ref() {
+            tray.stop_taskbar_flash();
             duthub_desktop::tray_lifecycle::run_tray_actions(tray, &[LifecycleAction::StopFlash]);
         }
         self.alert_router.set_flash_started(None);

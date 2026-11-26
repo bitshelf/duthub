@@ -1201,6 +1201,9 @@ pub struct Workbench {
     relay_watch_quit: Arc<std::sync::atomic::AtomicBool>,
     /// Change key of the watched board set (`id`, `node`, `channel`, `driver`).
     relay_watch_signature: Vec<(String, String, u8, String)>,
+    /// HDMI / capture and USB debug (ADB / HDC) disconnect monitor.
+    device_watch: Arc<crate::device_watch::DeviceWatchService>,
+    device_watch_events: std::sync::mpsc::Receiver<crate::device_watch::DeviceWatchEvent>,
     /// Next allowed MCP snapshot refresh (250 ms throttle while hidden).
     snapshot_due_ms: u64,
     /// Toasts dropped because `pending_toasts` hit `MAX_TOASTS`; reported once
@@ -1826,11 +1829,23 @@ impl Workbench {
         let relay_probe = Arc::new(duthub_device::control::ControlRelayProbe::new(
             control.clone(),
         ));
-        let relay_watch = Arc::new(duthub_device::relay_watch::RelayWatchService::new(
-            relay_probe.clone(),
-        ));
+        let relay_watch = Arc::new(
+            duthub_device::relay_watch::RelayWatchService::new(relay_probe.clone()).with_config(
+                duthub_device::relay_watch::RelayWatchConfig {
+                    interval_ms: 5_000,
+                    confirmations: 1,
+                    // Slightly above AlertCenter::DEDUP_WINDOW (30s) so tick jitter
+                    // never drops a periodic reminder as a duplicate.
+                    remind_interval_ms: 31_000,
+                },
+            ),
+        );
         let (relay_tx, relay_events) = std::sync::mpsc::channel();
         let relay_watch_quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let device_watch = Arc::new(crate::device_watch::DeviceWatchService::new(Arc::new(
+            crate::device_watch::RealDeviceProbe,
+        )));
+        let (device_watch_tx, device_watch_events) = std::sync::mpsc::channel();
         // 心跳引擎（需求⑦）：持久化钩子把 Agent 的 heartbeat.set 写回 duts.json
         //（bootstrap 配置目录；load → 改该 DUT 的 heartbeat 段 → 原子保存）。
         let hb_data_dir = data_dir.clone();
@@ -2056,6 +2071,8 @@ impl Workbench {
             relay_events,
             relay_watch_quit,
             relay_watch_signature: Vec::new(),
+            device_watch,
+            device_watch_events,
             snapshot_due_ms: 0,
             toasts_omitted: 0,
             _float_closed_subscription: Some(float_closed_subscription),
@@ -2130,13 +2147,32 @@ impl Workbench {
                 .name("duthub-relay-watch".into())
                 .spawn(move || {
                     while !quit.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_secs(5));
+                        std::thread::sleep(Duration::from_secs(2));
                         if quit.load(Ordering::Relaxed) {
                             break;
                         }
                         watch.tick_at(crate::alerts::now_ms());
                         for event in watch.drain_events() {
                             if relay_tx.send(event).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                })
+                .ok();
+            let dev_watch = wb.device_watch.clone();
+            let dev_quit = wb.relay_watch_quit.clone();
+            std::thread::Builder::new()
+                .name("duthub-device-watch".into())
+                .spawn(move || {
+                    while !dev_quit.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_secs(2));
+                        if dev_quit.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        dev_watch.tick_at(crate::alerts::now_ms());
+                        for event in dev_watch.drain_events() {
+                            if device_watch_tx.send(event).is_err() {
                                 return;
                             }
                         }
@@ -2188,6 +2224,8 @@ impl Workbench {
                             | view.agent_host_tick()
                             | view.sync_relay_watch()
                             | view.drain_relay_events()
+                            | view.sync_device_watch()
+                            | view.drain_device_watch_events()
                             | view.alert_present_tick()
                             | view.drain_tray_events(cx)
                             | view.snapshot_tick()
