@@ -20,7 +20,7 @@ use rmcp::transport::async_rw::AsyncRwTransport;
 /// The only skills the A2A surface accepts — the W1 evidence tool list.
 /// The executor fails any other skill (and any TextPart) with a policy
 /// rejection before the MCP server is even started.
-pub const EVIDENCE_SKILLS: [&str; 8] = duthub_mcp::server::EVIDENCE_TOOL_NAMES;
+pub const EVIDENCE_SKILLS: [&str; 5] = duthub_mcp::server::EVIDENCE_TOOL_NAMES;
 
 /// Per-call cap: evidence tools are quick local reads; a stuck call must not
 /// pin the A2A task forever.
@@ -178,23 +178,23 @@ mod tests {
 
     #[test]
     fn evidence_skills_match_w1_surface() {
-        assert_eq!(EVIDENCE_SKILLS.len(), 8);
+        assert_eq!(EVIDENCE_SKILLS.len(), 5);
         assert!(EVIDENCE_SKILLS.contains(&"dut_list"));
-        assert!(EVIDENCE_SKILLS.contains(&"heartbeat_get"));
+        assert!(EVIDENCE_SKILLS.contains(&"dut_status"));
         assert!(!EVIDENCE_SKILLS.contains(&"dut_files"));
         assert!(!EVIDENCE_SKILLS.contains(&"media_streams"));
     }
 
     #[test]
     fn prepare_args_forces_bound_dut() {
-        let args = prepare_tool_args("dut_info", "dut-a", None, serde_json::json!({})).unwrap();
+        let args = prepare_tool_args("dut_status", "dut-a", None, serde_json::json!({})).unwrap();
         assert_eq!(args["dutId"], serde_json::json!("dut-a"));
     }
 
     #[test]
     fn prepare_args_rejects_cross_dut_and_snake_case() {
         let error = prepare_tool_args(
-            "dut_info",
+            "dut_status",
             "dut-a",
             Some("dut-b"),
             serde_json::json!({"dutId": "dut-a"}),
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(error.code, a2a::error_code::INVALID_PARAMS);
 
         let error = prepare_tool_args(
-            "dut_info",
+            "dut_status",
             "dut-a",
             None,
             serde_json::json!({"dut_id": "dut-a"}),

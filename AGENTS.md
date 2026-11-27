@@ -477,3 +477,14 @@ Rust 工作区 + gpui-kit 0.9.1 桌面应用（串口调试 + MCP Agent 工作�
 162. **桌面渲染热路径与模块拆分不变量**：`apps/desktop/src/{pages,workspace}.rs` 已按领域拆为 `pages/` 与 `workspace/` 子模块，并由 `apps/desktop/tests/architecture_invariants.rs` 钉住五项红线：① `duthub-core`/`duthub-agent` 维持 `#![forbid(unsafe_code)]` 且 `duthub-core` 零 `windows-sys`/`reqwest`；② `PLAN_TOOL_NAMES` 单一真相源；③ `zh-CN.json`/`en-US.json` 1:1 键集对齐；④ 桌面 UI 渲染模块禁止出现硬编码中文界面文案；⑤ 桌面共用 `main.rs` 单一 Tokio 运行时（`DeviceService::with_runtime`、`ControlService::with_runtime`、`A2aRuntime::start_with_handle`），`SnapshotWriter` 按内容摘要脏检查零空闲写盘，`probe_os_isolation` 10s TTL 缓存，`compiled_highlight_rules` 按 `Arc` 缓存，`refresh_tool_rows` 仅在安装完成时触发。
 
 163. **AppContainer 的 PowerShell 驱动器与 NTFS 目录权限是两回事**：如果默认盘符无法解析已授权的工作目录，进程内用 FileSystem `New-PSDrive` 挂载该目录，再切换位置。保留 Win32 的原生工作目录和原有权限。挂载或切换失败时不运行用户脚本。回归用 D 盘单元验证相对路径写入、越界拒绝和超时终止进程树。
+
+**专用账户 AppContainer 的服务会话验收**：PowerShell 在脚本标记前以 0xC0000142 退出时，核对私有窗口站、桌面及其完整性标签。能进入 PowerShell 后若报告注册表访问被拒，再核对目标账户用户配置文件与容器配置文件的归属、生命周期。使用同一套专用身份验收程序核实脚本身份、目录内外写入与受保护路径读取；跳过的测试单列。
+
+## 2026-11-27 MXC SDK 沙箱重构（`mxc-sdk 1.1.0`，自动追加）
+
+> 本节记录将 `duthub-sandbox` 全面迁移至 Microsoft `mxc-sdk = "1.1.0"`、移除 Codex 参考实现与全部手写 Win32 沙箱 FFI 后的新增经验教训；只追加、不改旧条目。
+
+164. **基于 `mxc-sdk 1.1.0` 的 `duthub-sandbox` 必须维持 `#![forbid(unsafe_code)]` 且零 `windows-sys` 依赖**：Windows 11 原生 PSEC 1.1+（非提权即可同时执行读/写/网络/UI 隔离）、Linux `Bubblewrap`、macOS `Seatbelt` 全部通过 `mxc_sdk::v1` 驱动。策略校验（`validate_scope`/`validate_executable`/`validate_policy`）必须在 `prepare_cell` 创建 `tmp/`/`home/` 目录**之前**执行，确保被拒绝的请求对沙箱单元零落盘副作用（T8 不变量）。
+165. **Windows PSEC 禁止默认环境继承时的 `LOCALAPPDATA` 红线**：`inherit_default_environment = Some(false)` 时，Windows `CreateProcessW + PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT` 要求子进程环境块中必须存在 `SYSTEMROOT` 与 `LOCALAPPDATA`（缺失即 Win32 203 拒启）。`AcpClient::spawn_in_cell` 必须调用 `prepare_cell` 并将 `LOCALAPPDATA` 重定向到 `<cell>/home/AppData/Local`（不继承宿主 `%LOCALAPPDATA%`，且 `USERPROFILE`/`APPDATA`/`HOME`/`HOMEDRIVE`/`HOMEPATH` 仍禁止继承）；CLI 路径若环境缺 `LOCALAPPDATA` 同样兜底指向单元内目录。
+166. **`.duthub/tools/` 与 `.cmd` 垫片在 deny-by-default 容器下的放行口径**：`CellSpec::protected_paths_excluding(allowed_exe_dir)` 在 Agent 程序位于 `.duthub/tools/<tool>/` 时拆分拒读 `.duthub/` 内兄弟文件（保护 `settings.json`/`duts.json`），避免父目录 `deniedPaths` 覆盖子目录只读授权；`cli.rs` 通过固定 `cmd.exe /D /C call <shim>` 启动 `.cmd`/`.bat` 时必须把 `launch.program.parent()` 加入 `extra_readable`。
+167. **隔离桌面（非 `WinSta0\Default`）下 `user32.dll` 初始化 `0xC0000142`**：在无 `ALL APPLICATION PACKAGES` ACE 的自定义隔离桌面（如代理/服务会话桌面 `exebox-*`）中，链接 `user32.dll` 的进程（`powershell.exe`/`pwsh.exe`/`whoami.exe`）在 PSEC AppContainer 内会在 `DllMain` 阶段以 `STATUS_DLL_INIT_FAILED (0xC0000142)` 退出，而纯控制台系统工具（`cmd.exe`/`curl.exe`/`findstr.exe`/`hostname.exe`）不依赖 `user32.dll`。沙箱核心安全不变量（T1–T8 与 `streaming_spawn`）使用 `cmd.exe`/`curl.exe` 验证内核文件系统/WFP 网络/Job 进程树边界，确保交互桌面与无头 CI / 隔离桌面均 100% 全绿、零 SKIP。

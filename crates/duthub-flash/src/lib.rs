@@ -10,6 +10,12 @@ use duthub_core::process::{ProcessRunner, RealProcessRunner, resolve_executable}
 use duthub_core::{DeviceError, DeviceResult, ProcessResult};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(12);
+const LIST_TIMEOUT: Duration = Duration::from_secs(15);
+const REBOOT_TIMEOUT: Duration = Duration::from_secs(15);
+const FLASH_UPDATE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Allowed image file extensions for workdir-fenced firmware flashing.
+const ALLOWED_IMAGE_EXTENSIONS: [&str; 2] = ["img", "bin"];
 
 /// 只读检查参数白名单（docs/SECURITY.md #4：`--help` 也不可尽信，参数必须显式白名单）。
 pub const SAFE_ARGS: [&str; 5] = ["--help", "-h", "--version", "-V", "-?"];
@@ -55,6 +61,46 @@ impl FlashTester {
         }
         let exe = resolve_executable(executable_spec)?;
         self.runner.run(&exe, args, TEST_TIMEOUT)
+    }
+
+    /// List connected Rockusb/MaskROM/Loader devices (`upgrade_tool ld`).
+    pub fn list_devices(&self, executable_spec: &str) -> DeviceResult<ProcessResult> {
+        let exe = resolve_executable(executable_spec)?;
+        self.runner.run(&exe, &["ld".to_owned()], LIST_TIMEOUT)
+    }
+
+    /// Reboot a connected Rockusb/Loader device back to normal boot (`upgrade_tool rd`).
+    pub fn reboot_device(&self, executable_spec: &str) -> DeviceResult<ProcessResult> {
+        let exe = resolve_executable(executable_spec)?;
+        self.runner.run(&exe, &["rd".to_owned()], REBOOT_TIMEOUT)
+    }
+
+    /// Flash a pre-verified firmware image located inside a DUT's owned directory
+    /// using fixed argv `["uf", <image_path>]` (zero shell interpolation).
+    pub fn upgrade_firmware(
+        &self,
+        executable_spec: &str,
+        verified_image: &std::path::Path,
+    ) -> DeviceResult<ProcessResult> {
+        let ext = verified_image
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if !ext
+            .as_deref()
+            .is_some_and(|e| ALLOWED_IMAGE_EXTENSIONS.contains(&e))
+        {
+            return Err(DeviceError::Invalid(
+                "firmware image must have .img or .bin extension".into(),
+            ));
+        }
+        if !verified_image.is_file() {
+            return Err(DeviceError::NotFound);
+        }
+        let exe = resolve_executable(executable_spec)?;
+        let image_arg = verified_image.to_string_lossy().into_owned();
+        self.runner
+            .run(&exe, &["uf".to_owned(), image_arg], FLASH_UPDATE_TIMEOUT)
     }
 }
 

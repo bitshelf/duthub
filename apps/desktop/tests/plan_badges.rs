@@ -94,8 +94,8 @@ fn both_locales_carry_the_three_badges_and_retire_plan_readonly() {
     );
     assert!(
         text_at(&zh, "agentLocalTools").contains("Goose 扩展已禁用")
-            && text_at(&zh, "agentLocalTools").contains("OS 沙箱未启用"),
-        "中文本机工具徽标必须写明扩展禁用与沙箱未启用"
+            && text_at(&zh, "agentLocalTools").contains("OS 沙箱（MXC）已启用"),
+        "中文本机工具徽标必须写明扩展禁用与 MXC OS 沙箱已启用"
     );
     assert!(
         text_at(&zh, "agentBindingBoundary").contains("不是安全边界"),
@@ -109,8 +109,8 @@ fn both_locales_carry_the_three_badges_and_retire_plan_readonly() {
     );
     assert!(
         text_at(&en, "agentLocalTools").contains("Goose extensions disabled")
-            && text_at(&en, "agentLocalTools").contains("OS sandbox not enabled"),
-        "English local-tools badge must state extensions disabled and sandbox off"
+            && text_at(&en, "agentLocalTools").contains("OS sandbox (MXC) enabled"),
+        "English local-tools badge must state extensions disabled and MXC OS sandbox enabled"
     );
     assert!(
         text_at(&en, "agentBindingBoundary").contains("not a security boundary"),
@@ -144,7 +144,7 @@ fn demo_keeps_badges_and_agent_settings_keep_runtime_status() {
         .split_once("fn agent_inspector_panel")
         .expect("session inspector")
         .1;
-    assert!(inspector.contains("os_isolation_badge_text(&status)"));
+    assert!(inspector.contains("format_sandbox_status(&status)"));
 }
 
 #[test]

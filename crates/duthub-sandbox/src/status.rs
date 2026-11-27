@@ -1,105 +1,242 @@
-//! Capability probing with an honest enum.
+//! Read-only host capability probing backed by `mxc-sdk`.
 //!
-//! There is no `sandboxed: bool` here on purpose. A host can have a restricted
-//! token but no AppContainer, or an AppContainer but no Job Object; a UI that
-//! collapses those into one flag ends up claiming isolation it does not have
-//! (AGENTS.md pitfall #61). Callers must name the capability they rely on.
+//! Reports factual containment backend and capability flags without launching
+//! any sandboxed process. UI layers translate these structured facts into the
+//! active locale rather than parsing free-form strings.
 
-/// Whether one enforcement primitive is available and was verified by a real
-/// API call during probing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Capability {
-    /// The primitive was established by a real call and read back.
-    Verified,
-    /// The platform or build does not provide it.
-    Unavailable,
-    /// It exists but the probe could not verify it (permissions, policy).
-    Unverified,
+use mxc_sdk::v1::{self, BackendCapability};
+
+/// Native OS containment backend detected on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxBackendKind {
+    /// Windows 11 native PSEC ProcessContainer.
+    ProcessContainer,
+    /// Linux Bubblewrap (`bwrap`).
+    Bubblewrap,
+    /// macOS Seatbelt (`sandbox_init`).
+    Seatbelt,
+    /// No supported MXC containment backend is usable on this host.
+    #[default]
+    Unsupported,
 }
 
-impl Capability {
-    pub fn is_verified(self) -> bool {
-        self == Capability::Verified
-    }
-
-    pub fn as_str(self) -> &'static str {
+impl SandboxBackendKind {
+    /// Canonical wire/display identifier of the backend.
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Capability::Verified => "已验证",
-            Capability::Unavailable => "不可用",
-            Capability::Unverified => "未验证",
+            Self::ProcessContainer => "processcontainer",
+            Self::Bubblewrap => "bubblewrap",
+            Self::Seatbelt => "seatbelt",
+            Self::Unsupported => "unsupported",
         }
     }
 }
 
-/// What the one-time elevated provisioning created, for the CLI and the report.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentityReport {
-    pub username: String,
-    pub group: String,
-    /// `S-1-5-21-…` of the sandbox account.
-    pub account_sid: String,
-    pub created_user: bool,
-    pub created_group: bool,
-    pub rotated_password: bool,
-    /// Absolute path of the DPAPI-sealed credential file.
-    pub credential_file: std::path::PathBuf,
-}
-
-/// What the current host can enforce. Every field is a probed fact.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Factual sandbox capability report probed from `mxc-sdk`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SandboxStatus {
-    /// `windows` or `unsupported`.
-    pub platform: &'static str,
-    /// `CreateRestrictedToken` + integrity lowering on a real token.
-    pub restricted_token: Capability,
-    /// `CreateAppContainerProfile` (+ derivation for an existing profile).
-    pub app_container: Capability,
-    /// Job Object with `ActiveProcessLimit` / `ProcessMemoryLimit` /
-    /// `KILL_ON_JOB_CLOSE`, queried back.
-    pub job_limits: Capability,
-    /// Deny-read ACE written for the sandbox identity SID and read back.
-    ///
-    /// Only `Verified` when [`Self::identity`] is verified *and* the ACE could be
-    /// written for the sandbox account's SID: read isolation needs a principal
-    /// other than the host user, and starting a process as that principal needs
-    /// an elevated caller. `Unverified` otherwise.
-    pub read_deny: Capability,
-    /// The dedicated local sandbox account is provisioned, logs on, **and** this
-    /// process holds the privileges needed to start a process as it
-    /// (`SeAssignPrimaryTokenPrivilege` + `SeIncreaseQuotaPrivilege`; without
-    /// them `CreateProcessAsUser` fails with Win32 1314).
-    pub identity: Capability,
-    /// Human-readable summary (UI/transcript text).
-    pub detail: String,
+    pub backend: SandboxBackendKind,
+    /// Isolation tier reported by Windows ProcessContainer (e.g. `"base-container"`).
+    pub tier: Option<String>,
+    /// True when the host supports the native process containment backend.
+    pub supported: bool,
+    /// Kernel-enforced `denied_paths` read isolation is available.
+    pub read_deny: bool,
+    /// Enumeration-only directory policy (`enumerate_paths`) is available.
+    pub enumerate_paths: bool,
+    /// Explicit host-loopback allow (needed for Agent MCP listeners) is available.
+    pub host_loopback: bool,
+    /// Native denial capture (`capture_denials`) is available.
+    pub capture_denials: bool,
+    /// OS-level UI/clipboard/input-injection isolation is available.
+    pub ui_isolation: bool,
+    /// Non-fatal capability warnings reported by `mxc-sdk`.
+    pub warnings: Vec<String>,
+    /// Diagnostic explanation when `supported` is `false`.
+    pub reason: Option<String>,
 }
 
 impl SandboxStatus {
-    /// A platform without a backend: every capability is explicitly
-    /// unavailable, never silently absent.
-    pub fn unsupported() -> Self {
+    /// Status representing an unsupported host (explicitly non-enforced).
+    pub fn unsupported(reason: impl Into<String>) -> Self {
         Self {
-            platform: "unsupported",
-            restricted_token: Capability::Unavailable,
-            app_container: Capability::Unavailable,
-            job_limits: Capability::Unavailable,
-            read_deny: Capability::Unavailable,
-            identity: Capability::Unavailable,
-            detail: "当前平台没有 OS 沙箱后端（仅 Windows 提供受限令牌与 AppContainer），命令一律拒绝执行"
-                .to_owned(),
+            backend: SandboxBackendKind::Unsupported,
+            reason: Some(reason.into()),
+            ..Self::default()
         }
     }
 
-    /// Whether scripts can be isolated (AppContainer + Job limits).
-    pub fn script_isolation(&self) -> bool {
-        self.app_container.is_verified() && self.job_limits.is_verified()
+    /// Whether the host can enforce OS-level process and filesystem containment.
+    pub fn is_enforced(&self) -> bool {
+        self.supported && self.backend != SandboxBackendKind::Unsupported
     }
 
-    /// Whether the Agent host can be write/read isolated (restricted token +
-    /// Job limits + read denial).
-    pub fn agent_isolation(&self) -> bool {
-        self.restricted_token.is_verified()
-            && self.job_limits.is_verified()
-            && self.read_deny.is_verified()
+    /// Whether kernel-level read isolation (`denied_paths`) is enforced.
+    pub fn supports_read_isolation(&self) -> bool {
+        self.is_enforced() && self.read_deny
+    }
+
+    /// Whether untrusted scripts can be contained with read + write + network isolation.
+    pub fn supports_script_isolation(&self) -> bool {
+        self.is_enforced() && self.read_deny
+    }
+
+    /// Whether Agent hosts (which require loopback MCP access alongside
+    /// read/write containment) are fully supported.
+    pub fn supports_agent_isolation(&self) -> bool {
+        self.is_enforced() && self.read_deny && self.host_loopback
+    }
+
+    /// Concise English diagnostic summary for logs and transcripts.
+    pub fn summary(&self) -> String {
+        if !self.is_enforced() {
+            return match self.reason.as_deref() {
+                Some(reason) => format!("unsupported ({reason})"),
+                None => "unsupported".to_owned(),
+            };
+        }
+        let mut caps = Vec::new();
+        if self.read_deny {
+            caps.push("read-deny");
+        }
+        if self.host_loopback {
+            caps.push("loopback");
+        }
+        if self.ui_isolation {
+            caps.push("ui-isolation");
+        }
+        if self.capture_denials {
+            caps.push("capture-denials");
+        }
+        let name = match self.tier.as_deref() {
+            Some(tier) => format!("{} ({tier})", self.backend.as_str()),
+            None => self.backend.as_str().to_owned(),
+        };
+        if caps.is_empty() {
+            name
+        } else {
+            format!("{name} [{}]", caps.join(", "))
+        }
+    }
+}
+
+/// Probe the current host through `mxc-sdk` without spawning any container.
+pub fn status() -> SandboxStatus {
+    let support = v1::platform_support();
+    let backends = v1::available_backends();
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(pc) = backends.iter().find(|b| b.backend == "processcontainer") {
+            let probe = v1::probe(None).ok();
+            let ui_isolation = probe.as_ref().is_some_and(|p| {
+                p.probes.ui_capabilities.can_block_clipboard_read
+                    && p.probes.ui_capabilities.can_block_clipboard_write
+                    && p.probes.ui_capabilities.can_block_input_injection
+            });
+            let mut warnings = pc.warnings.clone();
+            if let Some(p) = &probe {
+                warnings.extend(p.warnings.iter().cloned());
+            }
+            let read_deny = pc
+                .capabilities
+                .contains(&BackendCapability::FilesystemDeniedPaths)
+                || probe
+                    .as_ref()
+                    .is_some_and(|p| p.probes.base_container_supports_deny_paths);
+            let enumerate_paths = pc
+                .capabilities
+                .contains(&BackendCapability::FilesystemEnumeratePaths)
+                || probe
+                    .as_ref()
+                    .is_some_and(|p| p.probes.base_container_supports_enumerate_paths);
+            let host_loopback = pc
+                .capabilities
+                .contains(&BackendCapability::IngressHostLoopbackAllow)
+                || probe
+                    .as_ref()
+                    .is_some_and(|p| p.probes.base_container_supports_ingress_host_loopback_allow);
+            let capture_denials = pc.capabilities.contains(&BackendCapability::CaptureDenials)
+                || probe
+                    .as_ref()
+                    .is_some_and(|p| p.probes.native_capture_available);
+
+            return SandboxStatus {
+                backend: SandboxBackendKind::ProcessContainer,
+                tier: pc.tier.clone(),
+                supported: true,
+                read_deny,
+                enumerate_paths,
+                host_loopback,
+                capture_denials,
+                ui_isolation,
+                warnings,
+                reason: None,
+            };
+        }
+        SandboxStatus::unsupported(support.reason.unwrap_or_else(|| {
+            "Windows ProcessContainer (native PSEC 1.1+) is not available on this OS build"
+                .to_owned()
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(bwrap) = backends.iter().find(|b| b.backend == "bubblewrap") {
+            return SandboxStatus {
+                backend: SandboxBackendKind::Bubblewrap,
+                tier: None,
+                supported: true,
+                read_deny: true,
+                enumerate_paths: false,
+                host_loopback: true,
+                capture_denials: false,
+                ui_isolation: false,
+                warnings: bwrap.warnings.clone(),
+                reason: None,
+            };
+        }
+        return SandboxStatus::unsupported(
+            support
+                .reason
+                .unwrap_or_else(|| "Bubblewrap (bwrap) is not available on this host".to_owned()),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(seatbelt) = backends.iter().find(|b| b.backend == "seatbelt") {
+            let capture_denials = seatbelt
+                .capabilities
+                .contains(&BackendCapability::CaptureDenials);
+            return SandboxStatus {
+                backend: SandboxBackendKind::Seatbelt,
+                tier: None,
+                supported: true,
+                read_deny: true,
+                enumerate_paths: false,
+                host_loopback: true,
+                capture_denials,
+                ui_isolation: true,
+                warnings: seatbelt.warnings.clone(),
+                reason: None,
+            };
+        }
+        return SandboxStatus::unsupported(
+            support
+                .reason
+                .unwrap_or_else(|| "macOS Seatbelt (sandbox_init) is not available".to_owned()),
+        );
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = backends;
+        SandboxStatus::unsupported(
+            support
+                .reason
+                .unwrap_or_else(|| "MXC is not supported on this platform".to_owned()),
+        )
     }
 }
 
@@ -108,37 +245,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unsupported_status_never_claims_a_capability() {
-        let status = SandboxStatus::unsupported();
-        assert_eq!(status.platform, "unsupported");
-        for capability in [
-            status.restricted_token,
-            status.app_container,
-            status.job_limits,
-            status.read_deny,
-            status.identity,
-        ] {
-            assert_eq!(capability, Capability::Unavailable);
-        }
-        assert!(!status.script_isolation());
-        assert!(!status.agent_isolation());
+    fn unsupported_status_claims_zero_capabilities() {
+        let status = SandboxStatus::unsupported("no PSEC");
+        assert_eq!(status.backend, SandboxBackendKind::Unsupported);
+        assert!(!status.is_enforced());
+        assert!(!status.supports_read_isolation());
+        assert!(!status.supports_script_isolation());
+        assert!(!status.supports_agent_isolation());
+        assert!(status.summary().contains("no PSEC"));
     }
 
     #[test]
-    fn verified_capabilities_are_required_together() {
-        let mut status = SandboxStatus::unsupported();
-        status.app_container = Capability::Verified;
-        assert!(!status.script_isolation(), "Job 未验证时不得宣称脚本可沙箱");
-        status.job_limits = Capability::Verified;
-        assert!(status.script_isolation());
-        let mut status = SandboxStatus::unsupported();
-        status.restricted_token = Capability::Verified;
-        status.job_limits = Capability::Verified;
-        assert!(
-            !status.agent_isolation(),
-            "读隔离未验证时不得宣称 Agent 可沙箱"
-        );
-        status.read_deny = Capability::Verified;
-        assert!(status.agent_isolation());
+    fn agent_isolation_requires_read_deny_and_loopback() {
+        let mut s = SandboxStatus {
+            backend: SandboxBackendKind::ProcessContainer,
+            tier: Some("base-container".to_owned()),
+            supported: true,
+            ..SandboxStatus::default()
+        };
+        assert!(s.is_enforced());
+        assert!(!s.supports_agent_isolation());
+        s.read_deny = true;
+        assert!(s.supports_script_isolation());
+        assert!(!s.supports_agent_isolation());
+        s.host_loopback = true;
+        assert!(s.supports_agent_isolation());
+        assert!(s.summary().contains("processcontainer (base-container)"));
     }
 }

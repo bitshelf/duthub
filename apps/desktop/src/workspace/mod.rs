@@ -1093,6 +1093,8 @@ pub struct Workbench {
     pub(crate) mcp_runtime: crate::mcp_runtime::McpRuntimeHandles,
     /// 与 MCP 运行时共享的状态（HostManager 构造来源；T16 保存避免只活在线程闭包）。
     pub(crate) mcp_state: Arc<dyn duthub_mcp::state::McpState>,
+    /// Live flash tool presets & ADB path mirrored into `RuntimeMcpState`.
+    mcp_tools_config: Arc<Mutex<crate::mcp_runtime::RuntimeToolsConfig>>,
     /// Agent 接入上下文（认证/租约/审计）：每 DUT Agent 会话的运行时来源。
     pub(crate) agent_access: Option<Arc<duthub_mcp::auth_http::AccessContext>>,
     /// 每 DUT 独立 Agent 输入草稿（F13：切换 DUT 不串文本）。
@@ -1317,10 +1319,9 @@ pub struct Workbench {
     /// Cached compiled prompt highlight rules (`Arc` avoids cloning Regex + Strings every frame).
     highlight_cache: std::cell::RefCell<HashMap<String, Option<regex::Regex>>>,
     highlight_rules_cache: std::cell::RefCell<HighlightRulesCache>,
-    /// Per-DUT OS isolation probe cache (10s TTL) so render frames never run Win32 ACL/token probes.
-    os_isolation_cache: std::cell::RefCell<
-        HashMap<String, (std::time::Instant, duthub_sandbox::OsIsolationStatus)>,
-    >,
+    /// Cached host MXC OS sandbox status (10s TTL) so render frames never run OS probes at 60 FPS.
+    sandbox_status_cache:
+        std::cell::RefCell<Option<(std::time::Instant, duthub_sandbox::SandboxStatus)>>,
     /// Shared Tokio runtime owned for the lifetime of the desktop process.
     _shared_runtime: Arc<tokio::runtime::Runtime>,
     /// 最近一次下发给 real 会话的网格尺寸（None = 未发送；会话新建后重发）
@@ -1885,6 +1886,10 @@ impl Workbench {
         let mcp_port = settings.agent_access.http_port;
         let mcp_lan_access = settings.agent_access.lan_access;
         let mcp_bound_endpoint = Arc::new(OnceLock::new());
+        let mcp_tools_config = Arc::new(Mutex::new(crate::mcp_runtime::RuntimeToolsConfig {
+            flash_tools: settings.flash_tools.clone(),
+            adb_executable: settings.tools.adb_executable.clone(),
+        }));
         // Keep a typed handle: `Arc<dyn McpState>` cannot be downcast, and the
         // MCP listeners need a `UserNotifier` for `notify_user` (design §7).
         let runtime_state = Arc::new(crate::mcp_runtime::RuntimeMcpState::new(
@@ -1898,6 +1903,7 @@ impl Workbench {
             alerts.clone(),
             wb_work_dir.clone(),
             access_ctx.clone(),
+            mcp_tools_config.clone(),
         ));
         let mcp_state: Arc<dyn duthub_mcp::state::McpState> = runtime_state.clone();
         // A2A 运行时（W4a）：为已启用 DUT 绑定回环监听器；MCP 端口预登记为
@@ -1957,6 +1963,7 @@ impl Workbench {
             agent_host_toasts: Arc::new(Mutex::new(Vec::new())),
             mcp_runtime: crate::mcp_runtime::McpRuntimeHandles::default(),
             mcp_state: mcp_state.clone(),
+            mcp_tools_config,
             agent_access: access_ctx.clone(),
             agent_prompts: HashMap::new(),
             agent_transcript_scroll: HashMap::new(),
@@ -2042,7 +2049,7 @@ impl Workbench {
             serial_rule_selected: 0,
             highlight_cache: std::cell::RefCell::new(HashMap::new()),
             highlight_rules_cache: std::cell::RefCell::new(None),
-            os_isolation_cache: std::cell::RefCell::new(HashMap::new()),
+            sandbox_status_cache: std::cell::RefCell::new(None),
             _shared_runtime: shared_runtime,
             term_grid: None,
             terminal_zoom_size: None,

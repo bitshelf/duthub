@@ -442,10 +442,12 @@ fn notify_user_is_wired_only_for_user_configured_listeners() {
     );
     let plan_tools = duthub_desktop::agent_host::cli::PLAN_TOOLS;
     assert!(!plan_tools.contains(&"notify_user"));
+    assert!(!plan_tools.contains(&"dut_control"));
+    assert!(!plan_tools.contains(&"serial_exec"));
     assert_eq!(
         plan_tools.len(),
-        13,
-        "PLAN_TOOLS stays at 13 read-only tools"
+        10,
+        "PLAN_TOOLS stays at 10 read-only tools"
     );
 }
 

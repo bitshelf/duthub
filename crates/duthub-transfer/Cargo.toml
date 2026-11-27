@@ -35,3 +35,4 @@ tracing.workspace = true
 bytes = "1"
 futures-util = { version = "0.3", default-features = false }
 reqwest = { workspace = true, features = ["json", "stream", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

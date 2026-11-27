@@ -23,26 +23,23 @@ fn load_workspace_setting(candidates: &[PathBuf]) -> Option<String> {
 ///    （相对路径锚定本进程 exe 目录）；
 /// 2) 均未配置时优先选择新快照，兼容旧目录中的快照。
 fn discover_data_dir() -> PathBuf {
-    let args: Vec<String> = std::env::args().collect();
-    let cli = args
-        .iter()
-        .position(|a| a == "--workdir")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
     let anchor = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     use duthub_core::store::{config_dir_in, default_work_dir_in, resolve_portable_work_dir_in};
+    match duthub_core::store::explicit_workspace(&anchor, std::env::args_os().skip(1)) {
+        Ok(Some(root)) => return configured_data_dir(root),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("[duthub-mcp] {error}");
+            std::process::exit(2);
+        }
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| anchor.clone());
     let settings_workspace = load_workspace_setting(&[config_dir_in(&anchor), config_dir_in(&cwd)]);
 
-    if let Some(configured) = cli
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .or(settings_workspace.as_deref())
-    {
+    if let Some(configured) = settings_workspace.as_deref() {
         let root = resolve_portable_work_dir_in(&anchor, None, Some(configured));
         return configured_data_dir(root);
     }

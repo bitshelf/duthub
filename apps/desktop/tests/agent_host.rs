@@ -423,24 +423,44 @@ fn acp_child_env_excludes_user_dirs_and_uses_sandbox_temp() {
         })
         .collect();
 
-    for key in [
-        "USERPROFILE",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "HOME",
-        "HOMEDRIVE",
-        "HOMEPATH",
-    ] {
+    for key in ["USERPROFILE", "APPDATA", "HOME", "HOMEDRIVE", "HOMEPATH"] {
         assert!(
             !env.contains_key(key),
             "子进程不得继承 {key}：{:?}",
             env.get(key)
         );
     }
+    // Windows PSEC requires `LOCALAPPDATA` to be present when default
+    // environment inheritance is disabled and appends `Packages\sandbox.<guid>\AC`
+    // beneath the supplied path; verify it stays inside `<cell>/home/AppData/Local`
+    // and never inherits host `%LOCALAPPDATA%`.
+    let local_app_data = env
+        .get("LOCALAPPDATA")
+        .expect("LOCALAPPDATA 必须指向沙箱单元");
+    let expected_local_app_data = paths.sandbox.join("home").join("AppData").join("Local");
+    assert!(
+        PathBuf::from(local_app_data).starts_with(&expected_local_app_data),
+        "LOCALAPPDATA 必须位于 sandbox/home/AppData/Local 下，实际: {local_app_data}"
+    );
+    if let Some(host_local) = std::env::var_os("LOCALAPPDATA") {
+        assert_ne!(
+            PathBuf::from(local_app_data),
+            PathBuf::from(host_local),
+            "LOCALAPPDATA 不得继承宿主用户目录"
+        );
+    }
     let temp = env.get("TEMP").expect("TEMP 必须注入");
     let tmp = env.get("TMP").expect("TMP 必须注入");
-    assert_eq!(PathBuf::from(temp), paths.temp, "TEMP 必须指向 sandbox/tmp");
-    assert_eq!(PathBuf::from(tmp), paths.temp, "TMP 必须指向 sandbox/tmp");
+    // Windows PSEC may redirect TEMP/TMP to `<LOCALAPPDATA>\Packages\sandbox.<guid>\AC\Temp`
+    // beneath the cell root; both remain strictly confined inside `paths.sandbox`.
+    assert!(
+        PathBuf::from(temp).starts_with(&paths.sandbox),
+        "TEMP 必须位于 sandbox 单元内，实际: {temp}"
+    );
+    assert!(
+        PathBuf::from(tmp).starts_with(&paths.sandbox),
+        "TMP 必须位于 sandbox 单元内，实际: {tmp}"
+    );
     assert_ne!(
         PathBuf::from(temp),
         std::env::temp_dir(),

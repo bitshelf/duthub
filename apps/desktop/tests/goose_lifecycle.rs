@@ -432,50 +432,66 @@ fn mcp_unreachable_is_rejected_by_extension_validation() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// F5：`AcpClient::kill` 必须终止孙进程（taskkill /T），不是只杀直接子进程。
+/// F5: `AcpClient::kill` must terminate descendant processes via the MXC
+/// sandbox Job tree, not just the direct child.
 #[test]
 fn kill_terminates_grandchild_process() {
     let work = temp_dir("tree");
-    let pid_file = work.join("grandchild.pid");
+    let marker = work.join("grandchild-marker.txt");
+    let child = work.join("grandchild-loop.cmd");
+    std::fs::write(
+        &child,
+        "@echo off\r\n\
+         :loop\r\n\
+         echo tick>>grandchild-marker.txt\r\n\
+         for /L %%i in (1,1,4000) do @rem\r\n\
+         goto loop\r\n",
+    )
+    .unwrap();
     let script = work.join("spawn-tree.cmd");
     std::fs::write(
         &script,
-        format!(
-            "@echo off\r\n\
-             start \"\" /b powershell -NoProfile -Command \"$PID | Set-Content -Path '{pid}'; Start-Sleep -Seconds 60\"\r\n\
-             ping -n 60 127.0.0.1 >nul\r\n",
-            pid = pid_file.display()
-        ),
+        "@echo off\r\ncmd.exe /D /Q /C grandchild-loop.cmd\r\n",
     )
     .unwrap();
-    let cmd = std::env::var_os("COMSPEC").map_or_else(|| PathBuf::from("cmd.exe"), PathBuf::from);
+    let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+        .join("System32")
+        .join("cmd.exe");
     let acp = AcpClient::spawn(
         &cmd,
-        &["/c".into(), script.to_string_lossy().into_owned()],
+        &[
+            "/D".into(),
+            "/Q".into(),
+            "/C".into(),
+            script.to_string_lossy().into_owned(),
+        ],
         &work,
         &[],
         4096,
     )
     .unwrap();
 
-    // Wait until `Set-Content` has both created AND flushed a parseable PID
-    // (checking only `is_file()` races with an empty file on Windows).
-    let mut grandchild = None;
-    let _ = wait_until(Duration::from_secs(30), || {
-        grandchild = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok());
-        grandchild.is_some()
-    });
-    let grandchild =
-        grandchild.unwrap_or_else(|| panic!("孙进程未写出 PID: {}", pid_file.display()));
-    assert_ne!(grandchild, acp.pid(), "孙进程 PID 不应等于父进程");
-    assert!(process_alive(grandchild), "孙进程未启动: {grandchild}");
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0) > 0
+        }),
+        "grandchild never wrote marker: {}",
+        marker.display()
+    );
+    let root = acp.pid();
 
     acp.kill();
     assert!(
-        wait_until(Duration::from_secs(15), || !process_alive(grandchild)),
-        "停止后孙进程仍在运行: {grandchild}"
+        wait_until(Duration::from_secs(15), || !process_alive(root)),
+        "root process still alive after kill: {root}"
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    let after_kill = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(600));
+    let later = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        after_kill, later,
+        "grandchild kept writing after AcpClient::kill() ({after_kill} -> {later})"
     );
     drop(acp);
     let _ = std::fs::remove_dir_all(&work);

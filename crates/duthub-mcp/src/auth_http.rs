@@ -17,12 +17,14 @@
 //! 最小复现通过、接入 rmcp 路由后 Service 绑定不满足），手写实现完全确定且
 //! 不引入额外依赖形态。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::Request;
 use axum::response::{IntoResponse, Response};
 
@@ -55,10 +57,14 @@ impl AccessContext {
     }
 }
 
-/// Default failed-auth budget per sliding window (LAN brute-force hardening).
+/// Default failed-auth budget per source inside the sliding window.
 pub const AUTH_FAILURE_LIMIT: usize = 60;
 /// Default sliding window for [`AUTH_FAILURE_LIMIT`].
 pub const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// Upper bound on distinct source buckets tracked in memory per listener so
+/// spoofed or rotating source addresses cannot grow memory unboundedly.
+pub const MAX_TRACKED_AUTH_SOURCES: usize = 1024;
+const DEFAULT_AUTH_SOURCE: &str = "unknown";
 
 /// How a failed authentication attempt should be handled by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,17 +81,19 @@ pub enum AuthFailureDecision {
 struct AuthFailureWindow {
     failures: VecDeque<Instant>,
     tripped: bool,
+    last_seen: Option<Instant>,
 }
 
-/// Sliding-window limiter for failed Bearer authentication attempts.
+/// Per-source sliding-window limiter for failed Bearer authentication attempts.
 ///
-/// Successful requests are not recorded. Once the number of failures inside
-/// the window exceeds the configured limit, callers should answer `429` and
-/// stop writing one audit line per attempt (only the first trip is audited).
+/// Buckets are partitioned by client source IP so brute-force traffic from one
+/// peer cannot exhaust the failure budget of legitimate clients on the same
+/// listener. Successful requests are never recorded.
 pub struct AuthFailureLimiter {
     limit: usize,
     window: Duration,
-    state: Mutex<AuthFailureWindow>,
+    max_sources: usize,
+    sources: Mutex<HashMap<String, AuthFailureWindow>>,
 }
 
 impl Default for AuthFailureLimiter {
@@ -101,21 +109,39 @@ impl AuthFailureLimiter {
 
     /// Test/host override for the failure budget.
     pub fn with_limits(limit: usize, window: Duration) -> Self {
+        Self::with_limits_and_capacity(limit, window, MAX_TRACKED_AUTH_SOURCES)
+    }
+
+    /// Test override for both the failure budget and tracked source capacity.
+    pub fn with_limits_and_capacity(limit: usize, window: Duration, max_sources: usize) -> Self {
         Self {
             limit,
             window,
-            state: Mutex::new(AuthFailureWindow::default()),
+            max_sources: max_sources.max(1),
+            sources: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Record one failed attempt and report whether it should be audited.
+    /// Record one failed attempt on the default bucket (legacy/single-source callers).
     pub fn record_failure(&self) -> AuthFailureDecision {
-        let mut state = self.state.lock().unwrap();
-        self.prune(&mut state);
+        self.record_failure_for(DEFAULT_AUTH_SOURCE)
+    }
+
+    /// Record one failed attempt for `source` and report whether it should be audited.
+    pub fn record_failure_for(&self, source: &str) -> AuthFailureDecision {
+        let now = Instant::now();
+        let mut map = self
+            .sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.evict_if_needed(&mut map, source, now);
+        let state = map.entry(source.to_owned()).or_default();
+        self.prune(state, now);
         if state.failures.len() <= self.limit {
             state.tripped = false;
         }
-        state.failures.push_back(Instant::now());
+        state.failures.push_back(now);
+        state.last_seen = Some(now);
         let total = state.failures.len();
         if total > self.limit {
             if state.tripped {
@@ -129,18 +155,68 @@ impl AuthFailureLimiter {
         }
     }
 
-    /// True while the failure count inside the window exceeds the limit.
+    /// True while the default bucket exceeds the failure limit.
     pub fn is_limited(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        self.prune(&mut state);
+        self.is_limited_for(DEFAULT_AUTH_SOURCE)
+    }
+
+    /// True while `source` exceeds the failure limit inside the active window.
+    pub fn is_limited_for(&self, source: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self
+            .sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = map.get_mut(source) else {
+            return false;
+        };
+        self.prune(state, now);
+        if state.failures.is_empty() {
+            map.remove(source);
+            return false;
+        }
         if state.failures.len() <= self.limit {
             state.tripped = false;
         }
         state.failures.len() > self.limit
     }
 
-    fn prune(&self, state: &mut AuthFailureWindow) {
-        let now = Instant::now();
+    /// Number of currently tracked source buckets (diagnostics / tests).
+    pub fn tracked_sources(&self) -> usize {
+        self.sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn evict_if_needed(
+        &self,
+        map: &mut HashMap<String, AuthFailureWindow>,
+        incoming: &str,
+        now: Instant,
+    ) {
+        if map.contains_key(incoming) || map.len() < self.max_sources {
+            return;
+        }
+        // First reclaim any buckets whose failures have already expired.
+        map.retain(|_, window| {
+            self.prune(window, now);
+            !window.failures.is_empty()
+        });
+        if map.len() < self.max_sources {
+            return;
+        }
+        // Still full: evict the least-recently-seen source so memory stays bounded.
+        if let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, window)| window.last_seen)
+            .map(|(key, _)| key.clone())
+        {
+            map.remove(&oldest_key);
+        }
+    }
+
+    fn prune(&self, state: &mut AuthFailureWindow, now: Instant) {
         while state
             .failures
             .front()
@@ -206,10 +282,16 @@ where
         let listener_id = self.listener_id.clone();
         let failures = self.failures.clone();
         let mut inner = self.inner.clone();
+        let source_key = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip().to_string())
+            .unwrap_or_else(|| DEFAULT_AUTH_SOURCE.to_owned());
         Box::pin(async move {
-            // Reject before touching credentials while the window is exhausted:
-            // LAN clients cannot keep probing tokens at line rate.
-            if failures.is_limited() {
+            // Reject before touching credentials while this source's window is
+            // exhausted: brute-force traffic from one peer cannot keep probing
+            // at line rate, while other source IPs keep their own budget.
+            if failures.is_limited_for(&source_key) {
                 return Ok(rate_limited_response());
             }
             let bearer = bearer_token(req.headers());
@@ -240,7 +322,7 @@ where
                 Err(err) => {
                     // 失败细节只进审计（脱敏），响应统一 401 不区分原因（SPEC §5.1.6）。
                     // 超过失败预算后只记一条聚合事件，后续失败不再逐条落审计。
-                    let decision = failures.record_failure();
+                    let decision = failures.record_failure_for(&source_key);
                     match decision {
                         AuthFailureDecision::Audit => {
                             ctx.audit.record(
@@ -259,13 +341,15 @@ where
                                 None,
                                 None,
                                 AuditOutcome::Denied,
-                                Some(&format!("认证失败 {total} 次/窗口，已限流 (rate_limited)")),
+                                Some(&format!(
+                                    "来源 {source_key} 认证失败 {total} 次/窗口，已限流 (rate_limited)"
+                                )),
                             );
                         }
                         AuthFailureDecision::Suppressed => {}
                     }
                     if matches!(decision, AuthFailureDecision::Aggregated { .. })
-                        || failures.is_limited()
+                        || failures.is_limited_for(&source_key)
                     {
                         Ok(rate_limited_response())
                     } else {
@@ -566,5 +650,36 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    #[test]
+    fn per_source_failure_limiter_isolates_attackers_and_bounds_memory() {
+        let limiter = AuthFailureLimiter::with_limits_and_capacity(3, Duration::from_secs(60), 4);
+        // Attacker exhausts its own source bucket.
+        for _ in 0..3 {
+            assert_eq!(
+                limiter.record_failure_for("10.0.0.99"),
+                AuthFailureDecision::Audit
+            );
+        }
+        assert_eq!(
+            limiter.record_failure_for("10.0.0.99"),
+            AuthFailureDecision::Aggregated { total: 4 }
+        );
+        assert_eq!(
+            limiter.record_failure_for("10.0.0.99"),
+            AuthFailureDecision::Suppressed
+        );
+        assert!(limiter.is_limited_for("10.0.0.99"));
+
+        // Legitimate peers on other IPs remain completely unaffected.
+        assert!(!limiter.is_limited_for("10.0.0.10"));
+        assert!(!limiter.is_limited_for("127.0.0.1"));
+
+        // Flood of distinct source IPs stays bounded at max_sources.
+        for idx in 0..20 {
+            let _ = limiter.record_failure_for(&format!("192.168.1.{idx}"));
+        }
+        assert!(limiter.tracked_sources() <= 4);
     }
 }

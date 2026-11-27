@@ -127,27 +127,34 @@ impl NotifyRateLimiter {
     }
 }
 
+/// Live tool configuration synced from `settings.json` into `RuntimeMcpState`.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeToolsConfig {
+    pub flash_tools: Vec<duthub_core::model::FlashToolPreset>,
+    pub adb_executable: String,
+}
+
 pub struct RuntimeMcpState {
     device: Arc<DeviceService>,
     snapshot: Arc<std::sync::Mutex<duthub_mcp::snapshot::StateSnapshot>>,
     approval: Arc<ApprovalManager>,
-    /// 共用设备操作入口：控制动作的授权/绑定/能力校验与驱动派发都收口在此。
+    /// Shared device control entry point: authorization, bindings, capabilities, and driver dispatch.
     control: Arc<ControlService>,
-    /// 心跳引擎（需求⑦）：Agent 经 heartbeat.set 改写命令/间隔。
+    /// Heartbeat service (allows updating command/interval via MCP).
     heartbeat: Arc<HeartbeatService>,
     media_urls: crate::media::MediaUrls,
     /// GUI end of the media-op bridge (`sync_channel(8)` + oneshot replies):
     /// `media_streams` with an `op` enqueues here and the Workbench tick
     /// answers (§5.5). This clone shares one queue with `MediaView`.
     media_ops: crate::media_page::MediaOpSubmitter,
-    /// 异常弹窗提醒中心（需求⑤）：MCP 侧控制动作失败经此回 GUI 弹窗
-    ///（HTTP 线程与 Workbench 共用同一实例）。
+    /// Alert center shared between MCP HTTP threads and the Workbench UI.
     alerts: Arc<std::sync::Mutex<AlertCenter>>,
-    /// 工作目录（`resolve_work_dir_in` 同源解析）：skill_export 落盘锚点。
+    /// Work directory (`resolve_work_dir_in`): anchor for logs and skill export.
     work_dir: PathBuf,
-    /// Agent 接入上下文（认证/租约/审计）：控制权四件套与写工具租约复核的
-    /// 唯一租约管理器实例（与 DeviceService 写入通道共享）。
+    /// Agent access context (auth / leases / audit) shared with `DeviceService`.
     access: Option<Arc<AccessContext>>,
+    /// Live flash presets and ADB executable path synced from `settings.json`.
+    tools_config: Arc<Mutex<RuntimeToolsConfig>>,
     /// Host-side `notify_user` rate limiting (per credential + global).
     notify_limiter: NotifyRateLimiter,
 }
@@ -165,6 +172,7 @@ impl RuntimeMcpState {
         alerts: Arc<std::sync::Mutex<AlertCenter>>,
         work_dir: PathBuf,
         access: Option<Arc<AccessContext>>,
+        tools_config: Arc<Mutex<RuntimeToolsConfig>>,
     ) -> Self {
         Self {
             device,
@@ -177,8 +185,56 @@ impl RuntimeMcpState {
             alerts,
             work_dir,
             access,
+            tools_config,
             notify_limiter: NotifyRateLimiter::new(),
         }
+    }
+
+    fn resolve_flash_executable(&self, preset_id: Option<&str>) -> Result<String, String> {
+        let cfg = self
+            .tools_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let preset = if let Some(wanted) = preset_id.map(str::trim).filter(|s| !s.is_empty()) {
+            cfg.flash_tools
+                .iter()
+                .find(|p| p.id == wanted || p.name.eq_ignore_ascii_case(wanted))
+                .ok_or_else(|| format!("flash preset not found: {wanted}"))?
+        } else {
+            cfg.flash_tools
+                .iter()
+                .find(|p| {
+                    p.executable.to_ascii_lowercase().contains("upgrade_tool")
+                        || p.name.to_ascii_lowercase().contains("upgrade_tool")
+                })
+                .or_else(|| cfg.flash_tools.first())
+                .ok_or_else(|| "no flash tool preset is configured in settings.json".to_string())?
+        };
+        let exe = preset.executable.trim();
+        if exe.is_empty() {
+            return Err(format!(
+                "flash preset {} has no executable configured",
+                preset.id
+            ));
+        }
+        Ok(exe.to_owned())
+    }
+
+    fn resolve_adb_executable(&self) -> String {
+        let cfg = self
+            .tools_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        duthub_desktop::tool_resolver::effective_spec(&cfg.adb_executable, "adb")
+    }
+
+    fn begin_agent_action<'a>(
+        lease: &'a Option<Arc<ControlLeaseManager>>,
+    ) -> Result<Option<impl Drop + 'a>, String> {
+        lease
+            .as_ref()
+            .map(|lease| lease.begin_agent_action().map_err(|err| lease_err(&err)))
+            .transpose()
     }
 
     /// 控制动作统一走共用设备操作入口；授权错误带类别码便于 MCP 客户端感知。
@@ -253,6 +309,32 @@ impl RuntimeMcpState {
             .lock()
             .map(|mut center| center.report_for(dut_id, AlertSource::Control, title, detail));
     }
+}
+
+/// Redact host-side directory prefixes from subprocess output so remote Agents
+/// never see Windows host paths or usernames while keeping plain filenames clear.
+fn redact_host_dir(text: &str, host_dir: &std::path::Path) -> String {
+    let raw = host_dir.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let mut out = text.to_owned();
+    for prefix in [
+        format!(r"\\?\{stripped}\"),
+        format!(r"\\?\{stripped}/"),
+        format!(r"{stripped}\"),
+        format!("{stripped}/"),
+        format!(r"\\?\{stripped}"),
+        stripped.to_owned(),
+    ] {
+        if !prefix.is_empty() {
+            let replacement = if prefix.ends_with('\\') || prefix.ends_with('/') {
+                "<dut-dir>/"
+            } else {
+                "<dut-dir>"
+            };
+            out = out.replace(&prefix, replacement);
+        }
+    }
+    out
 }
 
 /// 租约错误 → `LeaseRequired/{code}: {message}`（与 server.rs 前缀约定一致）。
@@ -436,7 +518,11 @@ impl McpState for RuntimeMcpState {
     }
 
     fn discover_adb_devices(&self) -> Result<Vec<AdbDeviceDto>, String> {
-        duthub_adb::list_local_server_devices()
+        let devices = duthub_adb::list_local_server_devices().or_else(|_| {
+            let spec = self.resolve_adb_executable();
+            duthub_adb::AdbClient::real().devices_l(&spec)
+        });
+        devices
             .map(|devices| {
                 devices
                     .into_iter()
@@ -456,7 +542,140 @@ impl McpState for RuntimeMcpState {
         _argv: &[String],
         _writer: WriteIdentity,
     ) -> Result<ProcessResultDto, String> {
-        Err("adb.shell 经 MCP 暂未开放（与 GUI 审批面接线后启用）".into())
+        Err("adb_shell is deprecated; use adb_exec instead".into())
+    }
+
+    fn adb_exec(
+        &self,
+        dut_id: &str,
+        op: &str,
+        command: Option<&str>,
+        file_id: Option<&str>,
+        remote_path: Option<&str>,
+        timeout_ms: u64,
+        _writer: WriteIdentity,
+    ) -> Result<ProcessResultDto, String> {
+        use duthub_core::process::{ProcessRunner, RealProcessRunner, resolve_executable};
+
+        let lease = self.device.lease_manager();
+        let _agent_action = Self::begin_agent_action(&lease)?;
+        let dut = self
+            .dut_info(dut_id)
+            .ok_or_else(|| "DUT not found".to_string())?;
+        let serial = dut
+            .adb_serial
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "DUT has no bound ADB serial configured".to_string())?;
+        let adb_spec = self.resolve_adb_executable();
+        let devices = duthub_adb::AdbClient::real()
+            .devices_l(&adb_spec)
+            .map_err(|err| format!("ADB discovery failed: {err}"))?;
+        let target = devices
+            .iter()
+            .find(|d| d.serial == serial)
+            .ok_or_else(|| format!("bound ADB device {serial} is not connected"))?;
+        if !matches!(target.state.as_str(), "device" | "recovery") {
+            return Err(format!(
+                "bound ADB device {serial} is not ready (state: {})",
+                target.state
+            ));
+        }
+
+        let mut argv: Vec<String> = vec!["-s".into(), serial.to_owned()];
+        match op {
+            "shell" => {
+                let cmd = command
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "command is required for adb_exec(op=\"shell\")".to_string())?;
+                argv.push("shell".into());
+                argv.push(cmd.to_owned());
+            }
+            "reboot" => {
+                let _ = self.device.log_mark(dut_id, "adb reboot");
+                argv.push("reboot".into());
+            }
+            "reboot_loader" => {
+                let _ = self.device.log_mark(dut_id, "adb reboot loader");
+                argv.push("reboot".into());
+                argv.push("loader".into());
+            }
+            "logcat" => {
+                argv.extend(["logcat".into(), "-d".into(), "-t".into(), "200".into()]);
+            }
+            "push" => {
+                let root = self
+                    .dut_artifact_root()
+                    .ok_or_else(|| "DUT artifact directory unavailable".to_string())?;
+                let fid = file_id
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "fileId is required for adb push".to_string())?;
+                let remote = remote_path
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "remotePath is required for adb push".to_string())?;
+                let verified_src = duthub_core::dut_artifacts::resolve_owned_file(
+                    &root,
+                    &dut.dut_id,
+                    &dut.name,
+                    fid,
+                )
+                .map_err(|err| format!("file fence rejected push source: {err}"))?;
+                argv.extend([
+                    "push".into(),
+                    verified_src.to_string_lossy().into_owned(),
+                    remote.to_owned(),
+                ]);
+            }
+            "pull" => {
+                let root = self
+                    .dut_artifact_root()
+                    .ok_or_else(|| "DUT artifact directory unavailable".to_string())?;
+                let fid = file_id
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "fileId is required for adb pull".to_string())?;
+                let remote = remote_path
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "remotePath is required for adb pull".to_string())?;
+                let verified_dst = duthub_core::dut_artifacts::prepare_owned_destination(
+                    &root,
+                    &dut.dut_id,
+                    &dut.name,
+                    fid,
+                )
+                .map_err(|err| format!("file fence rejected pull destination: {err}"))?;
+                argv.extend([
+                    "pull".into(),
+                    remote.to_owned(),
+                    verified_dst.to_string_lossy().into_owned(),
+                ]);
+            }
+            other => return Err(format!("unsupported adb_exec op: {other}")),
+        }
+
+        let exe = resolve_executable(&adb_spec).map_err(|err| err.to_string())?;
+        let out = RealProcessRunner
+            .run(&exe, &argv, Duration::from_millis(timeout_ms))
+            .map_err(|err| err.to_string())?;
+        let dut_dir = self.dut_artifact_root().map(|root| root.join(&dut.name));
+        let (stdout, stderr) = match dut_dir.as_deref() {
+            Some(dir) => (
+                redact_host_dir(&out.stdout, dir),
+                redact_host_dir(&out.stderr, dir),
+            ),
+            None => (out.stdout, out.stderr),
+        };
+        Ok(ProcessResultDto {
+            exit_code: out.exit_code,
+            stdout,
+            stderr,
+            elapsed_ms: out.elapsed_ms,
+        })
     }
 
     fn control_power(
@@ -488,6 +707,51 @@ impl McpState for RuntimeMcpState {
         self.control_execute(
             dut_id,
             ControlAction::PowerKey { long_press },
+            approval_token,
+            writer,
+        )
+    }
+
+    fn control_power_cycle(
+        &self,
+        dut_id: &str,
+        off_ms: u64,
+        approval_token: &str,
+        writer: WriteIdentity,
+    ) -> Result<(), String> {
+        self.control_execute(
+            dut_id,
+            ControlAction::PowerCycle { off_ms },
+            approval_token,
+            writer,
+        )
+    }
+
+    fn control_enter_maskrom(
+        &self,
+        dut_id: &str,
+        hold_ms: u64,
+        approval_token: &str,
+        writer: WriteIdentity,
+    ) -> Result<(), String> {
+        self.control_execute(
+            dut_id,
+            ControlAction::EnterMaskrom { hold_ms },
+            approval_token,
+            writer,
+        )
+    }
+
+    fn control_enter_loader(
+        &self,
+        dut_id: &str,
+        hold_ms: u64,
+        approval_token: &str,
+        writer: WriteIdentity,
+    ) -> Result<(), String> {
+        self.control_execute(
+            dut_id,
+            ControlAction::EnterLoader { hold_ms },
             approval_token,
             writer,
         )
@@ -572,7 +836,92 @@ impl McpState for RuntimeMcpState {
     }
 
     fn flash_test(&self, _preset_id: &str) -> Result<ProcessResultDto, String> {
-        Err("flash.test 经 MCP 暂未开放（preset_id 按 settings.flashTools[].id 解析与 GUI 接线后启用）".into())
+        Err("flash_test is deprecated; use dut_control(action=\"flash_list\")".into())
+    }
+
+    fn flash_list(&self, preset_id: Option<&str>) -> Result<ProcessResultDto, String> {
+        let exe = self.resolve_flash_executable(preset_id)?;
+        let out = duthub_flash::FlashTester::real()
+            .list_devices(&exe)
+            .map_err(|err| err.to_string())?;
+        Ok(ProcessResultDto {
+            exit_code: out.exit_code,
+            stdout: out.stdout,
+            stderr: out.stderr,
+            elapsed_ms: out.elapsed_ms,
+        })
+    }
+
+    fn flash_update(
+        &self,
+        dut_id: &str,
+        file_id: &str,
+        preset_id: Option<&str>,
+        _writer: WriteIdentity,
+    ) -> Result<ProcessResultDto, String> {
+        let lease = self.device.lease_manager();
+        let _agent_action = Self::begin_agent_action(&lease)?;
+        let root = self
+            .dut_artifact_root()
+            .ok_or_else(|| "DUT artifact directory unavailable".to_string())?;
+        let dut = self
+            .dut_info(dut_id)
+            .ok_or_else(|| "DUT not found".to_string())?;
+        let verified_image =
+            duthub_core::dut_artifacts::resolve_owned_file(&root, &dut.dut_id, &dut.name, file_id)
+                .map_err(|err| format!("file fence rejected firmware image: {err}"))?;
+        let exe = self.resolve_flash_executable(preset_id)?;
+        let _ = self
+            .device
+            .log_mark(dut_id, &format!("flash start {file_id}"));
+        let dut_dir = root.join(&dut.name);
+        match duthub_flash::FlashTester::real().upgrade_firmware(&exe, &verified_image) {
+            Ok(out) => {
+                let status = if out.exit_code == Some(0) {
+                    "done"
+                } else {
+                    "failed"
+                };
+                let _ = self
+                    .device
+                    .log_mark(dut_id, &format!("flash {status} {file_id}"));
+                Ok(ProcessResultDto {
+                    exit_code: out.exit_code,
+                    stdout: redact_host_dir(&out.stdout, &dut_dir),
+                    stderr: redact_host_dir(&out.stderr, &dut_dir),
+                    elapsed_ms: out.elapsed_ms,
+                })
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                let _ = self
+                    .device
+                    .log_mark(dut_id, &format!("flash failed {file_id}"));
+                self.report_control_failure(dut_id, "flash_update", &msg);
+                Err(msg)
+            }
+        }
+    }
+
+    fn flash_reboot(
+        &self,
+        dut_id: &str,
+        preset_id: Option<&str>,
+        _writer: WriteIdentity,
+    ) -> Result<ProcessResultDto, String> {
+        let lease = self.device.lease_manager();
+        let _agent_action = Self::begin_agent_action(&lease)?;
+        let exe = self.resolve_flash_executable(preset_id)?;
+        let _ = self.device.log_mark(dut_id, "flash reboot");
+        let out = duthub_flash::FlashTester::real()
+            .reboot_device(&exe)
+            .map_err(|err| err.to_string())?;
+        Ok(ProcessResultDto {
+            exit_code: out.exit_code,
+            stdout: out.stdout,
+            stderr: out.stderr,
+            elapsed_ms: out.elapsed_ms,
+        })
     }
 
     fn approval_issue(&self, dut_id: &str, action: &str, args_json: &str) -> ApprovalIssueResult {

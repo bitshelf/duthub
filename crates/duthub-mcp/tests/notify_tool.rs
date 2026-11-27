@@ -243,10 +243,12 @@ async fn endpoint_without_a_notifier_hides_and_rejects_notify_user() {
     let names = tool_names(&tools);
     assert_eq!(
         names.len(),
-        13,
-        "no notifier keeps the 13-tool surface: {names:?}"
+        10,
+        "no notifier keeps the 10-tool read-only surface: {names:?}"
     );
     assert!(!names.iter().any(|name| name == NOTIFY), "{names:?}");
+    assert!(!names.iter().any(|name| name == "dut_control"), "{names:?}");
+    assert!(!names.iter().any(|name| name == "serial_exec"), "{names:?}");
 
     let error = call(&client, NOTIFY, json!({"message": "hello"}))
         .await
@@ -283,6 +285,9 @@ async fn dut_bound_endpoint_lists_fourteen_tools_and_queues_a_notice() {
     let names = tool_names(&tools);
     assert_eq!(names.len(), 14, "{names:?}");
     assert!(names.iter().any(|name| name == NOTIFY), "{names:?}");
+    assert!(names.iter().any(|name| name == "dut_control"), "{names:?}");
+    assert!(names.iter().any(|name| name == "serial_exec"), "{names:?}");
+    assert!(names.iter().any(|name| name == "adb_exec"), "{names:?}");
 
     let data = call(&client, NOTIFY, json!({"message": "boot finished"}))
         .await

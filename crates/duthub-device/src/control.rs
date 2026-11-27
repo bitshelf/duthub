@@ -24,13 +24,39 @@ use duthub_core::{
 
 use crate::relay_watch::{RelayBoardProbe, RelayProbeSample, classify_probe_error};
 
-/// 控制动作（名称与参数串与 MCP `approval.request` 的 action/args 绑定约定一致）。
+/// Control actions (names and bound argument JSON match MCP approval tokens).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlAction {
-    Power { on: bool },
+    Power {
+        on: bool,
+    },
+    PowerCycle {
+        off_ms: u64,
+    },
     Reset,
-    PowerKey { long_press: bool },
+    PowerKey {
+        long_press: bool,
+    },
+    /// Hold the `maskrom` relay channel while pulsing reset (or cycling power),
+    /// then unconditionally release `maskrom` back to OFF.
+    EnterMaskrom {
+        hold_ms: u64,
+    },
+    /// Hold the `recovery` relay channel while pulsing reset (or cycling power),
+    /// then unconditionally release `recovery` back to OFF.
+    EnterLoader {
+        hold_ms: u64,
+    },
 }
+
+/// Default hold window (ms) for boot-mode strap sequences.
+pub const DEFAULT_BOOT_HOLD_MS: u64 = 1_500;
+/// Default power-off window (ms) for a power cycle.
+pub const DEFAULT_POWER_CYCLE_OFF_MS: u64 = 1_500;
+const MIN_BOOT_HOLD_MS: u64 = 200;
+const MAX_BOOT_HOLD_MS: u64 = 10_000;
+const MIN_POWER_CYCLE_OFF_MS: u64 = 200;
+const MAX_POWER_CYCLE_OFF_MS: u64 = 10_000;
 
 /// 继电器动作完成后的分段标记接收端（日志分割）：参数 `(dut_id, label)`，
 /// 由宿主接到 [`crate::DeviceService::log_mark`]。会话未开时静默丢弃（标记是
@@ -52,8 +78,11 @@ impl ControlAction {
     pub fn name(&self) -> &'static str {
         match self {
             ControlAction::Power { .. } => "control.power",
+            ControlAction::PowerCycle { .. } => "control.power_cycle",
             ControlAction::Reset => "control.reset",
             ControlAction::PowerKey { .. } => "control.power_key",
+            ControlAction::EnterMaskrom { .. } => "control.enter_maskrom",
+            ControlAction::EnterLoader { .. } => "control.enter_loader",
         }
     }
 
@@ -62,9 +91,12 @@ impl ControlAction {
         match self {
             ControlAction::Power { on: true } => "继电器 power ON",
             ControlAction::Power { on: false } => "继电器 power OFF",
+            ControlAction::PowerCycle { .. } => "继电器 power cycle",
             ControlAction::Reset => "继电器 reset",
             ControlAction::PowerKey { long_press: true } => "继电器 power key 长按",
             ControlAction::PowerKey { long_press: false } => "继电器 power key 短按",
+            ControlAction::EnterMaskrom { .. } => "继电器 enter MaskROM",
+            ControlAction::EnterLoader { .. } => "继电器 enter Loader",
         }
     }
 
@@ -72,9 +104,15 @@ impl ControlAction {
     pub fn args_json(&self) -> String {
         match self {
             ControlAction::Power { on } => serde_json::json!({ "on": on }).to_string(),
+            ControlAction::PowerCycle { off_ms } => {
+                serde_json::json!({ "offMs": off_ms }).to_string()
+            }
             ControlAction::Reset => serde_json::json!({}).to_string(),
             ControlAction::PowerKey { long_press } => {
                 serde_json::json!({ "long_press": long_press }).to_string()
+            }
+            ControlAction::EnterMaskrom { hold_ms } | ControlAction::EnterLoader { hold_ms } => {
+                serde_json::json!({ "holdMs": hold_ms }).to_string()
             }
         }
     }
@@ -395,7 +433,10 @@ impl ControlService {
         //    成功/失败都写分段标记（日志分割，B2）
         let label = action.mark_label();
         let action_name = action.name();
-        let is_power = matches!(action, ControlAction::Power { .. });
+        let is_power = matches!(
+            action,
+            ControlAction::Power { .. } | ControlAction::PowerCycle { .. }
+        );
         if let ControlAction::Power { on } = action {
             // LOG-5：分段未确认落盘 → 拦截派发（不动设备），回收本次租约并
             // 登记失败审计。令牌已在 validate 消费，重试需重新申请审批。
@@ -403,13 +444,68 @@ impl ControlService {
                 self.finish_control(&dut.id, &admission, action_name, false);
                 return Err(ControlEntryError::Device(err));
             }
+        } else if matches!(action, ControlAction::PowerCycle { .. })
+            && let Err(err) = self.begin_power_boundary(&dut.id, false)
+        {
+            self.finish_control(&dut.id, &admission, action_name, false);
+            return Err(ControlEntryError::Device(err));
         }
+        let boot_trigger = match action {
+            ControlAction::EnterMaskrom { .. } | ControlAction::EnterLoader { .. } => {
+                Some(resolve_boot_trigger(dut)?)
+            }
+            _ => None,
+        };
         let outcome = self.runtime.block_on(async move {
             match action {
                 ControlAction::Power { on } => backend.power(&target, on).await,
+                ControlAction::PowerCycle { off_ms } => {
+                    let wait = off_ms.clamp(MIN_POWER_CYCLE_OFF_MS, MAX_POWER_CYCLE_OFF_MS);
+                    backend.power(&target, false).await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    backend.power(&target, true).await
+                }
                 ControlAction::Reset => backend.reset(&target).await,
                 ControlAction::PowerKey { long_press } => {
                     backend.power_key(&target, long_press).await
+                }
+                ControlAction::EnterMaskrom { hold_ms }
+                | ControlAction::EnterLoader { hold_ms } => {
+                    let trigger = boot_trigger.expect("boot trigger pre-resolved");
+                    let hold = hold_ms.clamp(MIN_BOOT_HOLD_MS, MAX_BOOT_HOLD_MS);
+                    // Energize the boot-strap channel first; if ON fails, still
+                    // attempt OFF defensively in case the frame reached the board.
+                    let strap_on = backend.power(&target, true).await;
+                    let triggered = if strap_on.is_ok() {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        let trig = match trigger {
+                            BootTrigger::Reset(reset_target) => backend.reset(&reset_target).await,
+                            BootTrigger::PowerCycle(power_target) => {
+                                match backend.power(&power_target, false).await {
+                                    Ok(()) => {
+                                        tokio::time::sleep(std::time::Duration::from_millis(1_000))
+                                            .await;
+                                        backend.power(&power_target, true).await
+                                    }
+                                    Err(err) => Err(err),
+                                }
+                            }
+                        };
+                        if trig.is_ok() {
+                            tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+                        }
+                        trig
+                    } else {
+                        Ok(())
+                    };
+                    // Unconditionally release the boot-strap channel even when
+                    // the reset or power-cycle step fails so the board is never
+                    // left latched in MaskROM/Recovery.
+                    let strap_off = match backend.power(&target, false).await {
+                        Ok(()) => Ok(()),
+                        Err(_) => backend.power(&target, false).await,
+                    };
+                    strap_off.and(strap_on).and(triggered)
                 }
             }
         });
@@ -724,6 +820,72 @@ fn relay_node(dut: &DutConfig) -> DeviceResult<String> {
     }
 }
 
+/// Trigger used to reboot the board while a boot-strap pin (`maskrom` / `recovery`)
+/// is held active.
+enum BootTrigger {
+    Reset(ControlTarget),
+    PowerCycle(ControlTarget),
+}
+
+fn configured_channel_names(channels: &duthub_core::model::RelayChannels) -> String {
+    let mut names = Vec::new();
+    if let Some(ch) = channels.power {
+        names.push(format!("power=CH{ch}"));
+    }
+    if let Some(ch) = channels.reset {
+        names.push(format!("reset=CH{ch}"));
+    }
+    if let Some(ch) = channels.recovery {
+        names.push(format!("recovery=CH{ch}"));
+    }
+    if let Some(ch) = channels.maskrom {
+        names.push(format!("maskrom=CH{ch}"));
+    }
+    if let Some(ch) = channels.power_key {
+        names.push(format!("powerKey=CH{ch}"));
+    }
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn resolve_boot_trigger(dut: &DutConfig) -> DeviceResult<BootTrigger> {
+    let RelayConfig::UsbSerial {
+        node,
+        driver,
+        channels,
+        ..
+    } = &dut.relay
+    else {
+        return Err(DeviceError::Unsupported);
+    };
+    let resolved_driver = if driver.is_empty() {
+        "usb-serial-relay".to_owned()
+    } else {
+        driver.clone()
+    };
+    if let Some(ch) = channels.reset {
+        return Ok(BootTrigger::Reset(ControlTarget {
+            address: node.clone(),
+            driver: resolved_driver,
+            channel: u16::from(ch),
+        }));
+    }
+    if let Some(ch) = channels.power {
+        return Ok(BootTrigger::PowerCycle(ControlTarget {
+            address: node.clone(),
+            driver: resolved_driver,
+            channel: u16::from(ch),
+        }));
+    }
+    Err(DeviceError::Invalid(format!(
+        "Neither reset nor power relay channel is configured for boot-mode entry (configured: {})",
+        configured_channel_names(channels)
+    )))
+}
+
 /// 绑定 + 动作能力校验 + 目标解析。SNMP PDU 只提供电源通断（不伪造 Reset/PowerKey）。
 pub fn resolve_target(dut: &DutConfig, action: &ControlAction) -> DeviceResult<ControlTarget> {
     match &dut.relay {
@@ -740,7 +902,7 @@ pub fn resolve_target(dut: &DutConfig, action: &ControlAction) -> DeviceResult<C
                 return Err(DeviceError::Invalid("继电器节点（串口）未配置".into()));
             }
             let channel = match action {
-                ControlAction::Power { .. } => channels
+                ControlAction::Power { .. } | ControlAction::PowerCycle { .. } => channels
                     .power
                     .ok_or_else(|| DeviceError::Invalid("未配置电源通道".into()))?,
                 ControlAction::Reset => channels
@@ -749,6 +911,24 @@ pub fn resolve_target(dut: &DutConfig, action: &ControlAction) -> DeviceResult<C
                 ControlAction::PowerKey { .. } => channels
                     .power_key
                     .ok_or_else(|| DeviceError::Invalid("未配置电源按键通道".into()))?,
+                ControlAction::EnterMaskrom { .. } => {
+                    let _ = resolve_boot_trigger(dut)?;
+                    channels.maskrom.ok_or_else(|| {
+                        DeviceError::Invalid(format!(
+                            "MaskROM relay channel is not configured on this DUT (configured: {})",
+                            configured_channel_names(channels)
+                        ))
+                    })?
+                }
+                ControlAction::EnterLoader { .. } => {
+                    let _ = resolve_boot_trigger(dut)?;
+                    channels.recovery.ok_or_else(|| {
+                        DeviceError::Invalid(format!(
+                            "Recovery/Loader relay channel is not configured on this DUT (configured: {})",
+                            configured_channel_names(channels)
+                        ))
+                    })?
+                }
             };
             Ok(ControlTarget {
                 address: node.clone(),
@@ -761,7 +941,7 @@ pub fn resolve_target(dut: &DutConfig, action: &ControlAction) -> DeviceResult<C
             })
         }
         RelayConfig::SnmpPdu { snmp, outlets } => match action {
-            ControlAction::Power { .. } => {
+            ControlAction::Power { .. } | ControlAction::PowerCycle { .. } => {
                 if snmp.address.trim().is_empty() {
                     return Err(DeviceError::Invalid("SNMP PDU 地址未配置".into()));
                 }
@@ -772,7 +952,10 @@ pub fn resolve_target(dut: &DutConfig, action: &ControlAction) -> DeviceResult<C
                 })
             }
             // PDU 不伪造 Reset / PowerKey（docs/DATA_MODEL.md）
-            ControlAction::Reset | ControlAction::PowerKey { .. } => Err(DeviceError::Unsupported),
+            ControlAction::Reset
+            | ControlAction::PowerKey { .. }
+            | ControlAction::EnterMaskrom { .. }
+            | ControlAction::EnterLoader { .. } => Err(DeviceError::Unsupported),
         },
     }
 }
@@ -1572,5 +1755,70 @@ mod tests {
                 "power addr=COM7 driver=CH340 ch=4 on=false",
             ]
         );
+    }
+
+    #[test]
+    fn enter_maskrom_and_loader_always_release_strap_channel_off() {
+        let backend = MockBackend::new();
+        let (svc, approval) = service(Some(backend.clone()));
+        let mut dut = dut_with_relay("dut-boot");
+        if let RelayConfig::UsbSerial {
+            ref mut channels, ..
+        } = dut.relay
+        {
+            channels.maskrom = Some(5);
+            channels.recovery = Some(6);
+        }
+        svc.register_dut(dut.clone());
+
+        // 1) Normal MaskROM entry: maskrom ON -> reset -> maskrom OFF.
+        let action = ControlAction::EnterMaskrom { hold_ms: 200 };
+        let token = approval.issue(&dut.id, action.name(), &action.args_json());
+        svc.execute_by_id(&dut.id, action, &token.token).unwrap();
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            [
+                "power addr=COM7 driver=CH340 ch=5 on=true",
+                "reset addr=COM7 driver=CH340 ch=1",
+                "power addr=COM7 driver=CH340 ch=5 on=false",
+            ]
+        );
+
+        // 2) Normal Loader entry: recovery ON -> reset -> recovery OFF.
+        backend.calls.lock().unwrap().clear();
+        let action = ControlAction::EnterLoader { hold_ms: 200 };
+        let token = approval.issue(&dut.id, action.name(), &action.args_json());
+        svc.execute_by_id(&dut.id, action, &token.token).unwrap();
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            [
+                "power addr=COM7 driver=CH340 ch=6 on=true",
+                "reset addr=COM7 driver=CH340 ch=1",
+                "power addr=COM7 driver=CH340 ch=6 on=false",
+            ]
+        );
+
+        // 3) Unbound maskrom channel (only reset wired) fails clearly without touching hardware.
+        backend.calls.lock().unwrap().clear();
+        let mut reset_only = dut_with_relay("dut-reset-only");
+        if let RelayConfig::UsbSerial {
+            ref mut channels, ..
+        } = reset_only.relay
+        {
+            channels.power = None;
+            channels.power_key = None;
+            channels.maskrom = None;
+            channels.recovery = None;
+            channels.reset = Some(1);
+        }
+        svc.register_dut(reset_only.clone());
+        let action = ControlAction::EnterMaskrom { hold_ms: 200 };
+        let token = approval.issue(&reset_only.id, action.name(), &action.args_json());
+        let err = svc
+            .execute_by_id(&reset_only.id, action, &token.token)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reset=CH1"), "{err}");
+        assert!(backend.calls.lock().unwrap().is_empty());
     }
 }

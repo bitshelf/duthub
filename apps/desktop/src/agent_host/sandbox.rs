@@ -1,36 +1,42 @@
-//! 每 DUT Agent 的目录布局（W2）。
+//! Per-DUT Agent directory layout and unified MXC sandbox preparation.
 //!
-//! `<work_dir>/agent/dut/<hex(dut_id)>/`
-//! - `goose/`      → GOOSE_PATH_ROOT（config/、data/sessions/）
-//! - `sandbox/`    → ACP `session/new.cwd`（会话工作目录）
-//! - `sandbox/tmp/` → 子进程 TEMP/TMP（不继承用户 TEMP）
+//! Directory tree: `<work_dir>/agent/dut/<hex(dut_id)>/`
+//! - `goose/`          -> `GOOSE_PATH_ROOT` (`config/`, `data/sessions/`)
+//! - `sandbox/`        -> container working directory and primary writable cell
+//! - `sandbox/tmp/`    -> child `TEMP` / `TMP` (never inherits host `%TEMP%`)
+//! - `sandbox/home/`   -> child private `LOCALAPPDATA` / `APPDATA` root
 //! - `transcript.jsonl`
 //! - `session-id` (legacy resume marker)
 //! - `resume.json` (`agentId` + `programSha256` + `sessionId`)
 //!
-//! 目录逐级经 `duthub_core::store::ensure_agent_dir`（cap-std；junction/symlink
-//! 与非法路径段一律拒绝）。
-//!
-//! **范围声明**：这里做的是**路径收敛**（把 goose 的配置、会话与临时文件压进
-//! 每 DUT 目录），不是 OS 级强制边界——子进程仍可能通过绝对路径访问用户目录。
-//! 受限令牌（只挡写）、专用账户 + NTFS ACL、AppContainer 仍 deferred；
-//! 见 `docs/reviews/AGENT_IMPLEMENTATION_REPORT.md` §5.1。
+//! All OS containment (filesystem grants/denials, directional network policy,
+//! UI isolation, and tree termination) is delegated to `duthub-sandbox`
+//! (`mxc-sdk`).
 
 use std::path::{Path, PathBuf};
 
 use duthub_core::store;
+use duthub_sandbox::{CellSpec, NetworkPolicy, SandboxPolicy, SandboxStatus, prepare_cell};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPaths {
     pub dut_dir: PathBuf,
     pub sandbox: PathBuf,
-    /// 子进程 TEMP/TMP：`<sandbox>/tmp`（见 [`temp_dir`]）。
+    /// Per-session `TEMP`/`TMP`: `<sandbox>/tmp`.
     pub temp: PathBuf,
     pub goose_root: PathBuf,
     pub transcript: PathBuf,
     pub session_id: PathBuf,
     /// Structured resume marker (`agentId` + `programSha256` + `sessionId`).
     pub resume: PathBuf,
+}
+
+/// Prepared MXC sandbox state shared by both ACP and CLI workers.
+#[derive(Debug, Clone)]
+pub struct PreparedAgentSandbox {
+    pub cell: CellSpec,
+    pub policy: SandboxPolicy,
+    pub status: SandboxStatus,
 }
 
 #[derive(Debug)]
@@ -42,14 +48,15 @@ pub enum SandboxError {
 impl std::fmt::Display for SandboxError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SandboxError::InvalidDutId => write!(formatter, "DUT id 为空，无法建立 Agent 沙箱"),
-            SandboxError::Io(error) => write!(formatter, "Agent 沙箱目录不可用: {error}"),
+            SandboxError::InvalidDutId => write!(formatter, "DUT id is empty"),
+            SandboxError::Io(error) => write!(formatter, "Agent sandbox directory error: {error}"),
         }
     }
 }
 
 impl std::error::Error for SandboxError {}
 
+/// Create and validate the per-DUT directory layout via `cap-std`.
 pub fn prepare(work_dir: &Path, dut_id: &str) -> Result<AgentPaths, SandboxError> {
     if dut_id.trim().is_empty() {
         return Err(SandboxError::InvalidDutId);
@@ -72,26 +79,79 @@ pub fn prepare(work_dir: &Path, dut_id: &str) -> Result<AgentPaths, SandboxError
     })
 }
 
-/// 子进程 TEMP/TMP 目录：`<sandbox>/tmp`。
-///
-/// 只做**路径收敛**，不是 OS 强制边界（受限令牌 / AppContainer 仍 deferred）：
-/// 子进程拿到的 TEMP/TMP 指向该 DUT 的 sandbox，不再继承用户 `%TEMP%`。
-/// 目录先创建并通过与 [`prepare`] 相同的 cap-std 校验（junction/symlink 与
-/// 非目录一律拒绝），再返回普通路径。
+/// Create and validate `<sandbox>/tmp` as a plain (non-reparse) directory.
 pub fn temp_dir(sandbox: &Path) -> Result<PathBuf, SandboxError> {
     let dir = store::ensure_agent_dir(sandbox, &["tmp"])
         .map_err(|error| SandboxError::Io(error.to_string()))?;
-    // ensure_agent_dir 已拒绝 junction/symlink；这里对最终路径再做一次显式
-    // 普通目录校验，避免调用方单独使用本函数时把非目录/重解析点当 TEMP。
     let metadata =
         std::fs::symlink_metadata(&dir).map_err(|error| SandboxError::Io(error.to_string()))?;
     if !metadata.is_dir() || is_redirect(&metadata) {
         return Err(SandboxError::Io(format!(
-            "TEMP 路径不是普通目录: {}",
+            "TEMP path is not a plain directory: {}",
             dir.display()
         )));
     }
     Ok(dir)
+}
+
+/// Verify host MXC capability, establish the cell directories, and build the
+/// per-DUT [`SandboxPolicy`] (fail-closed if MXC containment is unavailable).
+pub fn prepare_agent_sandbox(
+    work_dir: &Path,
+    dut_id: &str,
+    paths: &AgentPaths,
+    allowed_exe_dir: Option<&Path>,
+    extra_writable: &[&Path],
+    extra_readable: &[&Path],
+    network: NetworkPolicy,
+) -> Result<PreparedAgentSandbox, String> {
+    let status = duthub_sandbox::status();
+    if !status.supports_agent_isolation() {
+        return Err(format!(
+            "OS sandbox backend is unavailable or missing required isolation capabilities ({})",
+            status.summary()
+        ));
+    }
+    let cell = CellSpec::for_dut(work_dir, dut_id)
+        .map_err(|error| format!("invalid Agent sandbox cell: {error}"))?;
+    if cell.root() != paths.sandbox {
+        return Err(format!(
+            "Agent sandbox cell mismatch: {} != {}",
+            cell.root().display(),
+            paths.sandbox.display()
+        ));
+    }
+    prepare_cell(&cell)
+        .map_err(|error| format!("failed to prepare Agent sandbox cell: {error}"))?;
+
+    let mut policy = SandboxPolicy::agent_cell(&cell, allowed_exe_dir);
+    policy.network = network;
+    for dir in extra_writable {
+        if dir.is_dir() && *dir != cell.root() {
+            policy.writable.push(dir.to_path_buf());
+        }
+    }
+    for dir in extra_readable {
+        if dir.is_dir() && *dir != cell.root() {
+            policy.readable.push(dir.to_path_buf());
+        }
+    }
+    // Remove any denied path that is an ancestor of an explicitly granted root.
+    policy.deny_read.retain(|denied| {
+        !policy
+            .writable
+            .iter()
+            .chain(&policy.readable)
+            .any(|allowed| allowed == denied || allowed.starts_with(denied))
+    });
+    duthub_sandbox::validate_policy(&policy, cell.root())
+        .map_err(|error| format!("Agent sandbox policy rejected: {error}"))?;
+
+    Ok(PreparedAgentSandbox {
+        cell,
+        policy,
+        status,
+    })
 }
 
 #[cfg(windows)]
@@ -123,7 +183,7 @@ mod tests {
         let paths = prepare(&work, "dut-A").unwrap();
         assert!(paths.sandbox.is_dir());
         assert!(paths.goose_root.is_dir());
-        assert!(paths.temp.is_dir(), "TEMP/TMP 目录必须预先创建");
+        assert!(paths.temp.is_dir());
         assert_eq!(paths.temp, paths.sandbox.join("tmp"));
         let key = store::agent_dut_key("dut-A").unwrap();
         assert!(paths.dut_dir.ends_with(format!("agent/dut/{key}")));
@@ -137,7 +197,6 @@ mod tests {
     fn temp_dir_rejects_non_directory() {
         let work = temp_work_dir("temp-file");
         let paths = prepare(&work, "dut-temp").unwrap();
-        // 模拟攻击面：把 tmp 换成普通文件后，temp_dir 必须拒绝而不是静默使用。
         std::fs::remove_dir(&paths.temp).unwrap();
         std::fs::write(&paths.temp, b"not a directory").unwrap();
         assert!(matches!(temp_dir(&paths.sandbox), Err(SandboxError::Io(_))));

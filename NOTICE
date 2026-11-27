@@ -42,26 +42,3 @@ and cargo-audit report shipped under `sbom/`. Third-party crates inside goose
 are the upstream release's responsibility; duthub does not audit them at release
 time and says so explicitly (`sbom/goose-audit-status.txt` is marked
 UNVERIFIED).
-
---------------------------------------------------------------------------------
-openai/codex — codex-rs/windows-sandbox-rs (Apache-2.0)
-
-Portions of `crates/duthub-sandbox/src/windows/` are derived from the
-openai/codex project, `codex-rs/windows-sandbox-rs`:
-  https://github.com/openai/codex/tree/main/codex-rs/windows-sandbox-rs
-  Copyright OpenAI and contributors, licensed under the Apache License 2.0.
-
-Derived files (each carries a header naming this provenance):
-  src/windows/identity.rs       (identity.rs, setup.rs)
-  src/windows/dpapi.rs          (dpapi.rs)
-  src/windows/token.rs          (token.rs, cap.rs)
-  src/windows/deny_read_acl.rs  (deny_read_acl.rs)
-  src/windows/no_reparse_dir.rs (no_reparse_dir.rs)
-  src/windows/process.rs        (process.rs — process creation and stdio plumbing)
-
-Changes made by duthub: the AppContainer cell policy, the per-DUT capability
-store moved out of the writable cell, `SandboxError`-based fail-closed error
-handling, and the `status()` capability probe. duthub does not vendor or run
-Codex itself; only these mechanisms were ported.
-
-Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0

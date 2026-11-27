@@ -6,6 +6,10 @@ impl Workbench {
     // ------------------------------------------------------------------
 
     pub fn persist_settings(&mut self) {
+        if let Ok(mut cfg) = self.mcp_tools_config.lock() {
+            cfg.flash_tools = self.settings.flash_tools.clone();
+            cfg.adb_executable = self.settings.tools.adb_executable.clone();
+        }
         if let Err(err) = store::save_settings_secured(&self.data_dir, &self.settings) {
             self.notify_toast(i18n::message(
                 "saveSettingsFailed",

@@ -39,10 +39,8 @@ use duthub_core::agent_access::AgentAccessRuntime;
 use duthub_core::agent_config::AgentDefinition;
 use duthub_mcp::auth_http::AccessContext;
 use duthub_mcp::state::McpState;
-use duthub_sandbox::os_acl;
 use duthub_sandbox::{
-    CellSpec, IsolationMode, PreparedCell, SandboxPolicy, SandboxStatus, SandboxedProcess,
-    SpawnRequest, spawn_streaming,
+    CellSpec, NetworkPolicy, SandboxPolicy, SandboxedProcess, SpawnRequest, spawn_streaming,
 };
 use serde_json::{Value, json};
 
@@ -706,14 +704,48 @@ pub(crate) fn run_cli_worker(
 fn run_cli_session(context: &CliWorkerContext, rx: &Receiver<WorkerCommand>) -> Result<(), String> {
     let paths =
         sandbox::prepare(&context.work_dir, &context.dut_id).map_err(|error| error.to_string())?;
-    let sandbox_state = prepare_cli_sandbox(context, &paths)?;
-    apply_isolation(context, &paths, &sandbox_state);
+    let probe_status = duthub_sandbox::status();
+    if !probe_status.supports_agent_isolation() {
+        return Err(format!(
+            "OS 沙箱后端不可用或缺少必需隔离能力，已拒绝启动 CLI Agent（{}）",
+            probe_status.summary()
+        ));
+    }
     let launch = resolve_cli_launch(&context.agent)?;
     *context.launch.lock().unwrap() = Some(launch.clone());
     if context.stop_flag.load(Ordering::Relaxed) {
         finalize_stopped(context);
         return Ok(());
     }
+    let mut extra_writable_owned: Vec<PathBuf> = Vec::new();
+    if context.agent.auth_mode.eq_ignore_ascii_case("inherit")
+        && let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    {
+        let claude_dir = PathBuf::from(home).join(".claude");
+        if claude_dir.is_dir() {
+            extra_writable_owned.push(claude_dir);
+        }
+    }
+    let extra_writable: Vec<&Path> = extra_writable_owned.iter().map(PathBuf::as_path).collect();
+    // Grant read-only access to the CLI program directory so `.cmd`/`.bat`
+    // shims launched through `cmd.exe /D /C call <shim>` stay readable inside
+    // the deny-by-default container.
+    let extra_readable: Vec<&Path> = launch.program.parent().into_iter().collect();
+    let sandbox_state = sandbox::prepare_agent_sandbox(
+        &context.work_dir,
+        &context.dut_id,
+        &paths,
+        launch.program.parent(),
+        &extra_writable,
+        &extra_readable,
+        NetworkPolicy::LoopbackAndOutbound { proxy_url: None },
+    )?;
+    context.view.push_entry(TranscriptEntry::system(format!(
+        "OS 隔离状态：{}",
+        sandbox_state.status.summary()
+    )));
+    context.view.set_os_isolation(sandbox_state.status.clone());
+    context.dirty.store(true, Ordering::Relaxed);
 
     let (port, token, url) = if let Some(url) = &context.mcp_url_override {
         (None, TEST_MCP_TOKEN.to_owned(), url.clone())
@@ -857,17 +889,10 @@ fn run_cli_session(context: &CliWorkerContext, rx: &Receiver<WorkerCommand>) -> 
     Ok(())
 }
 
-struct CliSandbox {
-    cell: CellSpec,
-    policy: SandboxPolicy,
-    prepared: PreparedCell,
-    status: SandboxStatus,
-}
-
 struct TurnContext<'a> {
     context: &'a CliWorkerContext,
     paths: &'a AgentPaths,
-    sandbox: &'a CliSandbox,
+    sandbox: &'a sandbox::PreparedAgentSandbox,
     launch: &'a AgentLaunchSpec,
     mcp_url: &'a str,
     mcp_token: &'a str,
@@ -1338,76 +1363,6 @@ fn is_valid_session_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
-fn prepare_cli_sandbox(
-    context: &CliWorkerContext,
-    paths: &AgentPaths,
-) -> Result<CliSandbox, String> {
-    let status = duthub_sandbox::status();
-    context.view.push_entry(TranscriptEntry::system(format!(
-        "OS 沙箱能力探测：{}",
-        status.detail
-    )));
-    if !status.restricted_token.is_verified() || !status.job_limits.is_verified() {
-        context.dirty.store(true, Ordering::Relaxed);
-        return Err(format!(
-            "当前系统不支持受限令牌或 Job 限额，已拒绝启动 CLI Agent（{}）",
-            status.detail
-        ));
-    }
-    let cell = CellSpec::for_dut(&context.work_dir, &context.dut_id)
-        .map_err(|error| format!("CLI Agent 沙箱单元无效: {error}"))?;
-    if cell.root() != paths.sandbox {
-        return Err(format!(
-            "CLI Agent 沙箱单元与工作目录不一致：{} ≠ {}",
-            cell.root().display(),
-            paths.sandbox.display()
-        ));
-    }
-    let policy = super::acp::agent_policy(&cell, None);
-    let prepared = duthub_sandbox::prepare(&cell, &policy)
-        .map_err(|error| format!("CLI Agent 沙箱单元建立失败: {error}"))?;
-    context.dirty.store(true, Ordering::Relaxed);
-    Ok(CliSandbox {
-        cell,
-        policy,
-        prepared,
-        status,
-    })
-}
-
-fn apply_isolation(context: &CliWorkerContext, paths: &AgentPaths, sandbox_state: &CliSandbox) {
-    let acl_ok = match os_acl::harden_private_dir(&paths.dut_dir) {
-        Ok(()) => true,
-        Err(error) => {
-            context.view.push_entry(TranscriptEntry::system(format!(
-                "私密目录 ACL 加固失败（不阻断启动）: {error}"
-            )));
-            false
-        }
-    };
-    let mode = if sandbox_state.policy.mode == IsolationMode::RestrictedToken {
-        "受限令牌"
-    } else {
-        "AppContainer"
-    };
-    let status = os_acl::OsIsolationStatus {
-        private_dir_acl: acl_ok,
-        restricted_token: sandbox_state.status.restricted_token.is_verified(),
-        app_container: sandbox_state.status.app_container.is_verified(),
-        unsupported: sandbox_state.status.platform == "unsupported",
-        detail: format!(
-            "{} · 会话单元 {}（{}，已 prepare）",
-            sandbox_state.status.detail, sandbox_state.prepared.scope, mode
-        ),
-    };
-    context.view.push_entry(TranscriptEntry::system(format!(
-        "OS 隔离状态：{}",
-        status.detail
-    )));
-    context.view.set_os_isolation(status);
-    context.dirty.store(true, Ordering::Relaxed);
-}
-
 fn code_text(code: Option<i32>) -> String {
     code.map_or_else(|| "signal/unknown".into(), |code| code.to_string())
 }
@@ -1446,6 +1401,8 @@ impl CliProcess {
         if !cwd.is_dir() {
             return Err(format!("工作目录不存在: {}", cwd.display()));
         }
+        duthub_sandbox::prepare_cell(cell).map_err(|error| error.to_string())?;
+        let local_app_data = cell.layout().home().join("AppData").join("Local");
         let temp = sandbox::temp_dir(cwd).map_err(|error| error.to_string())?;
         let (program, args) = resolve_sandboxed_argv(plan)?;
         let mut environment: Vec<(OsString, OsString)> = Vec::new();
@@ -1459,6 +1416,12 @@ impl CliProcess {
                 return Err("环境变量包含 NUL 字符".into());
             }
             set_env_var(&mut environment, key, value.as_ref());
+        }
+        if !environment.iter().any(|(k, _)| {
+            k.to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("LOCALAPPDATA"))
+        }) {
+            set_env_var(&mut environment, "LOCALAPPDATA", local_app_data.as_os_str());
         }
         // TEMP/TMP are written last so neither the inherited environment nor an
         // Agent envKeys entry can point them back at the user's temp directory.

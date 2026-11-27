@@ -6,9 +6,9 @@
 //! - [`registry`]：`agents.json` 定义 → 启动规格（外部路径/哈希/版本门槛），
 //!   以及未安装状态 [`registry::goose_install_state`]；
 //! - [`acp`]：按行 JSON-RPC ACP 客户端（stdout 只走协议）；
-//! - [`job`]：Windows Job Object（挂起启动 → 加入 Job → resume；限制与杀树）；
-//! - [`model_env`]：模型 provider → goose 环境变量与 managed config；
-//! - [`sandbox`]：每 DUT 的 sandbox / GOOSE_PATH_ROOT / transcript 布局；
+//! - [`job`]: self-containment helper (`contain_current_process`) for test stubs;
+//! - [`model_env`]: model provider -> goose environment and managed config;
+//! - [`sandbox`]: per-DUT sandbox / `GOOSE_PATH_ROOT` / transcript layout and unified MXC policy preparation;
 //! - [`listener`]：每会话 loopback MCP listener 与只读 Token；
 //! - [`session`]：会话状态、内存/文件 transcript 上限；
 //! - [`transcript`]：async transcript writer thread (keeps disk I/O off the ACP loop);

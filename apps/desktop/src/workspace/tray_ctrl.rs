@@ -133,6 +133,12 @@ impl Workbench {
             Ok((handle, view)) => {
                 self.frame_pump.set_float(Some(view.downgrade()));
                 self.float_window = Some(crate::monitor_window::FloatWindow { handle });
+                // Collapse the docked Monitor side panel once the preview moves
+                // into the floating window so the terminal reclaims the width;
+                // only an explicit redock restores the right-hand pane.
+                if self.side_panel.visible == Some(crate::side_panel::Panel::Monitor) {
+                    self.side_panel.visible = None;
+                }
             }
             Err(error) => {
                 eprintln!("[capture] failed to open HDMI float window: {error}");

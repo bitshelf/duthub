@@ -1069,7 +1069,7 @@ async fn dut_bound_listener_http_scope_and_default_dut() {
             .with_arguments(args.as_object().unwrap().clone())
     };
     for (name, args) in [
-        ("dut_info", serde_json::json!({"dutId": "dut-b"})),
+        ("dut_status", serde_json::json!({"dutId": "dut-b"})),
         ("log_segments", serde_json::json!({"dutId": "dut-b"})),
         ("serial_read", serde_json::json!({"dutId": "dut-b"})),
         (

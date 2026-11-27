@@ -316,7 +316,7 @@ async fn agent_card_is_minimal_public_discovery() {
         card["securityRequirements"][0]["schemes"]["duthub-bearer"]["list"],
         json!([])
     );
-    assert_eq!(card["skills"].as_array().map(Vec::len), Some(8));
+    assert_eq!(card["skills"].as_array().map(Vec::len), Some(5));
 
     // A2A 0.2.x legacy keys must be gone (ADR-8).
     for key in ["url", "preferredTransport", "security"] {
@@ -701,7 +701,7 @@ async fn cross_dut_request_is_rejected() {
     let TestApp { app, .. } = test_app();
     expect_policy_failure(
         app,
-        skill_part("dut_info", Some("dut-b"), json!({})),
+        skill_part("dut_status", Some("dut-b"), json!({})),
         "cross-dut",
     )
     .await;
@@ -712,7 +712,7 @@ async fn smuggled_dut_in_args_is_rejected() {
     let TestApp { app, .. } = test_app();
     expect_policy_failure(
         app,
-        json!({ "skill": "dut_info", "args": { "dutId": "dut-b" } }),
+        json!({ "skill": "dut_status", "args": { "dutId": "dut-b" } }),
         "args-dut",
     )
     .await;

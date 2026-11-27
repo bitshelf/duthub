@@ -15,12 +15,12 @@ use duthub_a2a::listener::{A2aDutConfig, A2aRuntime, A2aStatus};
 use duthub_core::A2aPeer;
 use duthub_core::model::DutA2aConfig;
 use duthub_desktop::agent_ui::{
-    CleanupStep, DutCleanupOps, PendingCleanupEntry, SandboxBoundaryProof, a2a_endpoint_view,
-    a2a_export_payload, append_pending_cleanup, delete_agent_dir_idempotent, effective_trust_label,
-    load_pending_cleanup, os_isolation_badge_text, reserved_ports_from, run_remove_dut,
-    validate_a2a_port,
+    CleanupStep, DutCleanupOps, PendingCleanupEntry, SandboxBadgeState, SandboxBoundaryProof,
+    a2a_endpoint_view, a2a_export_payload, append_pending_cleanup, delete_agent_dir_idempotent,
+    effective_trust_label, load_pending_cleanup, reserved_ports_from, run_remove_dut,
+    sandbox_badge_state, sandbox_boundary_proof, validate_a2a_port,
 };
-use duthub_sandbox::OsIsolationStatus;
+use duthub_sandbox::{SandboxBackendKind, SandboxStatus};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("duthub-agent-ui-{tag}-{}", uuid::Uuid::new_v4()));
@@ -399,22 +399,23 @@ fn export_contains_secret_blocks_write() {
 
 #[test]
 fn os_isolation_badge_never_says_os_sandboxed_when_probe_false() {
-    let probe_false = OsIsolationStatus {
-        private_dir_acl: false,
-        restricted_token: false,
-        app_container: false,
-        unsupported: false,
-        detail: "目录 ACL 无法读取：拒绝访问".into(),
+    let unavailable = SandboxStatus {
+        backend: SandboxBackendKind::ProcessContainer,
+        supported: false,
+        reason: Some("PSEC 1.1 unavailable".into()),
+        ..SandboxStatus::default()
     };
-    let badge = os_isolation_badge_text(&probe_false);
-    assert!(
-        !badge.contains("os_sandboxed"),
-        "徽标不得宣称 os_sandboxed: {badge}"
+    assert_eq!(
+        sandbox_boundary_proof(&unavailable),
+        SandboxBoundaryProof::Unverified
     );
-    assert!(badge.contains("未加固"));
-    assert!(badge.contains("受限令牌不可用"));
-    assert!(badge.contains("AppContainer 未尝试"));
-    assert!(badge.contains("拒绝访问"), "失败原因必须可见");
+    assert_eq!(
+        sandbox_badge_state(&unavailable),
+        SandboxBadgeState::Unavailable {
+            backend: "processcontainer",
+            detail: "PSEC 1.1 unavailable".into(),
+        }
+    );
 
     let label = effective_trust_label("os_sandboxed", SandboxBoundaryProof::Unverified);
     assert!(label.contains("未验证"), "无后端证明必须降级: {label}");
@@ -424,26 +425,45 @@ fn os_isolation_badge_never_says_os_sandboxed_when_probe_false() {
         "降级文案不得同时宣称沙箱已启用: {label}"
     );
 
-    // ADR-12: a fully green *probe* is still not a boundary. The DACL read-back
-    // and a probe-only restricted token say nothing about the token a launched
-    // Agent runs under, so the label must stay unverified.
-    let probe_true = OsIsolationStatus {
-        private_dir_acl: true,
-        restricted_token: true,
-        ..probe_false.clone()
+    // Partial backend (supported, but missing read_deny) must stay Unverified.
+    let partial = SandboxStatus {
+        backend: SandboxBackendKind::ProcessContainer,
+        supported: true,
+        read_deny: false,
+        host_loopback: true,
+        ui_isolation: true,
+        ..SandboxStatus::default()
     };
-    let badge = os_isolation_badge_text(&probe_true);
-    assert!(!badge.contains("os_sandboxed"));
-    assert!(badge.contains("目录 ACL 已加固"));
-    assert!(badge.contains("受限令牌可用"));
-    let probe_only = effective_trust_label("os_sandboxed", SandboxBoundaryProof::Unverified);
-    assert!(
-        !probe_only.contains("OS 沙箱"),
-        "探测事实不足以宣称沙箱边界: {probe_only}"
+    assert_eq!(
+        sandbox_boundary_proof(&partial),
+        SandboxBoundaryProof::Unverified
     );
 
-    // Only a sandbox backend status that verified the enforcement primitives
-    // may upgrade the claim.
+    // Only an enforced MXC backend that verifies full Agent isolation upgrades
+    // the proof to VerifiedByBackend.
+    let enforced = SandboxStatus {
+        backend: SandboxBackendKind::ProcessContainer,
+        supported: true,
+        read_deny: true,
+        host_loopback: true,
+        ui_isolation: true,
+        capture_denials: true,
+        ..SandboxStatus::default()
+    };
+    assert_eq!(
+        sandbox_boundary_proof(&enforced),
+        SandboxBoundaryProof::VerifiedByBackend
+    );
+    assert_eq!(
+        sandbox_badge_state(&enforced),
+        SandboxBadgeState::Ready {
+            backend: "processcontainer",
+            fs_deny: true,
+            network: true,
+            ui_isolation: true,
+            denial_capture: true,
+        }
+    );
     let proven = effective_trust_label("os_sandboxed", SandboxBoundaryProof::VerifiedByBackend);
     assert_eq!(proven, "OS 沙箱（已验证）");
     assert!(
@@ -461,17 +481,20 @@ fn os_isolation_badge_never_says_os_sandboxed_when_probe_false() {
         "MCP 接入"
     );
 
-    // Wiring (source contract): the desktop does not consult `duthub-sandbox`
-    // yet, so no product call site may pass the verified proof — otherwise the
-    // page would claim a boundary nobody checked.
+    // Wiring (source contract): desktop UI derives the boundary proof from
+    // `cached_sandbox_status()` -> `sandbox_boundary_proof(&sandbox_status)`.
     let pages = source_of("pages.rs");
     assert!(
-        pages.contains("SandboxBoundaryProof::Unverified"),
-        "Agent 页必须显式传入未验证的边界证明"
+        pages.contains("sandbox_boundary_proof(&sandbox_status)"),
+        "Agent 页必须由真实 MXC status 推导边界证明"
     );
     assert!(
-        !pages.contains("SandboxBoundaryProof::VerifiedByBackend"),
-        "接入 duthub-sandbox 的真实 status 之前，页面不得宣称已验证沙箱"
+        pages.contains("format_sandbox_status(&sandbox_status)"),
+        "Agent 页必须展示本地化 MXC 沙箱状态"
+    );
+    assert!(
+        !pages.contains("SandboxBoundaryProof::Unverified"),
+        "Agent 页不再硬编码 Unverified 占位"
     );
 }
 

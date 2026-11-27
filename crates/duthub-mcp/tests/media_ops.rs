@@ -559,6 +559,8 @@ async fn snapshot_reply_maps_to_the_documented_artifact() {
         data,
         json!({
             "artifact": {
+                "fileId": "0f2c.png",
+                "resourceUri": "duthub://dut/dut-a/files/0f2c.png",
                 "path": r"C:\duthub\Alpha\0f2c.png",
                 "width": 1024,
                 "height": 600,
@@ -610,6 +612,8 @@ async fn record_stop_reply_reports_first_last_and_measured_duration() {
         data,
         json!({
             "artifact": {
+                "fileId": "9a11.ts",
+                "resourceUri": "duthub://dut/dut-a/files/9a11.ts",
                 "path": r"C:\duthub\Alpha\9a11.ts",
                 "firstPath": r"C:\duthub\Alpha\4b7e.ts",
                 "rotated": true,

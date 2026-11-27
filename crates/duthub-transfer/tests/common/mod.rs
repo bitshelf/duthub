@@ -100,12 +100,14 @@ pub async fn spawn_server(
 
 /// A plain HTTP/1.1 client (what `curl` speaks).
 pub fn client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::new()
 }
 
 /// A prior-knowledge HTTP/2 client over cleartext TCP: the transport the
 /// `ztus` CLI is built on (`reqwest::Client::http2_prior_knowledge`).
 pub fn h2c_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .http2_prior_knowledge()
         .build()

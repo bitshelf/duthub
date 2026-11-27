@@ -30,18 +30,15 @@ use duthub_mcp::state::{
 };
 use duthub_mcp::transport::http_router_on_dut;
 
-/// 13 个 Plan 工具（与 `server::plan_tool_allowed` 对齐）。
-const PLAN_TOOLS: [&str; 13] = [
+/// 10 streamlined Plan tools (aligned with `server::PLAN_TOOL_NAMES`).
+const PLAN_TOOLS: [&str; 10] = [
     "dut_list",
-    "dut_info",
-    "dut_control_status",
+    "dut_status",
     "serial_read",
-    "analyze_serial",
     "log_segments",
     "log_segment_read",
     "dut_files",
     "dut_file_read",
-    "heartbeat_get",
     "media_streams",
     "adb_list_devices",
     "skill_export",
@@ -365,11 +362,10 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
         "relay_status 不在 Plan 路由（只读但计划模式不暴露）"
     );
 
-    // 跨 DUT 的 10 个读工具一律 LeaseRequired/UNAUTHORIZED。
+    // Cross-DUT reads must all return LeaseRequired/UNAUTHORIZED.
     let cross_dut_calls = [
-        ("dut_info", json!({"dutId": "dut-b"})),
+        ("dut_status", json!({"dutId": "dut-b"})),
         ("serial_read", json!({"dutId": "dut-b"})),
-        ("analyze_serial", json!({"dutId": "dut-b"})),
         ("log_segments", json!({"dutId": "dut-b"})),
         (
             "log_segment_read",
@@ -380,9 +376,7 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
             "dut_file_read",
             json!({"dutId": "dut-b", "fileId": "b.txt"}),
         ),
-        ("heartbeat_get", json!({"dutId": "dut-b"})),
         ("media_streams", json!({"dutId": "dut-b"})),
-        ("dut_control_status", json!({"dutId": "dut-b"})),
     ];
     for (tool, arguments) in cross_dut_calls {
         let error = call(&client, tool, arguments)
@@ -394,32 +388,26 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
         );
     }
 
-    // 绑定 DUT 的工具正常返回。
-    let data = call(&client, "dut_info", json!({"dutId": "dut-a"}))
+    // Bound DUT tools succeed.
+    let data = call(&client, "dut_status", json!({"dutId": "dut-a"}))
         .await
-        .expect("dut_info dut-a");
+        .expect("dut_status dut-a");
     assert_eq!(data["dut_id"], "dut-a");
+    assert_eq!(data["control"]["state"], "free");
+    assert_eq!(data["heartbeat"]["dut_id"], "dut-a");
     let data = call(&client, "serial_read", json!({"dutId": "dut-a"}))
         .await
         .expect("serial_read dut-a");
     assert_eq!(data["lines"].as_array().unwrap().len(), 2);
     assert_eq!(data["lines"][0]["text"], "alpha ready");
-    let data = call(&client, "analyze_serial", json!({"dutId": "dut-a"}))
+    let data = call(&client, "serial_read", json!({"dutId": "dut-a", "tail": 1}))
         .await
-        .expect("analyze_serial dut-a");
-    assert_eq!(data["evidence_lines"].as_array().unwrap().len(), 2);
-    let data = call(&client, "heartbeat_get", json!({"dutId": "dut-a"}))
-        .await
-        .expect("heartbeat_get dut-a");
-    assert_eq!(data["dut_id"], "dut-a");
+        .expect("serial_read tail dut-a");
+    assert_eq!(data["lines"].as_array().unwrap().len(), 1);
     let data = call(&client, "media_streams", json!({"dutId": "dut-a"}))
         .await
         .expect("media_streams dut-a");
     assert_eq!(data["streams"], json!({}));
-    let data = call(&client, "dut_control_status", json!({"dutId": "dut-a"}))
-        .await
-        .expect("dut_control_status dut-a");
-    assert_eq!(data["state"], "free");
 
     // log_segments / log_segment_read：绑定 DUT 可读。
     let data = call(&client, "log_segments", json!({"dutId": "dut-a"}))

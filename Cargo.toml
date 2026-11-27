@@ -42,6 +42,7 @@ axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gpui-kit = "0.9.1"
+mxc-sdk = { version = "1.1.0", default-features = false }
 reqwest = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -54,7 +55,6 @@ tracing = "0.1"
 tracing-chrome = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
-windows-sys = "0.61"
 zerocopy = { version = "0.8", features = ["derive"] }
 
 [profile.dev]

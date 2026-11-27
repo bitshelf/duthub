@@ -906,6 +906,140 @@ pub(super) fn mcp_panel(
             let token_for_copy = token.clone();
             let expanded = w.expanded_mcp_config.as_deref() == Some(dut.id.as_str());
             let toggle_id = dut.id.clone();
+            let dut_cred = w
+                .settings
+                .agent_access
+                .listener_for_dut(&dut.id)
+                .and_then(|listener| {
+                    w.settings
+                        .agent_access
+                        .agents
+                        .iter()
+                        .find(|cred| cred.listener_id.as_deref() == Some(&listener.id))
+                        .cloned()
+                });
+            if let Some(cred) = dut_cred {
+                const DUT_MCP_GRANTS: [(duthub_core::agent_access::DutAction, &str); 8] = [
+                    (
+                        duthub_core::agent_access::DutAction::Read,
+                        "agentAccessGrantRead",
+                    ),
+                    (
+                        duthub_core::agent_access::DutAction::Capture,
+                        "agentAccessGrantCapture",
+                    ),
+                    (
+                        duthub_core::agent_access::DutAction::SerialWrite,
+                        "agentAccessGrantSerialWrite",
+                    ),
+                    (
+                        duthub_core::agent_access::DutAction::Reset,
+                        "agentAccessGrantReset",
+                    ),
+                    (
+                        duthub_core::agent_access::DutAction::Power,
+                        "agentAccessGrantPower",
+                    ),
+                    (
+                        duthub_core::agent_access::DutAction::Relay,
+                        "agentAccessGrantRelay",
+                    ),
+                    (
+                        duthub_core::agent_access::DutAction::Adb,
+                        "agentAccessGrantAdb",
+                    ),
+                    (
+                        duthub_core::agent_access::DutAction::Flash,
+                        "agentAccessGrantFlash",
+                    ),
+                ];
+                let mut perms = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .py(px(4.))
+                    .child(subtle(crate::i18n::label("mcpPermissionsLabel"), p));
+                for (action, label_key) in DUT_MCP_GRANTS {
+                    let granted = cred
+                        .grants
+                        .iter()
+                        .find(|g| g.dut_id == dut.id)
+                        .is_some_and(|g| g.actions.contains(&action));
+                    let cid = cred.id.clone();
+                    let did = dut.id.clone();
+                    perms = perms.child(
+                        btn(
+                            format!("dut-mcp-grant-{}-{}", dut.id, action.as_str()),
+                            crate::i18n::label(label_key),
+                            if granted {
+                                &BtnVariant::TinyPrimary
+                            } else {
+                                &BtnVariant::Tiny
+                            },
+                            p,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_agent_grant(&cid, &did, action);
+                            cx.notify();
+                        })),
+                    );
+                }
+                body = body.child(perms);
+            }
+            if let Some(lease_mgr) = w.device.lease_manager() {
+                let st = lease_mgr.status(&dut.id);
+                let status_text = match st.phase {
+                    duthub_core::lease::LeasePhase::Free => {
+                        crate::i18n::label("mcpLeaseFree").to_owned()
+                    }
+                    duthub_core::lease::LeasePhase::Held => {
+                        let holder = st.holder.as_deref().unwrap_or("—");
+                        match st.remaining_secs {
+                            Some(secs) => crate::i18n::message(
+                                "mcpLeaseHeldTimed",
+                                &[
+                                    ("holder", holder),
+                                    ("secs", &secs.to_string()),
+                                    ("queue", &st.queue_len.to_string()),
+                                ],
+                            ),
+                            None => crate::i18n::message(
+                                "mcpLeaseHeld",
+                                &[("holder", holder), ("queue", &st.queue_len.to_string())],
+                            ),
+                        }
+                    }
+                    duthub_core::lease::LeasePhase::Protected => crate::i18n::message(
+                        "mcpLeaseProtected",
+                        &[("op", st.protected_op.as_deref().unwrap_or("—"))],
+                    ),
+                    duthub_core::lease::LeasePhase::NeedsInspection => {
+                        crate::i18n::label("mcpLeaseNeedsInspection").to_owned()
+                    }
+                };
+                let mut lease_row = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.))
+                    .py(px(4.))
+                    .child(subtle(crate::i18n::label("mcpControlLeaseLabel"), p))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(match st.phase {
+                                duthub_core::lease::LeasePhase::Free => p.accent,
+                                duthub_core::lease::LeasePhase::NeedsInspection => p.red,
+                                _ => p.text,
+                            })
+                            .child(SharedString::from(status_text)),
+                    );
+                if let Some(action_btn) = super::settings::connection_lease_action(w, p, cx) {
+                    lease_row = lease_row.child(action_btn);
+                }
+                body = body.child(lease_row);
+            }
             body = body
                 .child(
                     div()

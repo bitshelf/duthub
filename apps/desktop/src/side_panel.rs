@@ -543,12 +543,10 @@ impl Workbench {
         if panel == Panel::Monitor {
             if self.frame_pump.placement() == duthub_desktop::capture_ui::MonitorPlacement::Floating
             {
-                // Floating + PanelSwitched: only the placeholder pane appears,
-                // the float window keeps consuming frames (§6.2).
-                self.side_panel.visible = Some(Panel::Monitor);
-                if let Some(dut) = self.panel_dut().cloned() {
-                    self.side_panel.dut_id = Some(dut.id.clone());
-                }
+                // Keep the right-hand Monitor pane collapsed while floating so
+                // the terminal retains full width; focus the existing float
+                // window instead of re-opening a placeholder pane.
+                self.focus_float_window(cx);
                 cx.notify();
                 return;
             }
@@ -1483,9 +1481,20 @@ impl Workbench {
             self.focus_main_window(cx);
         }
         if let Some((dut_id, source)) = self.frame_pump.key().cloned() {
+            if let Some(frame) = self.side_panel.adb_frame.take() {
+                cx.drop_image(frame, None);
+            }
+            self.side_panel = SidePanel::default();
+            self.side_panel.monitor_input =
+                crate::media_page::saved_capture(&self.duts, &dut_id, source)
+                    .ok()
+                    .cloned();
             self.side_panel.visible = Some(Panel::Monitor);
             self.side_panel.dut_id = Some(dut_id);
             self.side_panel.source = Some(source);
+            if self.sessions.get(self.active_session).is_some() {
+                self.view = ViewMode::Serial;
+            }
         }
         cx.notify();
     }

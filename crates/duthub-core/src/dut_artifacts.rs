@@ -100,6 +100,82 @@ pub fn create_new(dir: &Dir, filename: &str) -> io::Result<std::fs::File> {
     .map(cap_std::fs::File::into_std)
 }
 
+/// Resolve an existing regular file strictly inside an owned DUT directory
+/// (either `<dut>/<file_id>` or `<dut>/images/data/<file_id>`), rejecting any
+/// traversal, absolute path, reparse point/junction, or cross-DUT folder.
+pub fn resolve_owned_file(
+    root: &Path,
+    dut_id: &str,
+    name: &str,
+    file_id: &str,
+) -> io::Result<PathBuf> {
+    let filename = name_component(file_id)?;
+    if filename == OWNER {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "cannot access ownership marker",
+        ));
+    }
+    let folder = name_component(name)?;
+    let dir = open(root, dut_id, folder, false)?;
+    if let Ok(meta) = dir.symlink_metadata(filename) {
+        if !meta.is_file() || !plain(&meta) {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "target must be a plain file inside the DUT directory",
+            ));
+        }
+        return Ok(root.join(folder).join(filename));
+    }
+    if let Ok(images_meta) = dir.symlink_metadata("images")
+        && images_meta.is_dir()
+        && plain(&images_meta)
+        && let Ok(images) = dir.open_dir("images")
+        && let Ok(data_meta) = images.symlink_metadata("data")
+        && data_meta.is_dir()
+        && plain(&data_meta)
+        && let Ok(data) = images.open_dir("data")
+        && let Ok(meta) = data.symlink_metadata(filename)
+    {
+        if !meta.is_file() || !plain(&meta) {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "target must be a plain file inside DUT images/data",
+            ));
+        }
+        return Ok(root.join(folder).join("images").join("data").join(filename));
+    }
+    Err(io::Error::new(
+        ErrorKind::NotFound,
+        "file not found inside the DUT directory",
+    ))
+}
+
+/// Prepare a safe destination path for a new file strictly inside an owned DUT
+/// directory without allowing overwrite or path escape.
+pub fn prepare_owned_destination(
+    root: &Path,
+    dut_id: &str,
+    name: &str,
+    file_id: &str,
+) -> io::Result<PathBuf> {
+    let filename = name_component(file_id)?;
+    if filename == OWNER {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "cannot overwrite ownership marker",
+        ));
+    }
+    let (folder, dir) = existing_or_create(root, dut_id, name)?;
+    if dir.symlink_metadata(filename).is_ok() {
+        return Err(io::Error::new(
+            ErrorKind::AlreadyExists,
+            "destination file already exists inside the DUT directory",
+        ));
+    }
+    Ok(root.join(folder).join(filename))
+}
+
 pub fn rename_owned(root: &Path, dut_id: &str, old: &str, new: &str) -> io::Result<bool> {
     if old == new {
         return Ok(false);

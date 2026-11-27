@@ -705,32 +705,67 @@ pub fn running_launch_line(launch: Option<&AgentLaunchSpec>) -> String {
 
 /// Which fact source backs the `os_sandboxed` trust claim.
 ///
-/// ADR-12: [`duthub_core::probe_os_isolation`] only *detects capability* — it
-/// reads back the directory DACL and creates a probe restricted token, which
-/// says nothing about the token a launched Agent actually runs under. Treating
-/// that probe as a sandbox proof is exactly the overclaim ADR-12 rejected.
-///
-/// Only a `duthub_sandbox::SandboxStatus` whose enforcement primitives were
-/// established by real calls (`SandboxStatus::agent_isolation()`: restricted
-/// token + Job limits + read denial) may pass
-/// [`SandboxBoundaryProof::VerifiedByBackend`]. Until the desktop wires that
-/// probe, every call site passes [`SandboxBoundaryProof::Unverified`], so the
-/// `os_sandboxed` level always renders as 「未验证/未启用」.
+/// Only a `duthub_sandbox::SandboxStatus` reporting a ready MXC backend with
+/// mandatory Agent isolation primitives (`SandboxStatus::supports_agent_isolation()`)
+/// produces [`SandboxBoundaryProof::VerifiedByBackend`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxBoundaryProof {
-    /// A sandbox backend verified the primitives that form the boundary.
+    /// The MXC sandbox backend verified the containment primitives on this host.
     VerifiedByBackend,
-    /// No backend proof was consulted (or it reported the primitives
-    /// unverified/unavailable), so the label must not claim isolation.
+    /// Backend is unavailable or lacks mandatory isolation primitives, so the
+    /// label must not claim OS sandbox enforcement.
     Unverified,
+}
+
+/// Derive [`SandboxBoundaryProof`] directly from a real [`duthub_sandbox::SandboxStatus`].
+pub fn sandbox_boundary_proof(status: &duthub_sandbox::SandboxStatus) -> SandboxBoundaryProof {
+    if status.supports_agent_isolation() {
+        SandboxBoundaryProof::VerifiedByBackend
+    } else {
+        SandboxBoundaryProof::Unverified
+    }
+}
+
+/// Structured projection of [`duthub_sandbox::SandboxStatus`] for localized UI badges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxBadgeState {
+    /// Backend is available and satisfies Agent isolation requirements.
+    Ready {
+        backend: &'static str,
+        fs_deny: bool,
+        network: bool,
+        ui_isolation: bool,
+        denial_capture: bool,
+    },
+    /// Backend is unavailable or lacks mandatory isolation primitives.
+    Unavailable {
+        backend: &'static str,
+        detail: String,
+    },
+}
+
+/// Project [`duthub_sandbox::SandboxStatus`] onto a locale-independent badge state.
+pub fn sandbox_badge_state(status: &duthub_sandbox::SandboxStatus) -> SandboxBadgeState {
+    if status.supports_agent_isolation() {
+        SandboxBadgeState::Ready {
+            backend: status.backend.as_str(),
+            fs_deny: status.read_deny,
+            network: status.host_loopback,
+            ui_isolation: status.ui_isolation,
+            denial_capture: status.capture_denials,
+        }
+    } else {
+        SandboxBadgeState::Unavailable {
+            backend: status.backend.as_str(),
+            detail: status.reason.clone().unwrap_or_default(),
+        }
+    }
 }
 
 /// Effective trust label for a configured registry trust level.
 ///
-/// `os_sandboxed` is shown as 「OS 沙箱（已验证）」 only with a backend boundary
-/// proof. Without one it downgrades to 「未验证/未启用」 — the same string never
-/// mixes a "sandbox is on" claim with an "unverified" caveat, and it does not
-/// echo the raw `os_sandboxed` token either. Every other level is unaffected.
+/// `os_sandboxed` is shown as verified only with a backend boundary proof.
+/// Without one it downgrades to unverified without echoing raw `os_sandboxed`.
 pub fn effective_trust_label(trust_level: &str, proof: SandboxBoundaryProof) -> &'static str {
     match trust_level.trim() {
         "os_sandboxed" if proof == SandboxBoundaryProof::VerifiedByBackend => "OS 沙箱（已验证）",
@@ -738,32 +773,6 @@ pub fn effective_trust_label(trust_level: &str, proof: SandboxBoundaryProof) -> 
         "verified_readonly" => "已验证只读",
         _ => "MCP 接入",
     }
-}
-
-/// Badge text built strictly from probe facts (W2b `OsIsolationStatus`):
-/// ACL hardened or not + reason, restricted-token availability, and the
-/// explicit "AppContainer not attempted" note. Never mentions a sandbox that
-/// the probe did not prove.
-pub fn os_isolation_badge_text(status: &duthub_sandbox::OsIsolationStatus) -> String {
-    if status.unsupported {
-        return "OS 隔离未验证（当前平台无探测实现）".into();
-    }
-    let acl = if status.private_dir_acl {
-        "目录 ACL 已加固".to_owned()
-    } else {
-        let reason = if status.detail.is_empty() {
-            "原因未知".to_owned()
-        } else {
-            status.detail.clone()
-        };
-        format!("目录 ACL 未加固（{reason}）")
-    };
-    let token = if status.restricted_token {
-        "受限令牌可用"
-    } else {
-        "受限令牌不可用"
-    };
-    format!("{acl} · {token} · AppContainer 未尝试")
 }
 
 // ---------------------------------------------------------------------------

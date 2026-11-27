@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use duthub_sandbox::os_acl::OsIsolationStatus;
+use duthub_sandbox::SandboxStatus;
 
 pub const MEMORY_TRANSCRIPT_LIMIT: usize = 2000;
 pub const FILE_TRANSCRIPT_LIMIT: u64 = 8 * 1024 * 1024;
@@ -99,8 +99,8 @@ pub struct SessionView {
     pub stderr_tail: Mutex<String>,
     /// Runtime credential id issued for this session's loopback listener.
     credential_id: Mutex<Option<String>>,
-    /// OS isolation facts recorded by the worker (W2b, ADR-11).
-    os_isolation: Mutex<Option<OsIsolationStatus>>,
+    /// MXC sandbox capability facts recorded by the worker (ADR-12).
+    os_isolation: Mutex<Option<SandboxStatus>>,
     /// Total entries ever pushed (including entries later dropped by the
     /// memory cap), used by transcript diagnostics and tests.
     total_entries: AtomicU64,
@@ -184,13 +184,12 @@ impl SessionView {
         self.try_transition(&SessionStatus::Stopped, SessionStatus::Starting)
     }
 
-    /// OS isolation facts recorded for this session (W2b), if the worker has
-    /// already probed them.
-    pub fn os_isolation(&self) -> Option<OsIsolationStatus> {
+    /// MXC sandbox facts recorded for this session, if the worker has probed them.
+    pub fn os_isolation(&self) -> Option<SandboxStatus> {
         self.os_isolation.lock().unwrap().clone()
     }
 
-    pub fn set_os_isolation(&self, status: OsIsolationStatus) {
+    pub fn set_os_isolation(&self, status: SandboxStatus) {
         *self.os_isolation.lock().unwrap() = Some(status);
     }
 
@@ -521,12 +520,14 @@ mod tests {
         view.set_status(SessionStatus::Stopping);
         assert!(!view.reset_for_restart(), "Stopping 不得被改成 Starting");
 
-        let status = duthub_sandbox::os_acl::OsIsolationStatus {
-            private_dir_acl: true,
-            restricted_token: true,
-            app_container: false,
-            unsupported: false,
-            detail: "test".into(),
+        let status = SandboxStatus {
+            backend: duthub_sandbox::SandboxBackendKind::ProcessContainer,
+            tier: Some("base-container".into()),
+            supported: true,
+            read_deny: true,
+            host_loopback: true,
+            ui_isolation: true,
+            ..SandboxStatus::default()
         };
         view.set_os_isolation(status.clone());
         assert_eq!(view.os_isolation(), Some(status));

@@ -117,12 +117,10 @@ pub(super) fn agent_session_panel(
         p,
     ));
     body = body.child(meta);
-    // W4a: OS isolation badge + trust-level review. The badge only states
-    // probe facts (ACL / restricted token / AppContainer). ADR-12: the probe
-    // is capability detection, not a boundary, so `os_sandboxed` stays
-    // unverified until a sandbox backend
-    // (`duthub_sandbox::status().agent_isolation()`) proves the primitives.
-    let iso_status = w.cached_os_isolation(&dut.id);
+    // OS sandbox badge + trust-level review backed by the real MXC backend
+    // status (`duthub_sandbox::status()`).
+    let sandbox_status = w.cached_sandbox_status();
+    let proof = duthub_desktop::agent_ui::sandbox_boundary_proof(&sandbox_status);
     let trust_level = w
         .agents
         .agents
@@ -130,11 +128,8 @@ pub(super) fn agent_session_panel(
         .find(|entry| entry.id == w.agent_id_for_dut(&dut.id))
         .map(|entry| entry.trust_level.clone())
         .unwrap_or_else(|| "mcp_only".into());
-    let trust_label = duthub_desktop::agent_ui::effective_trust_label(
-        &trust_level,
-        duthub_desktop::agent_ui::SandboxBoundaryProof::Unverified,
-    );
-    let isolation_text = duthub_desktop::agent_ui::os_isolation_badge_text(&iso_status);
+    let trust_label = localized_trust_label(&trust_level, proof);
+    let isolation_text = format_sandbox_status(&sandbox_status);
     body = body.child(
         subtle(
             &crate::i18n::message(
@@ -511,10 +506,10 @@ pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> g
             p,
         ));
     }
-    // OS 隔离事实来自 worker 探测（W2b）；未记录时明说，不猜测。
+    // OS isolation facts recorded by the worker from `duthub_sandbox::status()`.
     let isolation = view.os_isolation().map_or_else(
         || crate::i18n::label("agentInspectorNotRecorded").to_owned(),
-        |status| duthub_desktop::agent_ui::os_isolation_badge_text(&status),
+        |status| format_sandbox_status(&status),
     );
     body = body.child(inspector_row(
         crate::i18n::label("agentInspectorOsIsolation"),
@@ -630,6 +625,65 @@ pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> g
             }),
     );
     panel_shell("spark", crate::i18n::label("agentInspectorTitle"), body, p)
+}
+
+fn localized_trust_label(
+    trust_level: &str,
+    proof: duthub_desktop::agent_ui::SandboxBoundaryProof,
+) -> &'static str {
+    use crate::i18n::label;
+    use duthub_desktop::agent_ui::SandboxBoundaryProof;
+    match trust_level.trim() {
+        "os_sandboxed" if proof == SandboxBoundaryProof::VerifiedByBackend => {
+            label("agentTrustLevelOsSandboxed")
+        }
+        "os_sandboxed" => label("agentTrustLevelUnverified"),
+        "verified_readonly" => label("agentTrustLevelVerifiedReadonly"),
+        _ => label("agentTrustLevelMcpOnly"),
+    }
+}
+
+fn format_sandbox_status(status: &duthub_sandbox::SandboxStatus) -> String {
+    use crate::i18n::{label, message};
+    use duthub_desktop::agent_ui::{SandboxBadgeState, sandbox_badge_state};
+    match sandbox_badge_state(status) {
+        SandboxBadgeState::Ready {
+            backend,
+            fs_deny,
+            network,
+            ui_isolation,
+            denial_capture,
+        } => {
+            let mut caps = Vec::new();
+            if fs_deny {
+                caps.push(label("agentSandboxCapFs"));
+            }
+            if network {
+                caps.push(label("agentSandboxCapNet"));
+            }
+            if ui_isolation {
+                caps.push(label("agentSandboxCapUi"));
+            }
+            if denial_capture {
+                caps.push(label("agentSandboxCapCapture"));
+            }
+            message(
+                "agentSandboxReady",
+                &[("backend", backend), ("caps", &caps.join(" · "))],
+            )
+        }
+        SandboxBadgeState::Unavailable { backend, detail } => {
+            let reason = if detail.trim().is_empty() {
+                label("agentSandboxUnknownReason")
+            } else {
+                detail.as_str()
+            };
+            message(
+                "agentSandboxUnavailable",
+                &[("backend", backend), ("reason", reason)],
+            )
+        }
+    }
 }
 
 /// Inspector 的一行「label: value」。

@@ -36,8 +36,7 @@ use duthub_core::restart::{
 use duthub_mcp::auth_http::AccessContext;
 use duthub_mcp::probe;
 use duthub_mcp::state::McpState;
-use duthub_sandbox::os_acl;
-use duthub_sandbox::{CellSpec, PreparedCell, SandboxPolicy, SandboxStatus};
+use duthub_sandbox::NetworkPolicy;
 use serde_json::Value;
 
 use super::acp::{AcpClient, AcpEvent, CRITICAL_OVERFLOW_PREFIX, McpServerRef, SessionInfo};
@@ -726,18 +725,36 @@ fn run_attempt(
 ) -> Result<WorkerOutcome, String> {
     let paths =
         sandbox::prepare(&context.work_dir, &context.dut_id).map_err(|error| error.to_string())?;
-    // 启动前必须建立内核边界：能力探测不满足或单元建立失败都拒绝启动，绝不
-    // 回退到完整令牌（ADR-12 fail-closed）。
-    let sandbox_state = prepare_agent_sandbox(context, &paths)?;
-    apply_os_isolation(context, &paths, &sandbox_state);
-    // 外部 goose / 任意 ACP 程序在这里完成路径解析、SHA-256 与版本门槛；失败
-    // fail closed，不执行未校验的程序。
+    // Fail closed early if the host cannot enforce OS sandbox containment.
+    let probe_status = duthub_sandbox::status();
+    if !probe_status.supports_agent_isolation() {
+        return Err(format!(
+            "OS 沙箱后端不可用或缺少必需隔离能力，已拒绝启动 Agent（{}）",
+            probe_status.summary()
+        ));
+    }
+    // Resolve external/downloaded ACP program path, SHA-256, and version gate.
     let launch =
         registry::resolve(&context.work_dir, &context.agent).map_err(|error| error.to_string())?;
     *context.launch.lock().unwrap() = Some(launch.clone());
     if context.stop_flag.load(Ordering::Relaxed) {
         return Ok(WorkerOutcome::stopped());
     }
+    let sandbox_state = sandbox::prepare_agent_sandbox(
+        &context.work_dir,
+        &context.dut_id,
+        &paths,
+        launch.program.parent(),
+        &[paths.goose_root.as_path()],
+        &[],
+        NetworkPolicy::LoopbackAndOutbound { proxy_url: None },
+    )?;
+    context.view.push_entry(TranscriptEntry::system(format!(
+        "OS 隔离状态：{}",
+        sandbox_state.status.summary()
+    )));
+    context.view.set_os_isolation(sandbox_state.status.clone());
+    context.dirty.store(true, Ordering::Relaxed);
     // duthub owns the sandbox/isolation variables. The registry rejects them on
     // save; re-check here so a hand-built AgentDefinition cannot bypass it.
     for (key, _) in &launch.env {
@@ -1143,111 +1160,6 @@ fn fail_session(context: &WorkerContext, message: &str) {
 /// `Stopping` by [`HostManager::stop`]).
 fn is_stop_requested(context: &WorkerContext) -> bool {
     context.stop_flag.load(Ordering::Relaxed) || context.view.status() == SessionStatus::Stopping
-}
-
-/// Kernel state for one Agent session: the cell, its policy and the identity
-/// the backend actually established.
-struct AgentSandbox {
-    cell: CellSpec,
-    policy: SandboxPolicy,
-    prepared: PreparedCell,
-    status: SandboxStatus,
-}
-
-/// Capability probe + cell establishment (ADR-12).
-///
-/// Every failure is a startup refusal: the Agent host may only run under the
-/// cell's `WRITE_RESTRICTED` token, so falling back to the full token would be
-/// a silent downgrade. On non-Windows (or a host without the primitives) the
-/// session fails with a visible note instead.
-fn prepare_agent_sandbox(
-    context: &WorkerContext,
-    paths: &sandbox::AgentPaths,
-) -> Result<AgentSandbox, String> {
-    let status = duthub_sandbox::status();
-    context.view.push_entry(TranscriptEntry::system(format!(
-        "OS 沙箱能力探测：{}",
-        status.detail
-    )));
-    if !status.restricted_token.is_verified() || !status.job_limits.is_verified() {
-        context.dirty.store(true, Ordering::Relaxed);
-        return Err(format!(
-            "当前系统不支持受限令牌或容器，已拒绝启动 Agent（{}）",
-            status.detail
-        ));
-    }
-    let cell = CellSpec::for_dut(&context.work_dir, &context.dut_id)
-        .map_err(|error| format!("Agent 沙箱单元无效: {error}"))?;
-    if cell.root() != paths.sandbox {
-        return Err(format!(
-            "Agent 沙箱单元与工作目录不一致：{} ≠ {}",
-            cell.root().display(),
-            paths.sandbox.display()
-        ));
-    }
-    // GOOSE_PATH_ROOT lives next to the cell, not inside it; the restricted
-    // token needs an explicit grant there or goose cannot persist config or
-    // sessions even though the session starts.
-    let policy = super::acp::agent_policy(&cell, Some(&paths.goose_root));
-    let prepared = duthub_sandbox::prepare(&cell, &policy)
-        .map_err(|error| format!("Agent 沙箱单元建立失败: {error}"))?;
-    for note in &prepared.notes {
-        context
-            .view
-            .push_entry(TranscriptEntry::system(format!("OS 沙箱：{note}")));
-    }
-    if let Some(sid) = prepared.capability_sid.as_deref() {
-        context.view.push_entry(TranscriptEntry::system(format!(
-            "OS 沙箱身份：受限令牌 · capability SID {sid}"
-        )));
-    }
-    context.dirty.store(true, Ordering::Relaxed);
-    Ok(AgentSandbox {
-        cell,
-        policy,
-        prepared,
-        status,
-    })
-}
-
-/// Directory ACL hardening plus the sandbox capability report for the session
-/// view. The ACL step stays best-effort (it protects the on-disk transcript and
-/// resume markers); the sandbox report reflects only probed facts.
-fn apply_os_isolation(
-    context: &WorkerContext,
-    paths: &sandbox::AgentPaths,
-    sandbox_state: &AgentSandbox,
-) {
-    let acl_ok = match os_acl::harden_private_dir(&paths.dut_dir) {
-        Ok(()) => true,
-        Err(error) => {
-            context.view.push_entry(TranscriptEntry::system(format!(
-                "私密目录 ACL 加固失败（不阻断启动）: {error}"
-            )));
-            false
-        }
-    };
-    let mode = if sandbox_state.policy.mode == duthub_sandbox::IsolationMode::RestrictedToken {
-        "受限令牌"
-    } else {
-        "AppContainer"
-    };
-    let status = duthub_sandbox::os_acl::OsIsolationStatus {
-        private_dir_acl: acl_ok,
-        restricted_token: sandbox_state.status.restricted_token.is_verified(),
-        app_container: sandbox_state.status.app_container.is_verified(),
-        unsupported: sandbox_state.status.platform == "unsupported",
-        detail: format!(
-            "{} · 会话单元 {}（{}，已 prepare）",
-            sandbox_state.status.detail, sandbox_state.prepared.scope, mode
-        ),
-    };
-    context.view.push_entry(TranscriptEntry::system(format!(
-        "OS 隔离状态：{}",
-        status.detail
-    )));
-    context.view.set_os_isolation(status);
-    context.dirty.store(true, Ordering::Relaxed);
 }
 
 /// Release everything one attempt owns (listener credential + process tree).

@@ -329,7 +329,7 @@ async fn tool_call_audit_records_metadata_but_no_token_or_body() {
     // Denied：跨 DUT 读
     let denied = client
         .call_tool_once(
-            rmcp::model::CallToolRequestParams::new("dut_info").with_arguments(
+            rmcp::model::CallToolRequestParams::new("dut_status").with_arguments(
                 serde_json::json!({"dutId": "dut-b"})
                     .as_object()
                     .unwrap()
@@ -370,9 +370,9 @@ async fn tool_call_audit_records_metadata_but_no_token_or_body() {
             event
                 .detail
                 .as_deref()
-                .is_some_and(|d| d.contains("tool=dut_info"))
+                .is_some_and(|d| d.contains("tool=dut_status"))
         })
-        .expect("dut_info 拒绝必须有 tool.call 审计");
+        .expect("dut_status 拒绝必须有 tool.call 审计");
     assert_eq!(denied.result, AuditOutcome::Denied);
     assert_eq!(denied.dut.as_deref(), Some("dut-b"));
     assert!(denied.detail.as_deref().unwrap().contains("UNAUTHORIZED"));

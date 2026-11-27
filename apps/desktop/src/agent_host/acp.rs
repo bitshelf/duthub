@@ -1,24 +1,22 @@
-//! 按行 JSON-RPC ACP 客户端（W2）。
+//! Line-delimited JSON-RPC ACP client.
 //!
-//! 约束：
-//! - stdout **只**解析协议；不把 goose 的日志混进 stdout（stderr 单独收集）。
-//! - 单行上限 [`MAX_STDOUT_LINE`]（4 MiB），超限丢行并记 [`AcpEvent::ProtocolError`]。
-//! - 事件队列有界（4096），溢出丢最旧并置一次 `ProtocolError`。
-//! - agent → client 的 `session/request_permission` 一律拒绝；
-//!   `fs/*`、`terminal/*` 一律 `MethodNotFound`（initialize 也声明不支持）。
-//! - stderr 尾部返回前脱敏（token / API key / Authorization）。
-//! - 子进程环境**只**继承系统变量白名单；用户目录键（`USERPROFILE`、
-//!   `APPDATA`、`LOCALAPPDATA`、`HOME` 等）不继承，`TEMP`/`TMP` 指向该会话
-//!   沙箱下的 `tmp/`。
+//! Contracts:
+//! - stdout is protocol-only; stderr is collected separately and redacted.
+//! - Each stdout line is bounded by [`MAX_STDOUT_LINE`] (4 MiB).
+//! - The body event queue is bounded (4096); critical events live in a separate
+//!   bounded queue that fails closed on overflow.
+//! - Agent -> client `session/request_permission` requests are cancelled;
+//!   `fs/*` and `terminal/*` return `MethodNotFound`.
+//! - The child environment inherits only the system allowlist (`INHERITED_ENV`);
+//!   host user-profile keys (`USERPROFILE`, `APPDATA`, `HOME`, `HOMEDRIVE`,
+//!   `HOMEPATH`) are never inherited, while `LOCALAPPDATA`, `TEMP`, and `TMP`
+//!   are redirected into the per-DUT sandbox cell.
 //!
-//! **范围声明**：子进程由 `duthub-sandbox` 以该 DUT 的 `WRITE_RESTRICTED`
-//! 受限令牌启动（写只落单元内，保留回环网络），令牌/Job/ACL 全部在该 crate
-//! 内建立并在 `ResumeThread` 前回验；任一步失败即拒绝启动，不回退完整令牌。
-//! 读隔离仍不在此模式下提供（内核只对写检查 restricting SID），需要读隔离的
-//! 脚本走 AppContainer（ADR-12）。
+//! OS containment is delegated to `duthub-sandbox` (`mxc-sdk`): filesystem
+//! read/write isolation, directional network policy, UI/clipboard/input
+//! isolation, and Job/container process-tree termination.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,8 +26,6 @@ use std::time::{Duration, Instant};
 
 use duthub_sandbox::{CellSpec, SandboxPolicy, SandboxedProcess, SpawnRequest, spawn_streaming};
 use serde_json::{Value, json};
-
-use super::job::{JOB_ACTIVE_PROCESS_LIMIT, JOB_PROCESS_MEMORY_LIMIT};
 
 pub const MAX_STDOUT_LINE: usize = 4 * 1024 * 1024;
 pub const EVENT_QUEUE_CAPACITY: usize = 4096;
@@ -192,7 +188,7 @@ impl StderrState {
 }
 
 struct AcpInner {
-    stdin: Mutex<Option<File>>,
+    stdin: Mutex<Option<Box<dyn Write + Send>>>,
     events: Mutex<VecDeque<AcpEvent>>,
     /// 控制事件独立通道（F15）：PromptDone / Exited / ProtocolError 不能被
     /// 正文事件溢出丢弃；自身有上限，越界即 fail closed。
@@ -526,23 +522,23 @@ fn cell_scope(cwd: &Path) -> String {
     format!("acp-{hash:016x}")
 }
 
-/// The Agent host policy: restricted token, host network (loopback MCP), the
-/// cell writable, and the task's Job limits.
+/// Agent host policy: MXC container with read/write cell isolation,
+/// loopback + outbound network, UI isolation, and optional `GOOSE_PATH_ROOT`.
 ///
-/// `goose_root` is the per-DUT `GOOSE_PATH_ROOT` (config/sessions). It is a
-/// sibling of the cell, and the write-restricted token can only write where the
-/// policy grants a capability SID — without this second root goose starts but
-/// cannot persist its own config or sessions. Both roots are per-DUT, so this
-/// does not widen the boundary across DUTs.
-pub(crate) fn agent_policy(cell: &CellSpec, goose_root: Option<&Path>) -> SandboxPolicy {
-    let mut policy = SandboxPolicy::agent_cell(cell);
+/// `goose_root` is the per-DUT `GOOSE_PATH_ROOT` (config/sessions) sibling of
+/// the cell. `allowed_exe_dir` grants read-only access to the Agent binary
+/// directory even when installed under `.duthub/tools/<tool>/`.
+pub(crate) fn agent_policy(
+    cell: &CellSpec,
+    goose_root: Option<&Path>,
+    allowed_exe_dir: Option<&Path>,
+) -> SandboxPolicy {
+    let mut policy = SandboxPolicy::agent_cell(cell, allowed_exe_dir);
     if let Some(root) = goose_root
         && root != cell.root()
     {
         policy.writable.push(root.to_path_buf());
     }
-    policy.process_limit = Some(JOB_ACTIVE_PROCESS_LIMIT);
-    policy.memory_limit_bytes = Some(JOB_PROCESS_MEMORY_LIMIT as u64);
     policy
 }
 
@@ -631,7 +627,7 @@ impl AcpClient {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case("GOOSE_PATH_ROOT"))
             .map(|(_, value)| PathBuf::from(value));
-        let policy = agent_policy(&cell, goose_root.as_deref());
+        let policy = agent_policy(&cell, goose_root.as_deref(), program.parent());
         Self::spawn_in_cell(program, &args, &cell, &policy, env, stderr_cap, cancel)
     }
 
@@ -647,8 +643,10 @@ impl AcpClient {
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, AcpError> {
         let cwd = cell.root();
-        // 生产路径的 cwd 就是该 DUT 的 sandbox；直接 spawn 的调用方也获得同一
-        // 收敛行为。创建失败/非普通目录 fail closed，绝不回退到用户 TEMP。
+        duthub_sandbox::prepare_cell(cell).map_err(|error| AcpError::Spawn(error.to_string()))?;
+        let local_app_data = cell.layout().home().join("AppData").join("Local");
+        // Validate `<cell>/tmp` as a plain directory (fail closed, never fall
+        // back to the host user's TEMP).
         let temp_dir =
             super::sandbox::temp_dir(cwd).map_err(|error| AcpError::Spawn(error.to_string()))?;
         let mut environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
@@ -661,11 +659,12 @@ impl AcpClient {
             if key.contains('\0') || value.contains('\0') {
                 return Err(AcpError::Spawn("环境变量包含 NUL 字符".into()));
             }
-            environment.push((key.into(), value.into()));
+            set_environment(&mut environment, key, value.as_ref());
         }
-        // TEMP/TMP 最后写入：调用方 env（含外部 agents.json 的 envKeys）不得
-        // 把它改回用户临时目录——路径收敛优先。`environment_block` 对重复键
-        // 保留首个拼写，所以先删再追加，而不是依赖顺序覆盖。
+        // Redirect `LOCALAPPDATA` (required by Windows ProcessContainer when
+        // default environment inheritance is disabled) and `TEMP`/`TMP` into
+        // the per-DUT sandbox cell so host user directories are never exposed.
+        set_environment(&mut environment, "LOCALAPPDATA", local_app_data.as_os_str());
         set_environment(&mut environment, "TEMP", temp_dir.as_os_str());
         set_environment(&mut environment, "TMP", temp_dir.as_os_str());
         let request = SpawnRequest {
@@ -674,8 +673,6 @@ impl AcpClient {
             cwd: cwd.to_path_buf(),
             environment,
         };
-        // 沙箱 crate 内：Job 限额 → 管道 → 受限令牌 CreateProcessAsUser →
-        // 令牌回验 → ResumeThread。任一步失败都会终止挂起的子进程并返回错误。
         let mut process = spawn_streaming(cell, policy, &request)
             .map_err(|error| AcpError::Spawn(error.to_string()))?;
         let Some(stdin) = process.take_stdin() else {
@@ -885,10 +882,10 @@ impl AcpClient {
         self.process.lock().unwrap().pid()
     }
 
-    /// Whether the process is bounded by the sandbox Job. A sandboxed spawn
-    /// either returns such a handle or fails, so this is a platform fact.
+    /// Whether the process is bounded by the sandbox containment handle.
+    /// Every MXC spawn attaches a process-tree teardown handle or fails closed.
     pub fn has_job(&self) -> bool {
-        cfg!(windows)
+        true
     }
 
     pub fn close_stdin(&self) {
@@ -974,7 +971,7 @@ fn session_params(cwd: &Path, mcp: Option<&McpServerRef<'_>>, session_id: Option
     params
 }
 
-fn read_stdout(stdout: File, inner: Arc<AcpInner>) {
+fn read_stdout(stdout: impl Read, inner: Arc<AcpInner>) {
     let mut reader = BufReader::new(stdout);
     loop {
         match read_bounded_line(&mut reader, MAX_STDOUT_LINE) {

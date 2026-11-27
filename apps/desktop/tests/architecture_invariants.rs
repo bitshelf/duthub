@@ -40,15 +40,29 @@ fn core_and_agent_crates_forbid_unsafe_and_keep_core_pure() {
         agent_lib.contains("#![forbid(unsafe_code)]"),
         "duthub-agent must declare #![forbid(unsafe_code)]"
     );
+    let sandbox_lib = read(&root.join("crates/duthub-sandbox/src/lib.rs"));
+    assert!(
+        sandbox_lib.contains("#![forbid(unsafe_code)]"),
+        "duthub-sandbox must declare #![forbid(unsafe_code)]"
+    );
 
     let core_toml = read(&root.join("crates/duthub-core/Cargo.toml"));
     assert!(
         !core_toml.contains("windows-sys"),
-        "duthub-core must not depend on windows-sys (OS ACLs live in duthub-sandbox)"
+        "duthub-core must not depend on windows-sys"
     );
     assert!(
         !core_toml.contains("reqwest"),
         "duthub-core must not depend on reqwest (LLM HTTP probes live in duthub-agent)"
+    );
+    let sandbox_toml = read(&root.join("crates/duthub-sandbox/Cargo.toml"));
+    assert!(
+        !sandbox_toml.contains("windows-sys"),
+        "duthub-sandbox must use mxc-sdk instead of raw windows-sys FFI"
+    );
+    assert!(
+        sandbox_toml.contains("mxc-sdk"),
+        "duthub-sandbox must depend on mxc-sdk"
     );
 }
 
@@ -63,8 +77,10 @@ fn plan_tool_names_have_a_single_source_of_truth() {
         duthub_desktop::agent_host::cli::PLAN_TOOLS,
         duthub_mcp::PLAN_TOOL_NAMES
     );
-    assert_eq!(duthub_mcp::PLAN_TOOL_NAMES.len(), 13);
+    assert_eq!(duthub_mcp::PLAN_TOOL_NAMES.len(), 10);
     assert!(!duthub_mcp::PLAN_TOOL_NAMES.contains(&"notify_user"));
+    assert!(!duthub_mcp::PLAN_TOOL_NAMES.contains(&"dut_control"));
+    assert!(!duthub_mcp::PLAN_TOOL_NAMES.contains(&"serial_exec"));
 }
 
 #[test]

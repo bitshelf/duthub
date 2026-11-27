@@ -32,26 +32,18 @@ const CARD_BEARER_DESCRIPTION: &str =
 /// Evidence skills advertised on the card, mirroring the server-side
 /// allowlist ([`crate::evidence::EVIDENCE_SKILLS`]). Descriptions stay generic
 /// so no DUT context leaks into the card.
-const CARD_SKILLS: [(&str, &str); 8] = [
+const CARD_SKILLS: [(&str, &str); 5] = [
     (
         "dut_list",
         "List the DUT served by this endpoint with its connection status.",
     ),
     (
-        "dut_info",
-        "Read the bound DUT's connection and session status.",
-    ),
-    (
-        "dut_control_status",
-        "Read the bound DUT's control-lease status (read-only).",
+        "dut_status",
+        "Read the bound DUT's connection, relay capabilities, lease and heartbeat status.",
     ),
     (
         "serial_read",
         "Read recent serial evidence lines from the bound DUT session.",
-    ),
-    (
-        "analyze_serial",
-        "Summarize recent serial output with analysis patterns.",
     ),
     (
         "log_segments",
@@ -60,10 +52,6 @@ const CARD_SKILLS: [(&str, &str); 8] = [
     (
         "log_segment_read",
         "Read one archived serial log segment of the bound DUT.",
-    ),
-    (
-        "heartbeat_get",
-        "Read the bound DUT's heartbeat configuration and last result.",
     ),
 ];
 

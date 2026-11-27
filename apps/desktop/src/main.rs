@@ -68,6 +68,7 @@ fn main() {
     // --open-port COM31 [--open-baud 115200]：启动即打开真实串口会话（快速调试入口）
     let args: Vec<String> = std::env::args().collect();
     let secondary_display = args.iter().any(|arg| arg == "--secondary-display");
+    let release_gui_lease = args.iter().any(|arg| arg == "--release-gui-lease");
     let open_port = args
         .iter()
         .position(|a| a == "--open-port")
@@ -80,11 +81,6 @@ fn main() {
         .and_then(|b| b.parse::<u32>().ok())
         .unwrap_or(115_200);
     // --workdir <目录> 覆盖保存的工作目录。默认以可执行文件目录为根。
-    let cli_workdir = args
-        .iter()
-        .position(|a| a == "--workdir")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
     let frames = Arc::new(AtomicUsize::new(0));
     let core_lines = Arc::new(AtomicUsize::new(0));
 
@@ -94,7 +90,18 @@ fn main() {
         eprintln!("无法定位可执行文件目录");
         exit(1);
     };
-    let data_dir = match duthub_core::store::initialize_config_dir(&exe_dir) {
+    let explicit_root =
+        duthub_core::store::explicit_workspace(&exe_dir, std::env::args_os().skip(1))
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                exit(1)
+            });
+    let config_root = explicit_root.as_deref().unwrap_or(&exe_dir);
+    if explicit_root.is_some() && !duthub_core::store::dir_writable(config_root) {
+        eprintln!("Workspace is not writable: {}", config_root.display());
+        exit(1);
+    }
+    let data_dir = match duthub_core::store::initialize_config_dir(config_root) {
         Ok(dir) => dir,
         Err(error) => {
             eprintln!("{error}");
@@ -159,9 +166,12 @@ fn main() {
     };
     // 工作目录解析 + 创建 + 可写校验（不可用回退默认并提示）
     let (artifact_root, workdir_notice) = match duthub_core::store::ensure_portable_work_dir(
-        &exe_dir,
-        settings.workspace_dir.as_deref(),
-        cli_workdir.as_deref(),
+        config_root,
+        settings
+            .workspace_dir
+            .as_deref()
+            .filter(|_| explicit_root.is_none()),
+        None,
     ) {
         Ok(value) => value,
         Err(error) => {
@@ -312,6 +322,14 @@ fn main() {
                             runtime: shared_runtime.clone(),
                         },
                     );
+                    if release_gui_lease {
+                        for session in &view.sessions {
+                            lease.release_for_holder(
+                                &session.dut_id,
+                                &duthub_core::LeaseHolder::Gui,
+                            );
+                        }
+                    }
                     if self_test {
                         view.set_config_page(Some(workspace::ConfigPage::AgentModel));
                     }

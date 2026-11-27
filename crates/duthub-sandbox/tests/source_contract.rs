@@ -1,18 +1,16 @@
-//! Source-level contracts that pin the security architecture (ADR-12 §3):
+//! Source-level contracts pinning the MXC sandbox architecture (ADR-12):
 //!
-//! 1. `unsafe` exists only in `src/windows/`, and every `unsafe` block there
-//!    carries a `SAFETY:` note.
-//! 2. This crate never falls back to an unsandboxed process (`Command`).
-//! 3. Process-spawning / container APIs used by the boundary do not appear in
-//!    any other crate or app, so `duthub-sandbox` stays the single owner.
-//! 4. The policy types are not duplicated in `duthub-core`.
-//! 5. The security tests stay present and ungated (no `#[ignore]`).
+//! 1. `duthub-sandbox` forbids `unsafe` code (`#![forbid(unsafe_code)]`) and
+//!    has no `windows-sys` dependency.
+//! 2. `duthub-sandbox` never falls back to an unsandboxed process (`Command`).
+//! 3. Low-level Win32 spawning/container APIs do not appear anywhere in the
+//!    workspace — all OS containment goes through `mxc-sdk`.
+//! 4. Policy types are not duplicated in `duthub-core`.
+//! 5. Security invariants T1–T8 stay present and ungated (no `#[ignore]`).
 
 use std::path::{Path, PathBuf};
 
 fn manifest_dir() -> PathBuf {
-    // Read at runtime: `env!` bakes an absolute path into the binary and
-    // breaks after a directory rename (AGENTS.md pitfall #4).
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
 }
 
@@ -39,58 +37,25 @@ fn rust_files(root: &Path, output: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn unsafe_is_confined_to_the_windows_backend() {
-    let src = manifest_dir().join("src");
-    let mut files = Vec::new();
-    rust_files(&src, &mut files);
+fn sandbox_crate_forbids_unsafe_and_drops_raw_win32_deps() {
+    let lib = std::fs::read_to_string(manifest_dir().join("src").join("lib.rs")).expect("read lib");
     assert!(
-        !files.is_empty(),
-        "no sources found under {}",
-        src.display()
+        lib.contains("#![forbid(unsafe_code)]"),
+        "duthub-sandbox must declare #![forbid(unsafe_code)]"
     );
-    for file in &files {
-        let relative = file.strip_prefix(&src).expect("under src");
-        let content = std::fs::read_to_string(file).expect("read source");
-        if relative.starts_with("windows") {
-            if !content.contains("unsafe") {
-                continue;
-            }
-            assert!(
-                content.contains("SAFETY:"),
-                "{} uses unsafe without a SAFETY note",
-                relative.display()
-            );
-            let blocks = content.matches("unsafe {").count()
-                + content.matches("unsafe fn").count()
-                + content.matches("unsafe extern").count();
-            let notes = content.matches("SAFETY:").count();
-            assert!(
-                notes >= blocks,
-                "{}: {blocks} unsafe blocks but only {notes} SAFETY notes",
-                relative.display()
-            );
-        } else {
-            // Documentation legitimately talks *about* unsafe; the contract is
-            // about code. Strip line comments (`//`, `///`, `//!`) before the
-            // check so prose cannot trip the gate.
-            let code: String = content
-                .lines()
-                .map(|line| {
-                    if line.trim_start().starts_with("//") {
-                        ""
-                    } else {
-                        line
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                !code.contains("unsafe"),
-                "{} must stay unsafe-free (all unsafe belongs in src/windows)",
-                relative.display()
-            );
-        }
-    }
+    let toml = std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(
+        !toml.contains("windows-sys"),
+        "duthub-sandbox must delegate OS isolation to mxc-sdk instead of windows-sys"
+    );
+    assert!(
+        toml.contains("mxc-sdk"),
+        "duthub-sandbox must depend on mxc-sdk"
+    );
+    assert!(
+        !manifest_dir().join("src").join("windows").exists(),
+        "legacy src/windows FFI directory must stay removed"
+    );
 }
 
 #[test]
@@ -98,6 +63,7 @@ fn the_crate_never_runs_an_unsandboxed_command() {
     let src = manifest_dir().join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files);
+    assert!(!files.is_empty());
     for file in &files {
         let content = std::fs::read_to_string(file).expect("read source");
         for forbidden in [
@@ -116,18 +82,15 @@ fn the_crate_never_runs_an_unsandboxed_command() {
 }
 
 #[test]
-fn spawning_apis_stay_inside_the_sandbox_crate() {
+fn raw_sandbox_spawning_apis_do_not_exist_in_workspace() {
     let root = workspace_root();
     let mut files = Vec::new();
     rust_files(&root.join("crates"), &mut files);
     rust_files(&root.join("apps"), &mut files);
-    let own_src = manifest_dir().join("src");
-    // This test file contains the forbidden names as data, so scanning it would
-    // always fail; every other crate, app and test stays in scope.
     let own_test = manifest_dir().join("tests").join("source_contract.rs");
     let mut scanned = 0usize;
     for file in &files {
-        if file.starts_with(&own_src) || file == &own_test {
+        if file == &own_test {
             continue;
         }
         let content = std::fs::read_to_string(file).expect("read source");
@@ -142,7 +105,7 @@ fn spawning_apis_stay_inside_the_sandbox_crate() {
         ] {
             assert!(
                 !content.contains(forbidden),
-                "{} contains `{forbidden}`: the sandbox boundary must stay in duthub-sandbox",
+                "{} contains `{forbidden}`: OS containment must go through mxc-sdk",
                 file.display()
             );
         }
@@ -162,7 +125,7 @@ fn policy_types_are_not_duplicated_in_core() {
             .join("src")
             .join("os_sandbox.rs")
             .exists(),
-        "duthub-core/src/os_sandbox.rs must be gone: one policy implementation only"
+        "duthub-core/src/os_sandbox.rs must stay removed"
     );
     let core_lib = std::fs::read_to_string(
         manifest_dir()
@@ -202,7 +165,7 @@ fn security_invariants_stay_present_and_ungated() {
         "security tests must always run, never be ignored"
     );
     assert!(
-        content.contains("#[cfg(not(windows))]"),
-        "non-Windows builds must keep an explicit Unsupported assertion"
+        !content.contains("skip_without_identity"),
+        "T3/T4 must run unconditionally under mxc-sdk PSEC without skipping"
     );
 }

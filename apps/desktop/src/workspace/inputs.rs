@@ -1676,31 +1676,18 @@ impl Workbench {
         }
     }
 
-    /// Cached per-DUT OS isolation capability probe (10s TTL) so GPUI render
-    /// frames never execute Win32 ACL / token syscalls at 60 FPS.
-    pub(crate) fn cached_os_isolation(&self, dut_id: &str) -> duthub_sandbox::OsIsolationStatus {
+    /// Cached host MXC sandbox capability probe (10s TTL) so GPUI render
+    /// frames never execute OS probes at 60 FPS.
+    pub(crate) fn cached_sandbox_status(&self) -> duthub_sandbox::SandboxStatus {
         const TTL: Duration = Duration::from_secs(10);
         let now = std::time::Instant::now();
+        if let Some((probed_at, status)) = self.sandbox_status_cache.borrow().as_ref()
+            && now.duration_since(*probed_at) < TTL
         {
-            let cache = self.os_isolation_cache.borrow();
-            if let Some((probed_at, status)) = cache.get(dut_id)
-                && now.duration_since(*probed_at) < TTL
-            {
-                return status.clone();
-            }
+            return status.clone();
         }
-        let status = match duthub_desktop::agent_ui::agent_dut_probe_path(&self.work_dir, dut_id) {
-            Some(dir) => duthub_sandbox::probe_os_isolation(&dir),
-            None => duthub_sandbox::OsIsolationStatus {
-                detail: crate::i18n::label("agentDutDirUnavailable").into(),
-                ..Default::default()
-            },
-        };
-        let mut cache = self.os_isolation_cache.borrow_mut();
-        if cache.len() >= 64 {
-            cache.clear();
-        }
-        cache.insert(dut_id.to_owned(), (now, status.clone()));
+        let status = duthub_sandbox::status();
+        *self.sandbox_status_cache.borrow_mut() = Some((now, status.clone()));
         status
     }
 
@@ -1762,7 +1749,7 @@ impl Workbench {
                         .saved_usb(&d.id)
                         .filter(|adb| adb.tool != "hdc" && !adb.serial.trim().is_empty())
                         .map(|adb| adb.serial.clone()),
-                    relay: None,
+                    relay: relay_brief_for_dut(d, &self.duts.file.relay_boards),
                     mcp_label: None,
                     lines,
                 }
@@ -1793,5 +1780,80 @@ impl Workbench {
         if result.job == scan.job {
             scan.result = Some(result.outcome);
         }
+    }
+}
+
+/// Build the MCP `RelayBrief` from a DUT's configured relay binding and shared
+/// board list so external MCP clients can inspect exact bound channels (such as
+/// `reset` only vs `maskrom` / `recovery` / `power`).
+fn relay_brief_for_dut(
+    dut: &duthub_core::model::DutConfig,
+    boards: &[duthub_core::model::RelayBoard],
+) -> Option<duthub_mcp::state::RelayBrief> {
+    use duthub_core::model::RelayConfig;
+    use duthub_mcp::state::{RelayBrief, RelayChannelsBrief};
+
+    match &dut.relay {
+        RelayConfig::Disabled => None,
+        RelayConfig::UsbBoard { board_id, channels } => {
+            let board = boards.iter().find(|board| board.id == *board_id);
+            let brief_channels = RelayChannelsBrief {
+                power: channels.power,
+                reset: channels.reset,
+                recovery: channels.recovery,
+                maskrom: channels.maskrom,
+                power_key: channels.power_key,
+            };
+            let capabilities = brief_channels.capabilities();
+            Some(RelayBrief {
+                mode: "usb-board".into(),
+                board_id: Some(board_id.clone()),
+                board_name: board.map(|b| b.name.clone()),
+                node: board
+                    .map(|b| b.node.clone())
+                    .filter(|node| !node.trim().is_empty()),
+                driver: board
+                    .map(|b| b.driver.clone())
+                    .filter(|driver| !driver.trim().is_empty()),
+                power_outlet: None,
+                channels: brief_channels,
+                capabilities,
+            })
+        }
+        RelayConfig::UsbSerial {
+            node,
+            driver,
+            channels,
+            ..
+        } => {
+            let brief_channels = RelayChannelsBrief {
+                power: channels.power,
+                reset: channels.reset,
+                recovery: channels.recovery,
+                maskrom: channels.maskrom,
+                power_key: channels.power_key,
+            };
+            let capabilities = brief_channels.capabilities();
+            Some(RelayBrief {
+                mode: "usb-serial".into(),
+                board_id: None,
+                board_name: None,
+                node: (!node.trim().is_empty()).then(|| node.clone()),
+                driver: (!driver.trim().is_empty()).then(|| driver.clone()),
+                power_outlet: None,
+                channels: brief_channels,
+                capabilities,
+            })
+        }
+        RelayConfig::SnmpPdu { snmp, outlets } => Some(RelayBrief {
+            mode: "snmp-pdu".into(),
+            board_id: None,
+            board_name: None,
+            node: (!snmp.address.trim().is_empty()).then(|| snmp.address.clone()),
+            driver: Some("snmp-pdu".into()),
+            power_outlet: Some(outlets.power),
+            channels: RelayChannelsBrief::default(),
+            capabilities: vec!["power".into()],
+        }),
     }
 }

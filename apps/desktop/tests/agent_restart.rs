@@ -146,40 +146,28 @@ impl HostEvents for Events {
     }
 }
 
-/// Fake ACP agent. `fail-early` exits before answering initialize; every other
-/// mode becomes Ready and then exits 0 after `session/new`.
-/// Uses pure .NET BCL I/O and regex matching so it never loads PowerShell
-/// modules (such as `ConvertFrom-Json`/`ConvertTo-Json`) under restricted
-/// tokens or headless CI runners.
-const FAKE_ACP_SCRIPT: &str = r#"param(
-    [Parameter(Mandatory = $true)][string]$Mode,
-    [Parameter(Mandatory = $true)][string]$CounterPath
-)
-$ErrorActionPreference = 'Stop'
-[System.IO.File]::AppendAllText($CounterPath, "spawn`n")
-if ($Mode -eq 'fail-early') { exit 3 }
-$utf8 = [System.Text.UTF8Encoding]::new($false)
-$reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8)
-$writer = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8)
-$writer.AutoFlush = $true
-while ($true) {
-    $line = $reader.ReadLine()
-    if ($null -eq $line) { break }
-    if ($line -notmatch '"id"\s*:\s*(\d+)') { continue }
-    $id = $Matches[1]
-    if ($line -match '"method"\s*:\s*"initialize"') {
-        $writer.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":1,"agentInfo":{"name":"fake-acp","version":"0.0.1"},"agentCapabilities":{"loadSession":false,"mcpCapabilities":{"http":true}}}}')
-    } elseif ($line -match '"method"\s*:\s*"session/new"') {
-        $sid = 'fake-' + [guid]::NewGuid().ToString('N')
-        $writer.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"sessionId":"' + $sid + '","_meta":{"extensionResults":[{"name":"duthub","success":true}]}}}')
-        break
-    } else {
-        $writer.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{}}')
-    }
-}
-[System.Threading.Thread]::Sleep(300)
-exit 0
-"#;
+/// Fake ACP agent written as a pure `cmd.exe` batch script so it runs inside
+/// MXC PSEC 1.1 on both interactive and headless/isolated CI desktops without
+/// linking `user32.dll`.
+///
+/// - `fail-early`: records a spawn line and exits 3 before answering `initialize`.
+/// - other modes: records a spawn line, answers `initialize` (id=1) and
+///   `session/new` (id=2), briefly stays alive so callers observe `Ready`, then
+///   exits 0.
+const FAKE_ACP_FAIL_EARLY_CMD: &str = "@echo off\r\n\
+echo spawn>>\"%~1\"\r\n\
+exit /b 3\r\n";
+
+const FAKE_ACP_CRASH_AFTER_READY_CMD: &str = "@echo off\r\n\
+echo spawn>>\"%~1\"\r\n\
+set \"line1=\"\r\n\
+set /p \"line1=\" || exit /b 1\r\n\
+echo {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"name\":\"fake-acp\",\"version\":\"0.0.1\"},\"agentCapabilities\":{\"loadSession\":false,\"mcpCapabilities\":{\"http\":true}}}}\r\n\
+set \"line2=\"\r\n\
+set /p \"line2=\" || exit /b 1\r\n\
+echo {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"fake-session-1\",\"_meta\":{\"extensionResults\":[{\"name\":\"duthub\",\"success\":true}]}}}\r\n\
+ping -n 2 127.0.0.1 >nul\r\n\
+exit /b 0\r\n";
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -196,40 +184,37 @@ fn access_context() -> Arc<AccessContext> {
     Arc::new(AccessContext::new(auth, lease, AuditSink::memory()))
 }
 
-fn powershell() -> PathBuf {
+fn cmd_exe() -> PathBuf {
     let root =
         std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from("C:/Windows"), PathBuf::from);
-    root.join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe")
+    root.join("System32").join("cmd.exe")
 }
 
-/// Build an external ACP definition running the fake script.
-fn fake_agent(work: &Path, mode: &str, counter: &Path) -> AgentDefinition {
-    let program = powershell();
-    assert!(
-        program.is_file(),
-        "缺少 powershell.exe: {}",
-        program.display()
-    );
-    let script = work.join(format!("fake-acp-{mode}.ps1"));
-    std::fs::write(&script, FAKE_ACP_SCRIPT).unwrap();
+/// Build an external ACP definition running the fake batch script inside the
+/// DUT's sandbox cell.
+fn fake_agent(work: &Path, dut: &str, mode: &str, counter: &Path) -> AgentDefinition {
+    let program = cmd_exe();
+    assert!(program.is_file(), "缺少 cmd.exe: {}", program.display());
+    let key = duthub_core::store::agent_dut_key(dut).expect("DUT id must map to a key");
+    let cell_dir = work.join("agent").join("dut").join(key).join("sandbox");
+    std::fs::create_dir_all(&cell_dir).unwrap();
+    let script = cell_dir.join(format!("fake-acp-{mode}.cmd"));
+    let body = if mode == "fail-early" {
+        FAKE_ACP_FAIL_EARLY_CMD
+    } else {
+        FAKE_ACP_CRASH_AFTER_READY_CMD
+    };
+    std::fs::write(&script, body).unwrap();
     AgentDefinition {
         id: format!("fake-{mode}"),
         name: format!("Fake ACP {mode}"),
         kind: AgentKind::Acp,
         program: Some(program.to_string_lossy().into_owned()),
         args: vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-ExecutionPolicy".into(),
-            "Bypass".into(),
-            "-File".into(),
+            "/D".into(),
+            "/Q".into(),
+            "/C".into(),
             script.to_string_lossy().into_owned(),
-            "-Mode".into(),
-            mode.into(),
-            "-CounterPath".into(),
             counter.to_string_lossy().into_owned(),
         ],
         env_keys: Vec::new(),
@@ -293,7 +278,7 @@ fn restart_only_after_ready() {
     host.start_with_agent(
         "dut-no-ready",
         None,
-        fake_agent(&work, "fail-early", &early_counter),
+        fake_agent(&work, "dut-no-ready", "fail-early", &early_counter),
     )
     .unwrap();
     assert!(
@@ -322,7 +307,7 @@ fn restart_only_after_ready() {
     host.start_with_agent(
         "dut-crash",
         None,
-        fake_agent(&work, "crash-after-ready", &crash_counter),
+        fake_agent(&work, "dut-crash", "crash-after-ready", &crash_counter),
     )
     .unwrap();
     assert!(
@@ -400,7 +385,7 @@ fn stop_cancels_pending_restart_without_new_spawn() {
     host.start_with_agent(
         "dut-stop",
         None,
-        fake_agent(&work, "crash-after-ready", &counter),
+        fake_agent(&work, "dut-stop", "crash-after-ready", &counter),
     )
     .unwrap();
     wait_until(Duration::from_secs(60), || {

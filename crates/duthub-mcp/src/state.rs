@@ -35,11 +35,62 @@ pub struct SerialBindInfo {
     pub format: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayChannelsBrief {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maskrom: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_key: Option<u8>,
+}
+
+impl RelayChannelsBrief {
+    /// Human/machine-readable list of bound relay capabilities for this DUT.
+    pub fn capabilities(&self) -> Vec<String> {
+        let mut caps = Vec::new();
+        if self.power.is_some() {
+            caps.push("power".into());
+        }
+        if self.reset.is_some() {
+            caps.push("reset".into());
+        }
+        if self.recovery.is_some() {
+            caps.push("recovery".into());
+        }
+        if self.maskrom.is_some() {
+            caps.push("maskrom".into());
+        }
+        if self.power_key.is_some() {
+            caps.push("power_key".into());
+        }
+        caps
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayBrief {
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_outlet: Option<u16>,
+    #[serde(default)]
+    pub channels: RelayChannelsBrief,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// 终端行（serial.read）
@@ -338,6 +389,39 @@ pub trait McpState: Send + Sync + 'static {
         writer: duthub_core::lease::WriteIdentity,
     ) -> Result<(), String>;
 
+    /// Atomic power cycle (`power OFF → wait → power ON`).
+    fn control_power_cycle(
+        &self,
+        _dut_id: &str,
+        _off_ms: u64,
+        _approval_token: &str,
+        _writer: duthub_core::lease::WriteIdentity,
+    ) -> Result<(), String> {
+        Err("control.power_cycle is unavailable on this state source".into())
+    }
+
+    /// Atomic MaskROM entry (`maskrom ON → reset/power_cycle → hold → maskrom OFF`).
+    fn control_enter_maskrom(
+        &self,
+        _dut_id: &str,
+        _hold_ms: u64,
+        _approval_token: &str,
+        _writer: duthub_core::lease::WriteIdentity,
+    ) -> Result<(), String> {
+        Err("control.enter_maskrom is unavailable on this state source".into())
+    }
+
+    /// Atomic Loader/Recovery entry (`recovery ON → reset/power_cycle → hold → recovery OFF`).
+    fn control_enter_loader(
+        &self,
+        _dut_id: &str,
+        _hold_ms: u64,
+        _approval_token: &str,
+        _writer: duthub_core::lease::WriteIdentity,
+    ) -> Result<(), String> {
+        Err("control.enter_loader is unavailable on this state source".into())
+    }
+
     /// 继电器逐通道状态查询（只读，无需审批）。返回应答 STATUS 的
     /// `(通道号, 是否吸合)`；Err = DUT 未配置继电器 / 后端不支持。
     fn relay_status(&self, _dut_id: &str) -> Result<Vec<(u8, bool)>, String> {
@@ -387,6 +471,49 @@ pub trait McpState: Send + Sync + 'static {
 
     /// 烧录工具只读测试（白名单参数；preset_id = settings.flashTools[].id 稳定预设 id）
     fn flash_test(&self, preset_id: &str) -> Result<ProcessResultDto, String>;
+
+    /// List connected Rockusb/MaskROM/Loader devices using a host-configured flash preset.
+    fn flash_list(&self, _preset_id: Option<&str>) -> Result<ProcessResultDto, String> {
+        Err("flash_list is unavailable on this state source".into())
+    }
+
+    /// Flash a firmware image strictly inside the DUT's owned directory using a
+    /// host-configured flash preset (`upgrade_tool uf <verified_dut_image>`).
+    fn flash_update(
+        &self,
+        _dut_id: &str,
+        _file_id: &str,
+        _preset_id: Option<&str>,
+        _writer: duthub_core::lease::WriteIdentity,
+    ) -> Result<ProcessResultDto, String> {
+        Err("flash_update is unavailable on this state source".into())
+    }
+
+    /// Reboot a connected Rockusb/Loader device back to normal boot (`upgrade_tool rd`).
+    fn flash_reboot(
+        &self,
+        _dut_id: &str,
+        _preset_id: Option<&str>,
+        _writer: duthub_core::lease::WriteIdentity,
+    ) -> Result<ProcessResultDto, String> {
+        Err("flash_reboot is unavailable on this state source".into())
+    }
+
+    /// Bound-DUT ADB debugging action (`shell` | `reboot` | `reboot_loader` | `logcat` | `push` | `pull`).
+    /// File transfer paths are strictly confined to the DUT's owned directory.
+    #[allow(clippy::too_many_arguments)]
+    fn adb_exec(
+        &self,
+        _dut_id: &str,
+        _op: &str,
+        _command: Option<&str>,
+        _file_id: Option<&str>,
+        _remote_path: Option<&str>,
+        _timeout_ms: u64,
+        _writer: duthub_core::lease::WriteIdentity,
+    ) -> Result<ProcessResultDto, String> {
+        Err("adb_exec is unavailable on this state source".into())
+    }
 
     /// 签发审批令牌（单次有效，5 分钟过期）
     fn approval_issue(&self, dut_id: &str, action: &str, args_json: &str) -> ApprovalIssueResult;

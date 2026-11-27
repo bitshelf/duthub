@@ -997,9 +997,15 @@ pub(super) fn grant_check(
         .when(checked, |el| el.child("✓"))
 }
 
-const GRANT_ACTIONS: [(DutAction, &str); 2] = [
+const GRANT_ACTIONS: [(DutAction, &str); 8] = [
     (DutAction::Read, "agentAccessGrantRead"),
     (DutAction::Capture, "agentAccessGrantCapture"),
+    (DutAction::SerialWrite, "agentAccessGrantSerialWrite"),
+    (DutAction::Reset, "agentAccessGrantReset"),
+    (DutAction::Power, "agentAccessGrantPower"),
+    (DutAction::Relay, "agentAccessGrantRelay"),
+    (DutAction::Adb, "agentAccessGrantAdb"),
+    (DutAction::Flash, "agentAccessGrantFlash"),
 ];
 
 pub(super) fn aa_credential_card(

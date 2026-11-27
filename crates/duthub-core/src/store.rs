@@ -25,11 +25,38 @@ pub fn exe_dir() -> DeviceResult<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// 配置目录（bootstrap）：settings.json / duts.json 固定 exe 同级 `.duthub/`。
+/// The explicit workspace also owns configuration and downloaded tools.
 pub fn data_dir() -> DeviceResult<PathBuf> {
-    Ok(config_dir_in(&exe_dir()?))
+    let anchor = exe_dir()?;
+    let root = explicit_workspace(&anchor, std::env::args_os().skip(1))?.unwrap_or(anchor);
+    Ok(config_dir_in(&root))
 }
 
+/// Resolve an explicitly supplied workspace before consulting any settings.
+pub fn explicit_workspace(
+    anchor: &Path,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> DeviceResult<Option<PathBuf>> {
+    let mut args = args.into_iter();
+    let mut root = None;
+    while let Some(arg) = args.next() {
+        if arg != "--workdir" {
+            continue;
+        }
+        if root.is_some() {
+            return Err(DeviceError::Invalid("Duplicate --workdir".into()));
+        }
+        let value = args
+            .next()
+            .filter(|v| {
+                let text = v.to_string_lossy();
+                !text.trim().is_empty() && !text.starts_with("--")
+            })
+            .ok_or_else(|| DeviceError::Invalid("--workdir requires a directory".into()))?;
+        root = Some(anchor.join(value));
+    }
+    Ok(root)
+}
 pub fn config_dir_in(exe_dir: &Path) -> PathBuf {
     exe_dir.join(CONFIG_DIR)
 }
@@ -112,14 +139,10 @@ pub fn ensure_portable_work_dir(
         ensure_portable_child(&root, "duthub-data")?;
         return Ok((root, None));
     }
-    ensure_portable_child(exe_dir, "duthub-data")?;
-    Ok((
-        exe_dir.to_path_buf(),
-        Some(format!(
-            "工作目录不可用，已使用程序同级目录: {}",
-            selected.display()
-        )),
-    ))
+    Err(DeviceError::Invalid(format!(
+        "Workspace is not writable: {}",
+        selected.display()
+    )))
 }
 
 pub fn ensure_portable_child(root: &Path, component: &str) -> DeviceResult<()> {
@@ -795,6 +818,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_workspace_is_checked_before_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = temp.path();
+        let parse = |args: &[&str]| explicit_workspace(anchor, args.iter().map(Into::into));
+        assert_eq!(
+            parse(&["--workdir", "work"]).unwrap(),
+            Some(anchor.join("work"))
+        );
+        for args in [
+            &["--workdir"][..],
+            &["--workdir", "--trace"],
+            &["--workdir", " "],
+            &["--workdir", "a", "--workdir", "b"],
+        ] {
+            assert!(parse(args).is_err());
+        }
+        std::fs::write(anchor.join("file"), "test").unwrap();
+        assert!(ensure_portable_work_dir(anchor, None, Some("file")).is_err());
+        assert!(!anchor.join("duthub-data").exists());
+    }
     #[test]
     fn usb_tool_paths_are_saved_independently() {
         let dir = temp_dir("usb-tool-paths");

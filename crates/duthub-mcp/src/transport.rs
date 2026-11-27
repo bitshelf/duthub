@@ -111,7 +111,12 @@ fn bridge_request_allowed(request: &ClientRequest) -> bool {
         ClientRequest::InitializeRequest(_)
         | ClientRequest::PingRequest(_)
         | ClientRequest::DiscoverRequest(_)
-        | ClientRequest::ListToolsRequest(_) => true,
+        | ClientRequest::ListToolsRequest(_)
+        | ClientRequest::ListResourcesRequest(_)
+        | ClientRequest::ListResourceTemplatesRequest(_)
+        | ClientRequest::ReadResourceRequest(_)
+        | ClientRequest::ListPromptsRequest(_)
+        | ClientRequest::GetPromptRequest(_) => true,
         ClientRequest::CallToolRequest(call) => plan_tool_allowed(&call.params.name),
         _ => false,
     }
@@ -399,16 +404,40 @@ pub fn advertised_endpoint(addr: SocketAddr) -> SocketAddr {
     )
 }
 
-/// 探测默认出口网卡的 IPv4（UDP connect 只选路由、不发包；结果进程内缓存）。
+/// Reject RFC 2544 benchmarking addresses (`198.18.0.0/15`) commonly used by
+/// local TUN proxies (e.g. Clash/Mihomo), which are unreachable from LAN peers.
+fn is_virtual_tun_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 198 && (b & 0xfe) == 18
+}
+
+fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local() && !is_virtual_tun_ipv4(ip)
+}
+
+fn probe_route_ipv4(target: Ipv4Addr) -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((target, 80)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if is_usable_lan_ipv4(ip) => Some(ip),
+        _ => None,
+    }
+}
+
+/// Detect the host's reachable LAN IPv4 address via routing-table lookup
+/// (UDP connect sends no packets; result is cached per process). Falls back to
+/// RFC 1918 gateway probes when the default internet route enters a virtual TUN.
 fn detect_lan_ipv4() -> Option<Ipv4Addr> {
     static CACHE: OnceLock<Option<Ipv4Addr>> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-        socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
-        match socket.local_addr().ok()?.ip() {
-            IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
-            _ => None,
-        }
+        const PROBES: [Ipv4Addr; 5] = [
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+        ];
+        PROBES.into_iter().find_map(probe_route_ipv4)
     })
 }
 
@@ -478,5 +507,8 @@ mod tests {
 
         let loopback: SocketAddr = "127.0.0.1:18797".parse().unwrap();
         assert_eq!(advertised_endpoint(loopback), loopback);
+        assert!(is_virtual_tun_ipv4(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(!is_usable_lan_ipv4(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(is_usable_lan_ipv4(Ipv4Addr::new(192, 168, 1, 175)));
     }
 }
