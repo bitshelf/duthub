@@ -117,11 +117,9 @@ jobs:
             dist/licenses/**
           if-no-files-found: error
 
-  # ADR-3 §9 requires regression checks, SBOM, cargo audit, goose download checks, and Authenticode.
-  # Publishing depends on this job and any unmet requirement fails the gate.
-  gate:
-    needs: build-windows
-    runs-on: windows-latest
+  regression:
+    # CLI Agent integration tests require the native PSEC backend on Windows 11.
+    runs-on: windows-11-arm
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -129,7 +127,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch head
         with:
-          toolchain: stable
+          toolchain: stable-aarch64-pc-windows-msvc
 
       - name: Rust build cache
         uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
@@ -145,34 +143,22 @@ jobs:
           Write-Host "Using fxc: $fxc"
           "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Download release artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: duthub-windows-x64
-          path: dist
-
-      - name: Install release-gate tools (community)
+      - name: Set a dedicated test temporary directory
         shell: pwsh
-        # Use community tooling for supply-chain checks and SBOM generation.
-        run: cargo install --locked cargo-cyclonedx@0.5.10 cargo-audit@0.23.0
-
-      - name: Format check
-        shell: pwsh
-        run: cargo fmt --all --check
-
-      - name: Clippy (workspace, all targets and features, deny warnings)
-        shell: pwsh
-        env:
-          CARGO_BUILD_WARNINGS: deny
+        # Give test fixtures a stable path instead of the runner account short-name alias.
         run: |
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          $testTemp = Join-Path $env:RUNNER_TEMP 'duthub-tests'
+          New-Item -ItemType Directory -Force -Path $testTemp | Out-Null
+          "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Test (workspace)
+        id: workspace_tests
         shell: pwsh
         # Unauthenticated viewers cannot read runner logs. Put failing test names in public
         # check annotations and the step summary so failures can be identified.
         run: |
-          cargo test --workspace 2>&1 | Tee-Object -FilePath test-workspace.log
+          cargo test --locked --workspace --no-fail-fast -- --skip cli_stop_kills_process_tree 2>&1 | Tee-Object -FilePath test-workspace.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $lines = Get-Content test-workspace.log
@@ -194,6 +180,57 @@ jobs:
           }
           exit $code
 
+      - name: Verify sandbox process-tree shutdown
+        if: ${{ !cancelled() && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
+        shell: pwsh
+        # Run the subprocess heartbeat fixture without other Agent CLI tests competing.
+        run: cargo test --locked --workspace --test agent_cli -- cli_stop_kills_process_tree --exact --nocapture
+
+  # Keep release artifact verification on the x64 Windows image.
+  gate:
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch head
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+
+      - name: Locate fxc.exe (HLSL compiler)
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $fxc) { Write-Error "fxc.exe not found in Windows Kits"; exit 1 }
+          Write-Host "Using fxc: $fxc"
+          "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download release artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: duthub-windows-x64
+          path: dist
+
+      - name: Format check
+        shell: pwsh
+        run: cargo fmt --all --check
+
+      - name: Clippy (workspace, all targets and features, deny warnings)
+        shell: pwsh
+        env:
+          CARGO_BUILD_WARNINGS: deny
+        run: |
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+
       - name: Desktop self-test (informational on headless runner)
         shell: pwsh
         # This is the optional fourth step of scripts/regression. A headless runner may exit
@@ -202,6 +239,11 @@ jobs:
         run: |
           & .\dist\duthub.exe --self-test
           Write-Host "self-test exit code: $LASTEXITCODE"
+
+      - name: Install release-gate tools (community)
+        shell: pwsh
+        # Use community tooling for supply-chain checks and SBOM generation.
+        run: cargo install --locked cargo-cyclonedx@0.5.10 cargo-audit@0.23.0
 
       - name: Generate CycloneDX SBOM (duthub)
         shell: pwsh
@@ -267,7 +309,7 @@ jobs:
 
   publish-release:
     if: github.ref_type == 'tag' && vars.RELEASE_GATE == 'true'
-    needs: [build-windows, gate]
+    needs: [build-windows, regression, gate]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -286,6 +328,7 @@ jobs:
         with:
           body_path: dist/RELEASE_NOTES.md
           generate_release_notes: false
+          fail_on_unmatched_files: true
           files: |
             dist/duthub.exe
             dist/licenses/duthub/LICENSE
