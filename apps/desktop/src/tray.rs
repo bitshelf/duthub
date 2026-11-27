@@ -182,17 +182,16 @@ mod platform {
         QUNS_QUIET_TIME, SHQueryUserNotificationState, Shell_NotifyIconGetRect, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CopyIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-        DestroyMenu, DestroyWindow, DispatchMessageW, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG,
-        FLASHWINFO, FlashWindowEx, GetCursorPos, GetMenuItemCount, GetMenuItemID, GetMessageW,
-        HCURSOR, HICON, HMENU, IDI_WARNING, IsIconic, IsWindow, IsWindowVisible, KillTimer,
-        LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, PostThreadMessageW,
-        RegisterClassW, RegisterWindowMessageW, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOW,
-        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetTimer, ShowWindowAsync,
-        SystemParametersInfoW, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-        TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_QUIT,
-        WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASS_STYLES, WNDCLASSW, WS_EX_TOOLWINDOW,
-        WS_POPUP,
+        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+        DestroyWindow, DispatchMessageW, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHWINFO,
+        FlashWindowEx, GetCursorPos, GetMenuItemCount, GetMenuItemID, GetMessageW, HCURSOR, HICON,
+        HMENU, IsIconic, IsWindow, IsWindowVisible, KillTimer, MF_SEPARATOR, MF_STRING, MSG,
+        PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
+        SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SetForegroundWindow, SetTimer, ShowWindowAsync, SystemParametersInfoW, TPM_BOTTOMALIGN,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CONTEXTMENU,
+        WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+        WNDCLASS_STYLES, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
     };
     use windows::core::{BOOL, GUID, PCWSTR};
 
@@ -1113,33 +1112,19 @@ mod platform {
         }
     }
 
-    /// Loads the blinking frame.
+    /// Loads the optional dedicated alert icon (`assets/tray-alert.ico`, id 2).
     ///
-    /// The dedicated `assets/tray-alert.ico` resource (id 2) wins when it exists.
-    /// Otherwise a private copy of the system warning icon is used so the blink
-    /// still reads as a warning without ever painting the normal app icon as the
-    /// "alert" frame. `None` means "no blink, balloon only".
+    /// Never falls back to the Win32 system warning triangle (`IDI_WARNING` / ⚠️):
+    /// Windows taskbar attention uses `FlashWindowEx` and modern balloons keep the
+    /// normal app icon instead of flashing a warning triangle.
     ///
     /// # Safety
     ///
     /// `hinst` must be a valid module handle for the current process. The caller
-    /// takes ownership of the returned `HICON` (always a private icon or copy) and
-    /// must release it with `DestroyIcon`.
+    /// takes ownership of the returned `HICON` and must release it with `DestroyIcon`.
     unsafe fn load_alert_icon(hinst: HINSTANCE) -> Option<HICON> {
         // SAFETY: `hinst` is guaranteed valid by the caller.
-        if let Some(icon) = unsafe { load_icon(hinst, RESOURCE_ALERT_ICON) } {
-            return Some(icon);
-        }
-        // SAFETY: `IDI_WARNING` is a predefined system icon identifier with `None` hInstance.
-        let shared = unsafe { LoadIconW(None, IDI_WARNING) };
-        // SAFETY: `CopyIcon` clones the shared system icon into a private `HICON` that
-        // can safely be destroyed via `DestroyIcon`.
-        if let Ok(Ok(copy)) = shared.map(|icon| unsafe { CopyIcon(icon) }) {
-            Some(copy)
-        } else {
-            eprintln!("[tray] no alert icon available; the alert will use the balloon only");
-            None
-        }
+        unsafe { load_icon(hinst, RESOURCE_ALERT_ICON) }
     }
 
     /// Runs the tray thread's Win32 message loop until `WM_QUIT`, then tears down
@@ -1513,12 +1498,6 @@ mod platform {
             if !self.shared.icon_added.load(Ordering::SeqCst) {
                 return;
             }
-            // No alert icon at all (neither the resource nor a copy of the system
-            // warning icon): degrade to balloon only instead of painting the normal
-            // app icon as if it were an alert frame.
-            if self.alert_icon.is_none() {
-                return;
-            }
             // A user who turned client-area animations off must not get a blinking
             // icon; the balloon still carries the alert. The UI already filters
             // this via `tray_ui::alert_presentation`, so this is a second guard for
@@ -1583,11 +1562,12 @@ mod platform {
             }
             let lit = !self.flash_lit.load(Ordering::SeqCst);
             self.flash_lit.store(lit, Ordering::SeqCst);
-            let icon = match (lit, self.alert_icon) {
-                (true, Some(alert_icon)) => alert_icon,
-                _ => self.base_icon,
-            };
-            self.modify_icon(icon);
+            // Never swap to a system warning triangle; only switch if an explicit
+            // custom alert icon resource was embedded.
+            if let Some(alert_icon) = self.alert_icon {
+                let icon = if lit { alert_icon } else { self.base_icon };
+                self.modify_icon(icon);
+            }
         }
 
         fn modify_icon(&self, icon: HICON) {

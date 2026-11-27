@@ -121,6 +121,11 @@ pub fn label(key: &str) -> &'static str {
     t(Lang(ACTIVE.load(Ordering::Relaxed)), key)
 }
 
+/// Return the BCP-47 locale code (`"zh-CN"` or `"en-US"`) of the currently active desktop language.
+pub fn active_code() -> &'static str {
+    LOCALES[ACTIVE.load(Ordering::Relaxed)].code
+}
+
 pub fn message(key: &str, arguments: &[(&str, &str)]) -> String {
     static PLACEHOLDER: OnceLock<regex::Regex> = OnceLock::new();
     let pattern =

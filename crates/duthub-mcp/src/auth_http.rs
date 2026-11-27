@@ -425,7 +425,7 @@ fn auth_fail_detail(err: &AuthError) -> String {
 }
 
 /// Extract a bearer token from the authorization header only.
-fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     let value = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()

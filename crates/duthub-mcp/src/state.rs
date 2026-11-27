@@ -118,6 +118,15 @@ pub struct AdbDeviceDto {
     pub model: Option<String>,
 }
 
+/// Redacted flash tool preset summary safe to expose over MCP (never reveals host paths).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FlashPresetSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
 /// Result of an executed device command or flash utility probe.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProcessResultDto {
@@ -511,6 +520,22 @@ pub trait McpState: Send + Sync + 'static {
     }
     fn skill_export_for_listener(&self, _port: Option<u16>) -> Result<String, String> {
         self.skill_export()
+    }
+
+    /// Active display locale for localized MCP text (follows duthub's active UI language).
+    fn locale(&self) -> crate::i18n::McpLocale {
+        crate::i18n::McpLocale::ZhCn
+    }
+
+    /// Return a monotonic or startup-bound epoch identifier for the DUT's active serial session,
+    /// allowing Agents to detect restarts when `seq` resets to 0.
+    fn session_epoch(&self, _dut_id: &str) -> Option<u64> {
+        None
+    }
+
+    /// Return redacted summaries of host-configured flash presets (no host executable paths).
+    fn flash_presets(&self) -> Vec<FlashPresetSummaryDto> {
+        Vec::new()
     }
 
     /// Run the allowlisted read-only probe for the specified flash preset ID.

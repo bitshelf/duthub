@@ -357,6 +357,7 @@ impl Workbench {
         if let Some(tray) = self.tray.as_ref() {
             let _ = tray.show_main();
             let _ = tray.set_icon_visible(false);
+            tray.stop_taskbar_flash();
             tray.set_alert(false);
         }
         if let Some(main) = self.main_window {

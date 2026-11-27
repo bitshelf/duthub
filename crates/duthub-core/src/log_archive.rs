@@ -47,13 +47,15 @@ pub fn archive_prefix(dut_id: &str) -> String {
     format!("dut-{hex}-")
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
     pub id: String,
     pub bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime_unix_ms: Option<u64>,
 }
 
 fn numbered_suffix(suffix: &str) -> bool {
@@ -233,7 +235,13 @@ pub fn list(work_dir: &Path, dut_id: &str, offset: usize, limit: usize) -> Vec<S
         .take(limit)
         .filter_map(|(id, path)| {
             let file = open_segment(work_dir, dut_id, &id, &path).ok()?;
-            let bytes = file.metadata().ok()?.len();
+            let meta = file.metadata().ok()?;
+            let bytes = meta.len();
+            let mtime_unix_ms = meta.modified().ok().and_then(|ts| {
+                ts.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| u64::try_from(d.as_millis()).ok())
+            });
             let mut start = Vec::new();
             let label = BufReader::new(file.take(2048))
                 .read_until(b'\n', &mut start)
@@ -241,9 +249,62 @@ pub fn list(work_dir: &Path, dut_id: &str, offset: usize, limit: usize) -> Vec<S
                 .and_then(|_| std::str::from_utf8(&start).ok())
                 .and_then(|line| line.trim_end().strip_prefix("[mark] "))
                 .map(str::to_owned);
-            Some(Segment { id, bytes, label })
+            Some(Segment {
+                id,
+                bytes,
+                label,
+                mtime_unix_ms,
+            })
         })
         .collect()
+}
+
+/// Snapshot archived segments in chronological order (oldest -> newest) with fixed per-segment
+/// byte lengths captured at call time so growing active logs keep a deterministic export boundary.
+#[must_use]
+pub fn snapshot_segments(
+    work_dir: &Path,
+    dut_id: &str,
+    since_segment_id: Option<&str>,
+    tail_segments: Option<usize>,
+) -> Vec<Segment> {
+    let mut segments = list(work_dir, dut_id, 0, usize::MAX);
+    // `list()` returns newest first; reverse to chronological order for concatenation.
+    segments.reverse();
+    if let Some(since) = since_segment_id.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(pos) = segments.iter().position(|seg| seg.id == since)
+    {
+        segments.drain(..=pos);
+    }
+    if let Some(tail) = tail_segments {
+        let keep = tail.min(segments.len());
+        let drop_n = segments.len().saturating_sub(keep);
+        segments.drain(..drop_n);
+    }
+    segments
+}
+
+/// Read up to `max_bytes` from a verified owned log segment starting at offset 0.
+pub fn read_segment_bounded(
+    work_dir: &Path,
+    dut_id: &str,
+    segment_id: &str,
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let Some((_, path)) = segment_files(work_dir, dut_id)
+        .into_iter()
+        .find(|(id, _)| id == segment_id)
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "log segment not found",
+        ));
+    };
+    let file = open_segment(work_dir, dut_id, segment_id, &path)?;
+    let cap = usize::try_from(max_bytes.min(64 * 1024 * 1024)).unwrap_or(64 * 1024 * 1024);
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+    file.take(max_bytes).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 #[cfg(test)]

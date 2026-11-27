@@ -214,29 +214,38 @@ fn http_router_for_listener(
         .as_ref()
         .map_or_default(|ctx| ctx.auth.settings().allowed_hosts);
     let allowed_hosts = allowed_hosts_for_listener(bind_addr, endpoint, &configured_hosts);
-    let core = McpServerCore::new(state, access.clone())
+    let core = McpServerCore::new(state.clone(), access.clone())
         .with_listener_endpoint(endpoint)
-        .with_listener_dut_arc(listener_dut)
+        .with_listener_dut_arc(listener_dut.clone())
         .with_user_notifier(notifier);
     let service = StreamableHttpService::new(
         move || Ok(core.clone()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
-            .with_allowed_hosts(allowed_hosts)
+            .with_allowed_hosts(allowed_hosts.clone())
             .enforce_origin_validation()
             .with_json_response(true),
     );
-    let router = match access {
+    let mcp_router = match access.clone() {
         Some(ctx) => axum::Router::new().route_service(
             "/mcp",
-            crate::auth_http::AuthSvc::new((*ctx).clone(), service).on_listener(listener_id),
+            crate::auth_http::AuthSvc::new((*ctx).clone(), service)
+                .on_listener(listener_id.clone()),
         ),
         None => axum::Router::new().route(
             "/mcp",
             axum::routing::any(|| async { crate::auth_http::unauthorized_response() }),
         ),
-    };
-    router.layer(axum::middleware::from_fn(limit_mcp_request_body))
+    }
+    .layer(axum::middleware::from_fn(limit_mcp_request_body));
+    let transfer_state = crate::http_transfer::HttpTransferState::new(
+        state,
+        access,
+        listener_id,
+        listener_dut,
+        allowed_hosts,
+    );
+    crate::http_transfer::mount_transfer_routes(mcp_router, transfer_state)
 }
 
 /// Own a live HTTP listener.

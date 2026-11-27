@@ -243,8 +243,8 @@ async fn endpoint_without_a_notifier_hides_and_rejects_notify_user() {
     let names = tool_names(&tools);
     assert_eq!(
         names.len(),
-        10,
-        "no notifier keeps the 10-tool read-only surface: {names:?}"
+        11,
+        "no notifier keeps the 11-tool read-only surface: {names:?}"
     );
     assert!(!names.iter().any(|name| name == NOTIFY), "{names:?}");
     assert!(!names.iter().any(|name| name == "dut_control"), "{names:?}");
@@ -283,7 +283,7 @@ async fn dut_bound_endpoint_lists_fourteen_tools_and_queues_a_notice() {
 
     let tools = client.list_all_tools().await.expect("tools/list");
     let names = tool_names(&tools);
-    assert_eq!(names.len(), 15, "{names:?}");
+    assert_eq!(names.len(), 16, "{names:?}");
     assert!(names.iter().any(|name| name == NOTIFY), "{names:?}");
     assert!(names.iter().any(|name| name == "dut_control"), "{names:?}");
     assert!(names.iter().any(|name| name == "serial_exec"), "{names:?}");

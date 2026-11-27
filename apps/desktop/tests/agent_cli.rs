@@ -1,7 +1,7 @@
 //! W2c: CLI profile (`claude-code`) integration tests.
 //!
-//! The deterministic process contract is exercised through `.cmd` fixtures
-//! that emit the same `stream-json` event shapes. A real Claude Code 2.1.204
+//! The deterministic process contract is exercised through fixtures that emit
+//! the same `stream-json` event shapes. A real Claude Code 2.1.204
 //! is discovered from `DUTHUB_CLAUDE_EXE`, PATH (`claude.exe`), or the native
 //! per-user install. The non-ignored
 //! `cli_real_claude_expands_mcp_token_from_env` uses it for a health check
@@ -10,6 +10,9 @@
 //! `DUTHUB_CLAUDE_LIVE=1`.
 
 #![cfg(windows)]
+
+#[path = "support/agent_fixture.rs"]
+mod agent_fixture;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -103,21 +106,6 @@ echo {"type":"system","subtype":"init","session_id":"sess-cli-1","model":"fixtur
 echo {"type":"assistant","session_id":"sess-cli-1","message":{"role":"assistant","content":[{"type":"text","text":"fixture says hello"}]}}
 echo {"type":"result","subtype":"success","is_error":false,"session_id":"sess-cli-1","result":"done"}
 exit /b 0
-"#;
-
-const SLOW_FIXTURE: &str = r#"@echo off
-setlocal
-echo {"type":"system","subtype":"init","session_id":"sess-cli-slow"}
-start "" /b cmd /c "%~dp0heartbeat.cmd"
-ping -n 60 127.0.0.1 >nul
-exit /b 0
-"#;
-
-const HEARTBEAT_FIXTURE: &str = r#"@echo off
-:loop
-echo beat>> "%CD%\heartbeat.log"
-ping -n 1 -w 200 127.0.0.1 >nul
-goto loop
 "#;
 
 // Mirrors the real Claude Code 2.1.204 stream shapes: init `tools[]` +
@@ -414,15 +402,14 @@ fn cli_mcp_config_uses_env_token_not_literal() {
 #[test]
 fn cli_stop_kills_process_tree() {
     let work = temp_dir("kill");
-    let fixture = write_fixture(&work, "claude-slow.cmd", SLOW_FIXTURE);
-    write_fixture(&work, "heartbeat.cmd", HEARTBEAT_FIXTURE);
+    let fixture = agent_fixture::executable();
     let mut host = HostManager::new(
         work.clone(),
         Arc::new(SnapshotState::empty()),
         access_context(),
         None,
     );
-    host.start_entry("dut-cli", BindingSource::None, cli_agent(&fixture))
+    host.start_entry("dut-cli", BindingSource::None, cli_agent(fixture))
         .unwrap();
     assert!(wait_ready(&mut host, "dut-cli"));
     host.prompt("dut-cli", "hold the tree").unwrap();
@@ -433,7 +420,10 @@ fn cli_stop_kills_process_tree() {
         wait_until(Duration::from_secs(20), || {
             std::fs::metadata(&heartbeat).is_ok_and(|metadata| metadata.len() > 0)
         }),
-        "grandchild heartbeat did not start (fixture did not run)"
+        "grandchild heartbeat did not start: status={:?}, stderr={}",
+        host.view("dut-cli").map(|view| view.status()),
+        host.view("dut-cli")
+            .map_or_default(|view| view.stderr_tail())
     );
 
     host.stop("dut-cli");

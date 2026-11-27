@@ -77,7 +77,7 @@ fn plan_tool_names_have_a_single_source_of_truth() {
         duthub_desktop::agent_host::cli::PLAN_TOOLS,
         duthub_mcp::PLAN_TOOL_NAMES
     );
-    assert_eq!(duthub_mcp::PLAN_TOOL_NAMES.len(), 10);
+    assert_eq!(duthub_mcp::PLAN_TOOL_NAMES.len(), 11);
     assert!(!duthub_mcp::PLAN_TOOL_NAMES.contains(&"notify_user"));
     assert!(!duthub_mcp::PLAN_TOOL_NAMES.contains(&"dut_control"));
     assert!(!duthub_mcp::PLAN_TOOL_NAMES.contains(&"serial_exec"));

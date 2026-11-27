@@ -43,12 +43,21 @@ pub fn skill_for_listener(port: Option<u16>) -> String {
     skill_for_endpoint(endpoint)
 }
 
-/// Generate a skill using the listener's actual advertised endpoint.
+/// Generate a skill using the listener's actual advertised endpoint (default `zh-CN` fallback).
 #[must_use]
 pub fn skill_for_endpoint(endpoint: Option<SocketAddr>) -> String {
+    skill_for_endpoint_localized(endpoint, crate::i18n::McpLocale::ZhCn)
+}
+
+/// Generate a skill using the listener's actual advertised endpoint and active duthub locale.
+#[must_use]
+pub fn skill_for_endpoint_localized(
+    endpoint: Option<SocketAddr>,
+    locale: crate::i18n::McpLocale,
+) -> String {
     match endpoint {
         Some(endpoint) => generate_for_endpoint(&format!("http://{endpoint}/mcp")),
-        None => generate_for_endpoint("未提供已绑定的 HTTP 地址，请向管理员确认。"),
+        None => generate_for_endpoint(crate::i18n::skill_unbound_endpoint(locale)),
     }
 }
 
@@ -79,8 +88,17 @@ pub fn export_skill_in(work_dir: &Path) -> std::io::Result<PathBuf> {
 
 /// Write separate copies for different HTTP listeners so one cannot overwrite another's endpoint.
 pub fn export_skill_for_listener(work_dir: &Path, port: Option<u16>) -> std::io::Result<PathBuf> {
+    export_skill_for_listener_localized(work_dir, port, crate::i18n::McpLocale::ZhCn)
+}
+
+/// Write separate copies for different HTTP listeners using the active duthub locale.
+pub fn export_skill_for_listener_localized(
+    work_dir: &Path,
+    port: Option<u16>,
+    locale: crate::i18n::McpLocale,
+) -> std::io::Result<PathBuf> {
     let endpoint = port.map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-    export_skill_for_endpoint(work_dir, endpoint)
+    export_skill_for_endpoint_localized(work_dir, endpoint, locale)
 }
 
 /// Export for a specific advertised address and identify the export by its listener port.
@@ -88,12 +106,21 @@ pub fn export_skill_for_endpoint(
     work_dir: &Path,
     endpoint: Option<SocketAddr>,
 ) -> std::io::Result<PathBuf> {
+    export_skill_for_endpoint_localized(work_dir, endpoint, crate::i18n::McpLocale::ZhCn)
+}
+
+/// Export for a specific advertised address using the active duthub locale.
+pub fn export_skill_for_endpoint_localized(
+    work_dir: &Path,
+    endpoint: Option<SocketAddr>,
+    locale: crate::i18n::McpLocale,
+) -> std::io::Result<PathBuf> {
     let mut dir = work_dir.join("skill");
     if let Some(endpoint) = endpoint {
         dir.push(format!("http-{}", endpoint.port()));
     }
     let dir = dir.join(SKILL_NAME);
-    write_skill_bundle(&dir, &skill_for_endpoint(endpoint))
+    write_skill_bundle(&dir, &skill_for_endpoint_localized(endpoint, locale))
 }
 
 #[cfg(test)]

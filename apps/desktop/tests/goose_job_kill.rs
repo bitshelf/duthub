@@ -7,6 +7,9 @@
 
 #![cfg(windows)]
 
+#[path = "support/agent_fixture.rs"]
+mod agent_fixture;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -20,37 +23,6 @@ fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("duthub-job-kill-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
-}
-
-fn cmd_exe() -> PathBuf {
-    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
-        .join("System32")
-        .join("cmd.exe")
-}
-
-/// Parent `cmd.exe` spawns a grandchild `cmd.exe` that continuously appends to
-/// `marker.txt`, proving both parent and descendant are alive before teardown
-/// and both cease immediately after `kill()` or `Drop`.
-fn write_tree_scripts(work: &Path) -> (PathBuf, PathBuf) {
-    let marker = work.join("grandchild-marker.txt");
-    let child = work.join("grandchild-loop.cmd");
-    std::fs::write(
-        &child,
-        "@echo off\r\n\
-         :loop\r\n\
-         echo tick>>grandchild-marker.txt\r\n\
-         for /L %%i in (1,1,4000) do @rem\r\n\
-         goto loop\r\n",
-    )
-    .unwrap();
-    let parent = work.join("spawn-tree.cmd");
-    std::fs::write(
-        &parent,
-        "@echo off\r\n\
-         cmd.exe /D /Q /C grandchild-loop.cmd\r\n",
-    )
-    .unwrap();
-    (parent, marker)
 }
 
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -85,15 +57,10 @@ fn process_alive(pid: u32) -> bool {
 #[test]
 fn acp_kill_terminates_job_process_tree() {
     let work = temp_dir("acp-kill");
-    let (script, marker) = write_tree_scripts(&work);
+    let marker = work.join("grandchild-marker.txt");
     let acp = AcpClient::spawn(
-        &cmd_exe(),
-        &[
-            "/D".into(),
-            "/Q".into(),
-            "/C".into(),
-            script.to_string_lossy().into_owned(),
-        ],
+        agent_fixture::executable(),
+        &["tree".into(), marker.to_string_lossy().into_owned()],
         &work,
         &[],
         64 * 1024,
@@ -106,8 +73,9 @@ fn acp_kill_terminates_job_process_tree() {
 
     assert!(
         wait_until(Duration::from_secs(15), || file_len(&marker) > 0),
-        "grandchild never wrote marker: {}",
-        marker.display()
+        "grandchild never wrote marker {}: {}",
+        marker.display(),
+        acp.stderr_tail()
     );
     let root = acp.pid();
 
@@ -131,15 +99,10 @@ fn acp_kill_terminates_job_process_tree() {
 #[test]
 fn dropping_acp_client_kills_job_tree() {
     let work = temp_dir("drop");
-    let (script, marker) = write_tree_scripts(&work);
+    let marker = work.join("grandchild-marker.txt");
     let acp = AcpClient::spawn(
-        &cmd_exe(),
-        &[
-            "/D".into(),
-            "/Q".into(),
-            "/C".into(),
-            script.to_string_lossy().into_owned(),
-        ],
+        agent_fixture::executable(),
+        &["tree".into(), marker.to_string_lossy().into_owned()],
         &work,
         &[],
         64 * 1024,
@@ -152,8 +115,9 @@ fn dropping_acp_client_kills_job_tree() {
 
     assert!(
         wait_until(Duration::from_secs(15), || file_len(&marker) > 0),
-        "grandchild never wrote marker: {}",
-        marker.display()
+        "grandchild never wrote marker {}: {}",
+        marker.display(),
+        acp.stderr_tail()
     );
     let root = acp.pid();
 

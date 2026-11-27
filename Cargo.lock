@@ -1787,7 +1787,9 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "duthub-core",
+ "flate2",
  "http",
+ "http-body-util",
  "regex",
  "reqwest",
  "rmcp",
@@ -1800,6 +1802,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tower-service",
+ "uuid",
 ]
 
 [[package]]

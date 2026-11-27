@@ -23,8 +23,8 @@ use duthub_mcp::notify::{
 };
 use duthub_mcp::state::{
     AdbDeviceDto, ApprovalErr, ApprovalIssueResult, ControlStatusDto, DutInfo, DutSummary,
-    HeartbeatUpdate, HeartbeatViewDto, LeaseGrantDto, LogLineDto, LogReadResult, McpState,
-    ProcessResultDto,
+    FlashPresetSummaryDto, HeartbeatUpdate, HeartbeatViewDto, LeaseGrantDto, LogLineDto,
+    LogReadResult, McpState, ProcessResultDto,
 };
 use duthub_mcp::transport::ListenerHandle;
 
@@ -161,6 +161,8 @@ pub struct RuntimeMcpState {
     tools_config: Arc<Mutex<RuntimeToolsConfig>>,
     /// Host-side `notify_user` rate limiting (per credential + global).
     notify_limiter: NotifyRateLimiter,
+    /// Process startup timestamp used as the live serial `sessionEpoch` so Agents detect restarts.
+    process_epoch_ms: u64,
 }
 
 impl RuntimeMcpState {
@@ -194,6 +196,7 @@ impl RuntimeMcpState {
             access,
             tools_config,
             notify_limiter: NotifyRateLimiter::new(),
+            process_epoch_ms: duthub_core::util::unix_ms(),
         }
     }
 
@@ -885,9 +888,44 @@ impl McpState for RuntimeMcpState {
 
     /// Export the skill under the work directory using the same generator as the settings button.
     fn skill_export_for_listener(&self, port: Option<u16>) -> Result<String, String> {
-        duthub_mcp::skill::export_skill_for_listener(&self.work_dir, port)
+        duthub_mcp::skill::export_skill_for_listener_localized(&self.work_dir, port, self.locale())
             .map(|path| path.display().to_string())
             .map_err(|e| e.to_string())
+    }
+
+    fn locale(&self) -> duthub_mcp::i18n::McpLocale {
+        duthub_mcp::i18n::McpLocale::from_setting(crate::i18n::active_code())
+    }
+
+    fn session_epoch(&self, dut_id: &str) -> Option<u64> {
+        self.device
+            .session_source(dut_id)
+            .map(|_| self.process_epoch_ms)
+    }
+
+    fn flash_presets(&self) -> Vec<FlashPresetSummaryDto> {
+        let cfg = self
+            .tools_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let default_id = cfg
+            .flash_tools
+            .iter()
+            .find(|p| {
+                p.executable.to_ascii_lowercase().contains("upgrade_tool")
+                    || p.name.to_ascii_lowercase().contains("upgrade_tool")
+            })
+            .or_else(|| cfg.flash_tools.first())
+            .map(|p| p.id.as_str());
+        cfg.flash_tools
+            .iter()
+            .filter(|p| !p.executable.trim().is_empty())
+            .map(|p| FlashPresetSummaryDto {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                is_default: default_id == Some(p.id.as_str()),
+            })
+            .collect()
     }
 
     fn flash_test(&self, _preset_id: &str) -> Result<ProcessResultDto, String> {

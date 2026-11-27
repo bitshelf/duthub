@@ -1941,9 +1941,11 @@ impl Workbench {
     /// Directory>/skill/duthub/SKILL.md`. This process uses the same generator as the MCP tool
     /// `skill_export`, namely `duthub_mcp::skill`.
     pub fn export_skill_md(&mut self) {
-        match duthub_mcp::skill::export_skill_for_endpoint(
+        let locale = duthub_mcp::i18n::McpLocale::from_setting(i18n::active_code());
+        match duthub_mcp::skill::export_skill_for_endpoint_localized(
             &self.work_dir,
             self.mcp_bound_endpoint.get().copied(),
+            locale,
         ) {
             Ok(path) => self.notify_toast(i18n::message(
                 "exportedTo",

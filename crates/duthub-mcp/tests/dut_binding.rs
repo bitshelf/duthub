@@ -371,6 +371,7 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
         ("dut_status", json!({"dutId": "dut-b"})),
         ("serial_read", json!({"dutId": "dut-b"})),
         ("log_segments", json!({"dutId": "dut-b"})),
+        ("log_export", json!({"dutId": "dut-b"})),
         (
             "log_segment_read",
             json!({"dutId": "dut-b", "segmentId": "anything"}),

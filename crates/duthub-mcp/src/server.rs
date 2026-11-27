@@ -281,6 +281,25 @@ pub struct LogSegmentReadArgs {
     pub offset: u64,
 }
 
+/// Arguments of `log_export`: snapshot-bounded bulk export of archived serial log segments.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LogExportArgs {
+    pub dut_id: String,
+    /// Optional exclusive lower bound: export segments newer than this segment ID.
+    #[serde(default)]
+    pub since_segment_id: Option<String>,
+    /// Optional limit keeping only the newest `tailSegments` segments.
+    #[serde(default)]
+    pub tail_segments: Option<usize>,
+    /// Strip ANSI escape codes from exported log text (default `true`).
+    #[serde(default)]
+    pub strip_ansi: Option<bool>,
+    /// Include merged plain text inline when the exported payload is <= 256 KiB (default `true` for small exports).
+    #[serde(default)]
+    pub inline: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct DutFilesArgs {
@@ -1651,11 +1670,51 @@ impl McpServerCore {
             .heartbeat_get(&args.dut_id)
             .ok()
             .and_then(|hb| serde_json::to_value(hb).ok());
+        let can_action = |action: DutAction| -> bool {
+            self.authorize(&principal.0, &args.dut_id, action).is_ok()
+        };
+        let can_flash = can_action(DutAction::Flash);
+        let capabilities = serde_json::json!({
+            "read": can_action(DutAction::Read),
+            "serialWrite": can_action(DutAction::SerialWrite),
+            "adb": can_action(DutAction::Adb),
+            "relay": can_action(DutAction::Relay),
+            "power": can_action(DutAction::Power),
+            "reset": can_action(DutAction::Reset),
+            "flash": can_flash,
+            "capture": can_action(DutAction::Capture),
+            "upload": can_flash,
+        });
+        let flash_presets = self.state.flash_presets();
+        let base_url = self.listener_endpoint.map_or_else(
+            || "http://127.0.0.1:8797".into(),
+            |ep| format!("http://{ep}"),
+        );
+        let dut_id_ref = &args.dut_id;
+        let transfer = serde_json::json!({
+            "protocols": ["http-put-stream", "tus-1.0.0"],
+            "putUrlTemplate": format!("{base_url}/dut/{dut_id_ref}/image/<filename>"),
+            "tusEndpoint": format!("{base_url}/dut/{dut_id_ref}/transfer"),
+            "allowedExtensions": [".img", ".bin", ".iso"],
+            "maxBytes": crate::http_transfer::MAX_IMAGE_UPLOAD_BYTES,
+            "canUpload": can_flash,
+            "clients": ["curl", "ztus"],
+        });
+        let logs_export = serde_json::json!({
+            "tool": "log_export",
+            "downloadUrl": format!("{base_url}/dut/{dut_id_ref}/logs/export"),
+            "gzipDownloadUrl": format!("{base_url}/dut/{dut_id_ref}/logs/export?format=gzip"),
+        });
         let mut payload = serde_json::to_value(&info).unwrap_or(serde_json::Value::Null);
         payload["dutState"] = serde_json::json!(dut_state);
         payload["nextActionHint"] = serde_json::json!(next_action_hint);
         payload["session_id"] = serde_json::json!(session_id);
         payload["session_open"] = serde_json::json!(session_id.is_some());
+        payload["sessionEpoch"] = serde_json::json!(self.state.session_epoch(&args.dut_id));
+        payload["capabilities"] = capabilities;
+        payload["flashPresets"] = serde_json::json!(flash_presets);
+        payload["transfer"] = transfer;
+        payload["logsExport"] = logs_export;
         payload["relayChannelStates"] =
             channel_states.map_or(serde_json::Value::Null, serde_json::Value::Array);
         payload["bootModes"] = serde_json::json!({
@@ -1736,6 +1795,7 @@ impl McpServerCore {
             return Ok(Json(serde_json::json!({
                 "dut_id": args.dut_id,
                 "session_id": probe.session_id,
+                "sessionEpoch": self.state.session_epoch(&args.dut_id),
                 "last_seq": latest_seq,
                 "mode": "screen",
                 "screen": screen,
@@ -1801,6 +1861,7 @@ impl McpServerCore {
             let mut payload = serde_json::json!({
                 "dut_id": args.dut_id,
                 "session_id": session_id,
+                "sessionEpoch": self.state.session_epoch(&args.dut_id),
                 "last_seq": cursor,
                 "lines": collected,
                 "cursorReset": cursor < args.since_seq,
@@ -1827,6 +1888,8 @@ impl McpServerCore {
                     clean_log_lines(&mut result.lines);
                     let mut payload =
                         serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+                    payload["sessionEpoch"] =
+                        serde_json::json!(self.state.session_epoch(&args.dut_id));
                     payload["cursorReset"] = serde_json::json!(false);
                     Ok(Json(payload))
                 }
@@ -1842,6 +1905,7 @@ impl McpServerCore {
             Some(mut result) => {
                 clean_log_lines(&mut result.lines);
                 let mut payload = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+                payload["sessionEpoch"] = serde_json::json!(self.state.session_epoch(&args.dut_id));
                 payload["cursorReset"] = serde_json::json!(result.last_seq < args.since_seq);
                 Ok(Json(payload))
             }
@@ -1914,6 +1978,92 @@ impl McpServerCore {
     }
 
     #[tool(
+        name = "log_export",
+        description = "一次性导出 DUT 全部或指定范围的归档串口日志快照（固定各段快照边界、默认剥离 ANSI 高亮、返回 SHA-256 与 HTTP 单次下载链接，免去逐段分页 RPC）。小日志（<=256 KiB）直接内联返回，大日志通过 downloadUrl / gzipDownloadUrl 一步拉取。"
+    )]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "required by rmcp #[tool] extractor signature"
+    )]
+    fn log_export(
+        &self,
+        Parameters(args): Parameters<LogExportArgs>,
+        principal: CurrentPrincipal,
+    ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
+        const MAX_INLINE_BYTES: usize = 256 * 1024;
+
+        self.authorize_scoped_read(&principal.0, &args.dut_id)?;
+        let dir = self
+            .state
+            .log_archive_dir()
+            .ok_or_else(|| state_err("Log archive unavailable"))?;
+        let strip_ansi = args.strip_ansi.unwrap_or(true);
+        let bundle = crate::http_transfer::build_snapshot_log_export(
+            &dir,
+            &args.dut_id,
+            args.since_segment_id.as_deref(),
+            args.tail_segments,
+            strip_ansi,
+            false,
+        )
+        .map_err(|err| state_err(&err.to_string()))?;
+        let base_url = self.listener_endpoint.map_or_else(
+            || "http://127.0.0.1:8797".into(),
+            |ep| format!("http://{ep}"),
+        );
+        let mut query_parts = Vec::new();
+        if let Some(since) = args
+            .since_segment_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query_parts.push(format!("sinceSegmentId={since}"));
+        }
+        if let Some(tail) = args.tail_segments {
+            query_parts.push(format!("tailSegments={tail}"));
+        }
+        if !strip_ansi {
+            query_parts.push("stripAnsi=false".into());
+        }
+        let query_suffix = if query_parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query_parts.join("&"))
+        };
+        let gzip_suffix = if query_parts.is_empty() {
+            "?format=gzip".to_owned()
+        } else {
+            format!("?{}&format=gzip", query_parts.join("&"))
+        };
+        let download_url = format!("{base_url}/dut/{}/logs/export{query_suffix}", args.dut_id);
+        let gzip_url = format!("{base_url}/dut/{}/logs/export{gzip_suffix}", args.dut_id);
+        let export_bytes = bundle.payload.len();
+        let include_inline = args.inline.unwrap_or(export_bytes <= MAX_INLINE_BYTES)
+            && export_bytes <= MAX_INLINE_BYTES;
+        let mut payload = serde_json::json!({
+            "ok": true,
+            "dutId": args.dut_id,
+            "segmentCount": bundle.segment_count,
+            "totalRawBytes": bundle.total_raw_bytes,
+            "exportBytes": export_bytes,
+            "sha256": bundle.sha256,
+            "stripAnsi": strip_ansi,
+            "snapshotAtUnixMs": duthub_core::util::unix_ms(),
+            "downloadUrl": download_url,
+            "gzipDownloadUrl": gzip_url,
+        });
+        if include_inline {
+            payload["inlineText"] = serde_json::json!(String::from_utf8_lossy(&bundle.payload));
+        } else {
+            payload["nextActionHint"] = serde_json::json!(
+                "Export exceeds 256 KiB inline limit; fetch downloadUrl or gzipDownloadUrl in one HTTP GET with Authorization: Bearer <TOKEN> (bypassing HTTP proxy via NO_PROXY)."
+            );
+        }
+        Ok(Json(payload))
+    }
+
+    #[tool(
         description = "读取工作目录内各 DUT 的资料目录。省略 dutId 时列出 DUT（DUT 专用端点默认到绑定 DUT），指定 dutId 时分页列出该目录内的普通文件，支持按 category（image/TEST/压力&老化/串口日志/misc/feedback）过滤。"
     )]
     #[expect(
@@ -1965,7 +2115,16 @@ impl McpServerCore {
                 };
             if let Some(ref cat) = category_filter {
                 let prefix = format!("{cat}/");
-                files.retain(|file| file.id.starts_with(&prefix));
+                if cat == duthub_core::dut_artifacts::IMAGE_DIR {
+                    files.retain(|file| {
+                        file.id.starts_with(&prefix)
+                            || file.id.starts_with("images/data/")
+                            || (!file.id.contains('/')
+                                && duthub_core::dut_artifacts::is_allowed_image_extension(&file.id))
+                    });
+                } else {
+                    files.retain(|file| file.id.starts_with(&prefix));
+                }
             }
             let next =
                 (files.len() > args.offset.saturating_add(limit)).then(|| args.offset + limit);
@@ -1974,11 +2133,22 @@ impl McpServerCore {
                 .skip(args.offset)
                 .take(limit)
                 .map(|file| {
-                    let top_category = file.id.split_once('/').and_then(|(top, _)| {
-                        duthub_core::dut_artifacts::DUT_CATEGORY_DIRS
-                            .contains(&top)
-                            .then_some(top)
-                    });
+                    let top_category = file
+                        .id
+                        .split_once('/')
+                        .and_then(|(top, _)| {
+                            if top == "images" {
+                                Some(duthub_core::dut_artifacts::IMAGE_DIR)
+                            } else {
+                                duthub_core::dut_artifacts::DUT_CATEGORY_DIRS
+                                    .contains(&top)
+                                    .then_some(top)
+                            }
+                        })
+                        .or_else(|| {
+                            duthub_core::dut_artifacts::is_allowed_image_extension(&file.id)
+                                .then_some(duthub_core::dut_artifacts::IMAGE_DIR)
+                        });
                     let mut val = serde_json::to_value(&file).unwrap_or(serde_json::Value::Null);
                     val["resourceUri"] =
                         serde_json::json!(format!("duthub://dut/{dut_id}/files/{}", file.id));
@@ -2659,16 +2829,37 @@ impl McpServerCore {
 
         // HTTP credentials without grants cannot export the skill. Stdio local access still works.
         self.authorize_any_read(&principal.0)?;
-        let mut markdown = crate::skill::skill_for_endpoint(self.listener_endpoint);
+        let locale = self.state.locale();
+        let mut markdown =
+            crate::skill::skill_for_endpoint_localized(self.listener_endpoint, locale);
         if let Some(bound) = self.listener_dut.as_deref() {
-            let _ = writeln!(
-                markdown,
-                "\n> 本端点仅可读 DUT `{bound}`；跨 DUT 请求返回 `LeaseRequired/UNAUTHORIZED`，且不开放写工具。"
-            );
+            let all_actions = [
+                DutAction::Read,
+                DutAction::SerialWrite,
+                DutAction::Adb,
+                DutAction::Relay,
+                DutAction::Power,
+                DutAction::Reset,
+                DutAction::Flash,
+                DutAction::Capture,
+            ];
+            let granted: Vec<&'static str> = all_actions
+                .into_iter()
+                .filter(|action| self.authorize(&principal.0, bound, *action).is_ok())
+                .map(DutAction::as_str)
+                .collect();
+            let note = if granted.len() == 1 && granted[0] == "read" {
+                crate::i18n::skill_bound_dut_readonly(locale, bound)
+            } else {
+                crate::i18n::skill_bound_dut_grants(locale, bound, &granted)
+            };
+            let _ = writeln!(markdown, "{note}");
         }
-        Ok(Json(
-            serde_json::json!({ "ok": true, "markdown": markdown }),
-        ))
+        Ok(Json(serde_json::json!({
+            "ok": true,
+            "locale": locale.code(),
+            "markdown": markdown
+        })))
     }
 
     /// Raise a notice in the duthub UI. This is not a device action: it needs
@@ -2744,7 +2935,7 @@ impl McpServerCore {
 
     #[tool(
         name = "agent_feedback",
-        description = "记录 Agent 使用反馈到 feedback 目录，便于后续优化 duthub 工具与流程（仅用户配置监听器开放，参数 camelCase）。category 取 bug | usability | missing_feature | performance | doc | other；severity 取 low | medium | high（默认 medium）；title 1–120 字符；detail 1–8192 字符。"
+        description = "记录 Agent 使用反馈到 feedback 目录（仅用户配置监听器开放，参数 camelCase）。提交前先调用 dut_files(category=\"feedback\") 检查避免重复刷屏；一件事一条。category 取 bug | usability | missing_feature | performance | doc | other；severity 取 low | medium | high；title 1–120 字符；detail 1–8192 字符，建议按四段编写：①目标与前置状态(dutState/capabilities)、②实测调用与原始错误码、③阻塞影响、④最小可行建议（严禁包含 Token 或宿主机敏感路径）。"
     )]
     #[expect(
         clippy::needless_pass_by_value,
@@ -3221,13 +3412,67 @@ impl McpServerCore {
                 }
                 "flash_update" => {
                     let Some(fid) = file_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
-                        return Err("fileId (plain .img/.bin filename inside the DUT directory) is required for action=flash_update".into());
+                        return Err("INVALID_FILE_ID: fileId is required for action=flash_update. Call dut_files(category=\"image\") and pass e.g. \"image/update.img\" or \"update.img\".".into());
                     };
-                    // Reject obvious traversal before entering Protected state so an
-                    // invalid path can never push the DUT into NeedsInspection.
-                    if fid.contains('/') || fid.contains('\\') || fid.contains("..") {
-                        return Err("fileId must be a plain filename inside the DUT directory".into());
+                    // Allow either a plain filename (`update.img`) or canonical `image/<filename>`.
+                    // Reject traversal, backslashes, other subdirectories, or non-image extensions
+                    // before entering Protected state so bad inputs never trigger NeedsInspection.
+                    let valid_image_ref = if let Some((subdir, base)) = fid.split_once('/') {
+                        subdir == duthub_core::dut_artifacts::IMAGE_DIR
+                            && !base.contains('/')
+                            && duthub_core::dut_artifacts::validate_image_filename(base).is_ok()
+                    } else {
+                        duthub_core::dut_artifacts::validate_image_filename(fid).is_ok()
+                    };
+                    if fid.contains('\\') || fid.contains("..") || !valid_image_ref {
+                        return Err(format!(
+                            "INVALID_FILE_ID: '{fid}' is not a valid DUT image fileId. Pass a plain filename or 'image/<name>' ending with .img/.bin/.iso from dut_files(category=\"image\")."
+                        ));
                     }
+                    // Pre-check image presence before entering Protected state so missing files
+                    // return actionable guidance and available images without locking the DUT.
+                    if let (Some(root), Some(dut)) =
+                        (state.dut_artifact_root(), state.dut_info(&dut_id))
+                        && duthub_core::dut_artifacts::resolve_owned_file(
+                            &root, &dut.dut_id, &dut.name, fid,
+                        )
+                        .is_err()
+                    {
+                        let available: Vec<String> = duthub_core::dut_artifacts::list_files(
+                            &root, &dut.dut_id, &dut.name,
+                        )
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|f| {
+                            f.id.starts_with("image/")
+                                || f.id.starts_with("images/data/")
+                                || (!f.id.contains('/')
+                                    && duthub_core::dut_artifacts::is_allowed_image_extension(&f.id))
+                        })
+                        .map(|f| f.id)
+                        .collect();
+                        let list_hint = if available.is_empty() {
+                            "no images currently staged; upload one via PUT /dut/<dutId>/image/<filename> (curl -T) or tus 1.0.0 /dut/<dutId>/transfer (ztus)".to_owned()
+                        } else {
+                            format!("available images: [{}]", available.join(", "))
+                        };
+                        return Err(format!(
+                            "IMAGE_NOT_FOUND: '{fid}' does not exist in DUT folder ({list_hint})."
+                        ));
+                    }
+                    let presets = state.flash_presets();
+                    let resolved_preset = preset_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            presets
+                                .iter()
+                                .find(|p| p.is_default)
+                                .or_else(|| presets.first())
+                                .map(|p| p.id.clone())
+                        });
                     let protected = access
                         .as_ref()
                         .and_then(|ctx| ctx.lease.enter_protected(&dut_id, &format!("flash_update {fid}")).ok())
@@ -3240,22 +3485,30 @@ impl McpServerCore {
                                 msg.contains("file fence rejected")
                                     || msg.contains("not found")
                                     || msg.contains("must have .img or .bin")
+                                    || msg.contains("IMAGE_NOT_FOUND")
                             }
                         };
                         let _ = ctx.lease.exit_protected(&dut_id, safe_exit);
                     }
                     let out = outcome?;
+                    let ok = out.exit_code == Some(0);
                     Ok(serde_json::json!({
-                        "ok": out.exit_code == Some(0),
+                        "ok": ok,
                         "dutId": dut_id,
                         "action": action,
                         "fileId": fid,
+                        "presetId": resolved_preset,
                         "exitCode": out.exit_code,
                         "elapsedMs": out.elapsed_ms,
                         "stdout": out.stdout,
                         "stderr": out.stderr,
                         "waitedMs": waited_ms,
                         "leaseReleasedAfterProtected": protected && had_explicit_lease,
+                        "nextActionHint": if ok {
+                            "Call dut_control(action=\"flash_reboot\") to boot the flashed image, verify startup via serial_read / adb_exec, then release_lease."
+                        } else {
+                            "Inspect stdout/stderr and dut_control(action=\"flash_list\") before retrying; do not leave the DUT in Loader unattended."
+                        },
                     }))
                 }
                 "flash_reboot" => {
@@ -3846,13 +4099,14 @@ fn notify_response(outcome: NotifyOutcome) -> serde_json::Value {
     payload
 }
 
-/// The 10 read-only Plan tools exposed by every authenticated duthub MCP listener.
+/// The 11 read-only Plan tools exposed by every authenticated duthub MCP listener.
 pub const PLAN_TOOL_NAMES: &[&str] = &[
     "dut_list",
     "dut_status",
     "serial_read",
     "log_segments",
     "log_segment_read",
+    "log_export",
     "dut_files",
     "dut_file_read",
     "media_streams",
@@ -4431,19 +4685,22 @@ impl ServerHandler for McpServerCore {
             .unwrap_or("loader");
         let (description, text) = match request.name.as_str() {
             "enter_flash_mode" => (
-                "One-shot workflow for putting a DUT into flash mode (Loader or MaskROM)",
+                "Complete 8-step safe workflow for uploading, flashing, and verifying a DUT image",
                 format!(
-                    "Follow this exact sequence (all JSON keys are camelCase):\n\
-1. Call `dut_list` if `dutId` is unknown, then call `dut_status` with `{{\"dutId\":\"{dut}\"}}`.\n\
-2. Check `relay.channels`, `adbSerial`, and `bootModes`:\n\
-   - If target is `maskrom` and `bootModes.canEnterMaskrom == true`: call `dut_control` with `{{\"dutId\":\"{dut}\",\"action\":\"enter_maskrom\"}}`.\n\
-   - If target is `loader` and `bootModes.canEnterLoaderByHardware == true`: call `dut_control` with `{{\"dutId\":\"{dut}\",\"action\":\"enter_loader\"}}`.\n\
-   - If Android/ADB is online (`adbSerial` present): call `adb_exec` with `{{\"dutId\":\"{dut}\",\"op\":\"reboot_loader\"}}`.\n\
-   - If only `reset` is wired (common on RK3576/embedded boards): call `serial_exec` ONCE with `{{\"dutId\":\"{dut}\",\"triggerReset\":true,\"waitFor\":\"Hit any key\",\"send\":\"\\r\",\"thenSend\":\"rockusb 0 mmc 0\\r\",\"expect\":\"rockusb\",\"markLabel\":\"enter-{mode}\",\"timeoutMs\":15000}}`, or if already in Linux shell call `serial_exec` with `{{\"dutId\":\"{dut}\",\"text\":\"reboot loader\\r\",\"markLabel\":\"enter-{mode}\"}}`.\n\
-3. Confirm Loader/MaskROM detection with `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"flash_list\"}}` (`inLoader == true` or `inMaskrom == true`).\n\
-4. Flash an image staged inside the DUT folder via `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"flash_update\",\"fileId\":\"<image.img>\"}}` (check `dut_files` first; never pass host paths).\n\
-5. Verify boot logs via `serial_read` (`{{\"dutId\":\"{dut}\",\"tail\":80}}`) or resource `duthub://dut/{dut}/serial/tail`.\n\
-Never attempt to access files outside duthub's directory or execute Windows host commands."
+                    "Follow this exact 8-step sequence (all JSON keys are camelCase):\n\
+1. Preflight: call `dut_list` if `dutId` is unknown, then `dut_status` `{{\"dutId\":\"{dut}\"}}` to inspect `dutState`, `capabilities.flash`, `bootModes`, `flashPresets`, and `transfer`.\n\
+2. Stage image: call `dut_files` `{{\"dutId\":\"{dut}\",\"category\":\"image\"}}`. If the target `.img`/`.bin` is not present, upload it using `dut_status.transfer` (requires `flash` grant): single-command `curl -T <local.img> <putUrl> -H 'Authorization: Bearer <TOKEN>' -H 'X-Content-SHA256: <sha256>'` OR resumable tus 1.0.0 `ztus upload <local.img> <tusEndpoint> --header 'Authorization: Bearer <TOKEN>' --checksum sha256`, then re-check `dut_files(category=\"image\")`.\n\
+3. Acquire exclusive lease: call `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"acquire_lease\",\"sessionName\":\"flash-{mode}\",\"waitMs\":15000}}` and save `leaseId`.\n\
+4. Enter Loader/MaskROM per `bootModes`:\n\
+   - If target is `maskrom` and `bootModes.canEnterMaskrom == true`: `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"enter_maskrom\",\"leaseId\":\"<leaseId>\"}}`.\n\
+   - If target is `loader` and `bootModes.canEnterLoaderByHardware == true`: `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"enter_loader\",\"leaseId\":\"<leaseId>\"}}`.\n\
+   - If `bootModes.canEnterLoaderByAdb == true`: `adb_exec` `{{\"dutId\":\"{dut}\",\"op\":\"reboot_loader\",\"leaseId\":\"<leaseId>\"}}`.\n\
+   - Otherwise via serial: `serial_exec` `{{\"dutId\":\"{dut}\",\"triggerReset\":true,\"waitFor\":\"Hit any key\",\"send\":\"\\r\",\"thenSend\":\"rockusb 0 mmc 0\\r\",\"expect\":\"rockusb\",\"markLabel\":\"enter-{mode}\",\"leaseId\":\"<leaseId>\",\"timeoutMs\":15000}}` or `text: \"reboot loader\\r\"`.\n\
+5. Confirm device in Loader/MaskROM: call `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"flash_list\"}}` and verify `inLoader == true` or `inMaskrom == true`.\n\
+6. Flash image (set MCP HTTP timeout >= 300s): call `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"flash_update\",\"fileId\":\"image/<image.img>\",\"presetId\":\"<optional-from-flashPresets>\",\"leaseId\":\"<leaseId>\"}}`. Note: if `flash_update` reports `leaseReleasedAfterProtected == true`, re-acquire a lease for follow-up actions if needed.\n\
+7. Reboot & verify boot: call `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"flash_reboot\",\"leaseId\":\"<leaseId>\"}}`, wait on boot logs with `serial_read` (`sinceSeq` + `waitRegex`) and confirm version via `adb_exec(op=\"shell\", command=\"uname -a\")`.\n\
+8. Release lease: always finish with `dut_control` `{{\"dutId\":\"{dut}\",\"action\":\"release_lease\",\"leaseId\":\"<leaseId>\"}}`. On failure or `NEEDS_INSPECTION`, stop writes and call `notify_user`.\n\
+Never attempt to access host paths outside duthub's DUT directory or execute Windows host commands."
                 ),
             ),
             "capture_and_diagnose" => (
@@ -4485,6 +4742,7 @@ Never attempt to access files outside duthub's directory or execute Windows host
     }
 
     fn get_info(&self) -> InitializeResult {
+        let notify_scope = crate::i18n::notify_user_scope_note(self.state.locale());
         InitializeResult::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
@@ -4493,23 +4751,24 @@ Never attempt to access files outside duthub's directory or execute Windows host
                 .build(),
         )
         .with_server_info(Implementation::new("duthub", env!("CARGO_PKG_VERSION")))
-        .with_instructions(
+        .with_instructions(format!(
             "duthub MCP for remote Linux & local Agents (all JSON arguments use camelCase: dutId, sinceSeq, markLabel, triggerReset, fileId, remotePath). Do NOT assume local filesystem access to the Windows host — read all logs, screenshots, recordings, and DUT files strictly via MCP Tools or duthub:// Resources.\n\
 QUICK RECIPES (one-shot, zero guessing):\n\
-1. Discover & inspect: `dut_list` -> `dut_status` {\"dutId\":\"<id>\"} (check `relay.channels`, `adbSerial`, `bootModes.recommendedLoaderFlow`).\n\
-2. Live/archived serial & screenshots (Tools OR Resources):\n\
-   - Live tail: resource `duthub://dut/{dutId}/serial/tail` OR `serial_read` {\"dutId\":\"<id>\",\"tail\":100}.\n\
-   - Segmented logs: `serial_exec` {\"dutId\":\"<id>\",\"markLabel\":\"step-1\"} -> `log_segments` {\"dutId\":\"<id>\"} -> read `resourceUri` or `log_segment_read`.\n\
-   - Screenshot/Recording: `media_streams` {\"dutId\":\"<id>\",\"op\":{\"kind\":\"snapshot\"}} (read returned PNG via `artifact.resourceUri`) or `recordStart`/`recordStop`.\n\
-3. Control board, ADB debug & flash (user-configured listeners with matching DUT grants):\n\
-   - Hardware control: `dut_control` {\"dutId\":\"<id>\",\"action\":\"reset\"|\"power_cycle\"|\"enter_maskrom\"|\"enter_loader\"|\"flash_list\"|\"flash_update\"|\"flash_reboot\"}.\n\
-   - Multi-Agent arbitration: concurrent calls auto-queue in FIFO order (`waitMs`, default 5000ms). For multi-step atomic flows (enter Loader -> flash -> boot), acquire a session lease via `dut_control` {\"dutId\":\"<id>\",\"action\":\"acquire_lease\",\"waitMs\":15000}, pass `leaseId` to each step, and finish with `release_lease`. If access cannot be acquired (manual takeover, GUI holding control, another Agent busy, protected flash, or missing grant), duthub automatically raises a desktop human-intervention alert explaining why and returns `humanNotified`/`reason`/`holder` in error data (set `notifyOnBlocked: false` to probe silently).\n\
-   - Only `reset` wired: `serial_exec` {\"dutId\":\"<id>\",\"triggerReset\":true,\"waitFor\":\"Hit any key\",\"send\":\"\\r\",\"thenSend\":\"rockusb 0 mmc 0\\r\",\"timeoutMs\":15000} or Linux `{\"dutId\":\"<id>\",\"text\":\"reboot loader\\r\"}`.\n\
-   - ADB debugging: `adb_exec` {\"dutId\":\"<id>\",\"op\":\"shell\"|\"reboot\"|\"reboot_loader\"|\"logcat\"|\"push\"|\"pull\"} (`push`/`pull` strictly fenced inside the DUT folder).\n\
-   - Flashing: check `dut_files` -> verify Loader via `dut_control` (`flash_list`) -> flash via `dut_control` (`flash_update`, `fileId` plain filename only; enters `Protected` during eMMC write).\n\
-4. Alert desktop user: `notify_user` {\"message\":\"...\",\"title\":\"...\",\"level\":\"info|warning|error\",\"dutId\":\"<id>\"}（仅用户配置的 MCP 监听器提供，桌面发起的 Agent 会话没有该工具）.\n\
-SECURITY: File access is strictly confined inside duthub's work directory; host OS commands and out-of-root paths are forbidden.",
-        )
+1. Discover & inspect: `dut_list` -> `dut_status` {{\"dutId\":\"<id>\"}} (check `dutState`, `capabilities`, `flashPresets`, `transfer`, `logsExport`, `relay.channels`, `adbSerial`, `bootModes.recommendedLoaderFlow`).\n\
+2. Live/archived serial, bulk logs & screenshots (Tools OR Resources; ANSI highlight codes stripped automatically):\n\
+   - Live tail: resource `duthub://dut/{{dutId}}/serial/tail` OR `serial_read` {{\"dutId\":\"<id>\",\"tail\":100}} (track `sessionEpoch` to detect restarts).\n\
+   - Bulk logs: `log_export` {{\"dutId\":\"<id>\"}} (inline if <=256 KiB, or single HTTP GET on `downloadUrl`/`gzipDownloadUrl` with SHA-256); per-segment pagination via `log_segments` + `log_segment_read`.\n\
+   - Screenshot/Recording: `media_streams` {{\"dutId\":\"<id>\",\"op\":{{\"kind\":\"snapshot\"}}}} (read returned PNG via `artifact.resourceUri`) or `recordStart`/`recordStop`.\n\
+3. Upload images, control board, ADB debug & flash (user-configured listeners with matching DUT grants):\n\
+   - Image upload (requires `flash` grant): stream `.img`/`.bin`/`.iso` via `PUT /dut/{{dutId}}/image/{{filename}}` (`curl -T`, optional `X-Content-SHA256`) or resumable tus 1.0.0 `/dut/{{dutId}}/transfer` (`ztus` / `curl`), then verify via `dut_files` {{\"dutId\":\"<id>\",\"category\":\"image\"}}.\n\
+   - Hardware control: `dut_control` {{\"dutId\":\"<id>\",\"action\":\"reset\"|\"power_cycle\"|\"enter_maskrom\"|\"enter_loader\"|\"flash_list\"|\"flash_update\"|\"flash_reboot\"}}.\n\
+   - Multi-Agent arbitration: concurrent calls auto-queue in FIFO order (`waitMs`, default 5000ms). For multi-step atomic flows (enter Loader -> flash -> boot), acquire a session lease via `dut_control` {{\"dutId\":\"<id>\",\"action\":\"acquire_lease\",\"sessionName\":\"...\",\"waitMs\":15000}}, pass `leaseId` to each step, and finish with `release_lease`. If access cannot be acquired (manual takeover, GUI holding control, another Agent busy, protected flash, or missing grant), duthub automatically raises a desktop human-intervention alert explaining why and returns `humanNotified`/`reason`/`holder` in error data (set `notifyOnBlocked: false` to probe silently).\n\
+   - Only `reset` wired: `serial_exec` {{\"dutId\":\"<id>\",\"triggerReset\":true,\"waitFor\":\"Hit any key\",\"send\":\"\\r\",\"thenSend\":\"rockusb 0 mmc 0\\r\",\"timeoutMs\":15000}} or Linux `{{\"dutId\":\"<id>\",\"text\":\"reboot loader\\r\"}}`.\n\
+   - ADB debugging: `adb_exec` {{\"dutId\":\"<id>\",\"op\":\"shell\"|\"reboot\"|\"reboot_loader\"|\"logcat\"|\"push\"|\"pull\"}} (`push`/`pull` strictly fenced inside the DUT folder).\n\
+   - Flashing: check `dut_files(category=\"image\")` (upload first if absent) -> `acquire_lease` -> enter Loader -> confirm via `flash_list` -> `flash_update` (`fileId`: `image/<name>` or `<name>`, optional `presetId` from `dut_status.flashPresets`) -> `flash_reboot` + verify boot -> `release_lease`.\n\
+4. Alert desktop user & structured feedback: `notify_user` {{\"message\":\"...\",\"title\":\"...\",\"level\":\"info|warning|error\",\"dutId\":\"<id>\"}}{notify_scope}; `agent_feedback` (check `dut_files(category=\"feedback\")` first to avoid duplicates; one concise 4-part entry per issue, never include secrets or host paths).\n\
+SECURITY: File access is strictly confined inside duthub's work directory; host OS commands and out-of-root paths are forbidden."
+        ))
     }
 }
 

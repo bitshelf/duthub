@@ -9,6 +9,9 @@
 
 #![cfg(windows)]
 
+#[path = "support/agent_fixture.rs"]
+mod agent_fixture;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -438,33 +441,9 @@ fn mcp_unreachable_is_rejected_by_extension_validation() {
 fn kill_terminates_grandchild_process() {
     let work = temp_dir("tree");
     let marker = work.join("grandchild-marker.txt");
-    let child = work.join("grandchild-loop.cmd");
-    std::fs::write(
-        &child,
-        "@echo off\r\n\
-         :loop\r\n\
-         echo tick>>grandchild-marker.txt\r\n\
-         for /L %%i in (1,1,4000) do @rem\r\n\
-         goto loop\r\n",
-    )
-    .unwrap();
-    let script = work.join("spawn-tree.cmd");
-    std::fs::write(
-        &script,
-        "@echo off\r\ncmd.exe /D /Q /C grandchild-loop.cmd\r\n",
-    )
-    .unwrap();
-    let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
-        .join("System32")
-        .join("cmd.exe");
     let acp = AcpClient::spawn(
-        &cmd,
-        &[
-            "/D".into(),
-            "/Q".into(),
-            "/C".into(),
-            script.to_string_lossy().into_owned(),
-        ],
+        agent_fixture::executable(),
+        &["tree".into(), marker.to_string_lossy().into_owned()],
         &work,
         &[],
         4096,
@@ -475,8 +454,9 @@ fn kill_terminates_grandchild_process() {
         wait_until(Duration::from_secs(15), || {
             std::fs::metadata(&marker).map_or(0, |m| m.len()) > 0
         }),
-        "grandchild never wrote marker: {}",
-        marker.display()
+        "grandchild never wrote marker {}: {}",
+        marker.display(),
+        acp.stderr_tail()
     );
     let root = acp.pid();
 

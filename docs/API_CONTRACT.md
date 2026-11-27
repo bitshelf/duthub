@@ -38,10 +38,10 @@ MCP 2026-07-28 客户端通过 `server/discover` 发现能力，并为每个请�
 
 | 工具 | 契约 |
 |---|---|
-| `dut_list`、`dut_status(dutId)` | 通用接入返回该 Token 已授权的 DUT；DUT 专用接入只返回绑定 DUT。统一返回机读 **`dutState`**（`ready`/`busy_gui`/`busy_agent`/`flashing`/`manual_takeover`/`needs_inspection`/`disconnected`）、**`nextActionHint`** 以及 `controlStatus`（含 `sessionName`、`acquiredAtUnixMs`、`occupiedSecs`） |
-| `serial_read(dutId, sinceSeq?, limit?, tail?, mode?, waitFor?, waitRegex?, timeoutMs?)` | 只读接收实时串口流或 VT100 渲染屏快照（`mode="screen"`，亦可通过 Resource `duthub://dut/{dutId}/serial/screen` 直读）。传入 `waitFor` / `waitRegex` 时基于 `sinceSeq` 游标无漏行等待（上限 30s），返回 `matched`/`matchedBy`/`elapsedMs`；关闭会话改查归档 |
-| `log_segments(dutId, offset?, limit?)`、`log_segment_read(dutId, segmentId, offset?)` | 分页读取 DUT 的文本日志归档。目录身份按稳定 DUT ID 校验；DUT 专用接入仅能读绑定 DUT |
-| `dut_files(dutId?, category?, offset?, limit?)`、`dut_file_read(dutId, fileId, offset?)` | 列出工作目录中的 DUT 或其文件，返回六大标准目录分类（`image`、`TEST`、`压力&老化`、`串口日志`、`misc`、`feedback`）并支持按 `category` 过滤；按返回的文件 ID 读取 Base64 分块；DUT 专用接入的 `dut_files` 省略 `dutId` 时默认绑定 DUT，`dut_file_read` 的 `dutId` 必填 |
+| `dut_list`、`dut_status(dutId)` | 通用接入返回该 Token 已授权的 DUT；DUT 专用接入只返回绑定 DUT。统一返回机读 **`dutState`**（`ready`/`busy_gui`/`busy_agent`/`flashing`/`manual_takeover`/`needs_inspection`/`disconnected`）、**`nextActionHint`**、**`capabilities`**（按当前凭据实际授权动态计算）、脱敏 **`flashPresets`**、**`transfer`**（流式 `PUT` 与 tus 1.0.0 上传端点）、**`logsExport`**、**`sessionEpoch`** 以及 `controlStatus`（含 `sessionName`、`acquiredAtUnixMs`、`occupiedSecs`） |
+| `serial_read(dutId, sinceSeq?, limit?, tail?, mode?, waitFor?, waitRegex?, timeoutMs?)` | 只读接收实时串口流或 VT100 渲染屏快照（`mode="screen"`，亦可通过 Resource `duthub://dut/{dutId}/serial/screen` 直读），自动剥离 ANSI 颜色/高亮转义并返回 `sessionEpoch`。传入 `waitFor` / `waitRegex` 时基于 `sinceSeq` 游标无漏行等待（上限 30s），返回 `matched`/`matchedBy`/`elapsedMs`；关闭会话改查归档 |
+| `log_segments(dutId, offset?, limit?)`、`log_segment_read(dutId, segmentId, offset?)`、`log_export(dutId, sinceSegmentId?, tailSegments?, stripAnsi?, inline?)` | 分页或一次性快照导出 DUT 归档日志（返回固定快照边界、SHA-256 与同端口受鉴权 HTTP 下载链接 `GET /dut/{dutId}/logs/export`）。目录身份按稳定 DUT ID 校验；DUT 专用接入仅能读绑定 DUT |
+| `dut_files(dutId?, category?, offset?, limit?)`、`dut_file_read(dutId, fileId, offset?)` | 列出工作目录中的 DUT 或其文件（含 `mtimeUnixMs`），返回六大标准目录分类（`image` 含 `image/`、`images/data/` 及根目录 `.img`/`.bin`/`.iso`；`TEST`、`压力&老化`、`串口日志`、`misc`、`feedback`）；按返回的文件 ID 读取 Base64 分块；镜像上传走同端口流式 `PUT /dut/{dutId}/image/{filename}`（`curl -T`）或 tus 1.0.0 `/dut/{dutId}/transfer`（`ztus`/`curl`，强制要求 `flash` 权限） |
 | `adb_list_devices()` | 查询已运行的 127.0.0.1:5037 ADB 服务。只返回授权 DUT 的绑定，服务不可用则返回错误 |
 | `media_streams(dutId)` | 读取已启动的采集及状态；流 URL 应保密。带 `op` 时按需取数（需该 DUT 的 `capture` 授权）：`{"kind":"snapshot","source?","note?"}` 截取静帧；`{"kind":"recordStart","source?","note?"}` 开始录屏并返回 `recordingId`；`{"kind":"recordStop","recordingId"}` 取回产物 |
 | `skill_export()` | 返回嵌入的 `skills/duthub/SKILL.md` 正文（支持 `npx skills add bitshelf/duthub` 安装），不写盘 |

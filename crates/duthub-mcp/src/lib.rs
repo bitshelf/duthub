@@ -15,6 +15,8 @@
 #![forbid(unsafe_code)]
 
 pub mod auth_http;
+pub mod http_transfer;
+pub mod i18n;
 pub mod keys;
 pub mod notify;
 pub mod probe;

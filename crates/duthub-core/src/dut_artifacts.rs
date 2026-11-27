@@ -13,6 +13,8 @@ pub const DUT_CATEGORY_DIRS: &[&str] =
     &["image", "TEST", "压力&老化", "串口日志", "misc", "feedback"];
 /// Category subdirectory for firmware images.
 pub const IMAGE_DIR: &str = "image";
+/// Allowed firmware image filename extensions for upload and flashing.
+pub const ALLOWED_IMAGE_EXTENSIONS: &[&str] = &["img", "bin", "iso"];
 /// Category subdirectory for serial logs.
 pub const SERIAL_LOGS_DIR: &str = "串口日志";
 /// Legacy serial logs subdirectory (read-only compatibility for existing captures).
@@ -368,10 +370,143 @@ fn open_plain_subdir(dir: &Dir, name: &str) -> io::Result<Dir> {
     dir.open_dir(name)
 }
 
+/// Return true if `filename` has an allowed firmware image extension (`.img`, `.bin`, `.iso`).
+#[must_use]
+pub fn is_allowed_image_extension(filename: &str) -> bool {
+    Path::new(filename)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            ALLOWED_IMAGE_EXTENSIONS
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        })
+}
+
+/// Validate a plain firmware image filename (no path separators, dotfiles, or disallowed extensions).
+pub fn validate_image_filename(filename: &str) -> io::Result<&str> {
+    let clean = name_component(filename)?;
+    if clean == OWNER || clean.starts_with('.') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "image filename must not start with '.' or reference ownership markers",
+        ));
+    }
+    if !is_allowed_image_extension(clean) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "image filename must end with one of: {}",
+                ALLOWED_IMAGE_EXTENSIONS
+                    .iter()
+                    .map(|ext| format!(".{ext}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    Ok(clean)
+}
+
+/// Validate a hidden temporary upload filename (`.upload-<id>.part`) so in-flight
+/// uploads stay invisible to `list_files` and `read_file` while remaining strictly
+/// confined to a single plain component inside `<dut>/image/`.
+fn validate_temp_upload_name(temp_name: &str) -> io::Result<&str> {
+    if temp_name.len() > 128
+        || !temp_name.starts_with(".upload-")
+        || !Path::new(temp_name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("part"))
+        || temp_name.contains("..")
+        || !temp_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "invalid temporary upload filename",
+        ));
+    }
+    Ok(temp_name)
+}
+
+/// Create a temporary upload file strictly inside `<dut>/image/` without following symlinks.
+pub fn create_image_upload_temp(
+    root: &Path,
+    dut_id: &str,
+    name: &str,
+    temp_name: &str,
+) -> io::Result<(std::fs::File, PathBuf)> {
+    let temp_name = validate_temp_upload_name(temp_name)?;
+    let (folder, dir) = open_dut_for_write(root, dut_id, name)?;
+    let image_dir = open_subdir_for_write(&dir, IMAGE_DIR)?;
+    let file = create_new(&image_dir, temp_name)?;
+    Ok((file, root.join(folder).join(IMAGE_DIR).join(temp_name)))
+}
+
+/// Remove a temporary upload file inside `<dut>/image/` if it exists as a plain file.
+pub fn remove_image_upload_temp(root: &Path, dut_id: &str, name: &str, temp_name: &str) {
+    let Ok(temp_name) = validate_temp_upload_name(temp_name) else {
+        return;
+    };
+    let Ok(dir) = open(root, dut_id, name, false) else {
+        return;
+    };
+    let Ok(image_dir) = open_plain_subdir(&dir, IMAGE_DIR) else {
+        return;
+    };
+    if let Ok(meta) = image_dir.symlink_metadata(temp_name)
+        && meta.is_file()
+        && plain(&meta)
+    {
+        let _ = image_dir.remove_file(temp_name);
+    }
+}
+
+/// Atomically commit a validated temporary upload into `<dut>/image/<final_name>`.
+/// Returns the canonical MCP `fileId` (`image/<final_name>`).
+pub fn commit_image_upload_temp(
+    root: &Path,
+    dut_id: &str,
+    name: &str,
+    temp_name: &str,
+    final_name: &str,
+    overwrite: bool,
+) -> io::Result<String> {
+    let temp_name = validate_temp_upload_name(temp_name)?;
+    let final_name = validate_image_filename(final_name)?;
+    let (_, dir) = open_dut_for_write(root, dut_id, name)?;
+    let image_dir = open_subdir_for_write(&dir, IMAGE_DIR)?;
+    if let Ok(existing) = image_dir.symlink_metadata(final_name) {
+        if !overwrite {
+            let _ = image_dir.remove_file(temp_name);
+            return Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "image '{IMAGE_DIR}/{final_name}' already exists (pass overwrite=true to replace)"
+                ),
+            ));
+        }
+        if !existing.is_file() || !plain(&existing) {
+            let _ = image_dir.remove_file(temp_name);
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "existing image target is not a plain file",
+            ));
+        }
+        image_dir.remove_file(final_name)?;
+    }
+    image_dir.rename(temp_name, &image_dir, final_name)?;
+    Ok(format!("{IMAGE_DIR}/{final_name}"))
+}
+
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Artifact {
     pub id: String,
     pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime_unix_ms: Option<u64>,
 }
 
 /// Maximum directory recursion depth when enumerating DUT artifacts.
@@ -418,9 +553,16 @@ pub fn list_files(root: &Path, dut_id: &str, name: &str) -> io::Result<Vec<Artif
                         pending.push((id, depth + 1));
                     }
                 } else if metadata.is_file() {
+                    let mtime_unix_ms = metadata.modified().ok().and_then(|ts| {
+                        ts.into_std()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|d| u64::try_from(d.as_millis()).ok())
+                    });
                     files.push(Artifact {
                         id,
                         bytes: metadata.len(),
+                        mtime_unix_ms,
                     });
                 }
             }

@@ -1,14 +1,14 @@
 # Duthub MCP — Copy-Paste Verified Recipes
 
-## 0. Direct LAN HTTP Connectivity Smoke Check (Bypassing Client Proxy)
+## 0. Direct LAN HTTP Connectivity Check (Bypassing Client Proxy)
 
-Always pass `--noproxy '*'` (or set `NO_PROXY`) so local HTTP proxies never intercept LAN MCP traffic:
+Ensure `NO_PROXY` includes the duthub LAN IP so local proxies never intercept LAN MCP traffic:
 
 ```bash
-curl --noproxy '*' -s -D - -X POST 'http://<LAN-IP>:<PORT>/mcp' \
+NO_PROXY=<LAN-IP> curl -s -D - -X POST 'http://<LAN-IP>:<PORT>/mcp' \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -H "Authorization: Bearer $DUTHUB_TOKEN" \
+  -H 'Authorization: Bearer <TOKEN>' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}'
 ```
 
@@ -22,7 +22,27 @@ curl --noproxy '*' -s -D - -X POST 'http://<LAN-IP>:<PORT>/mcp' \
 // Tool: dut_status
 {"dutId": "<id>"}
 ```
-Verify `dutState == "ready"` before issuing write/control commands.
+Verify `dutState == "ready"`, `capabilities`, `bootModes`, `flashPresets`, and `transfer` before issuing write/upload/flash commands.
+
+## 1b. Bulk Export All Archived Logs (Single Request)
+
+Instead of 100+ paginated `log_segment_read` calls, call `log_export`:
+
+```json
+// Tool: log_export
+{
+  "dutId": "<id>",
+  "stripAnsi": true
+}
+```
+If the total log size exceeds 256 KiB, download the returned `gzipDownloadUrl` in one HTTP request and verify `X-Duthub-Sha256`:
+
+```bash
+NO_PROXY=<LAN-IP> curl -sSf -D - \
+  -H 'Authorization: Bearer <TOKEN>' \
+  'http://<LAN-IP>:<PORT>/dut/<id>/logs/export?format=gzip' \
+  -o dut-logs.txt.gz
+```
 
 ## 2. Shell Command with Anti-Echo Sentinel
 
@@ -105,9 +125,31 @@ When only a `reset` relay is wired (check `dut_status.bootModes`):
 }
 ```
 
-## 7. Multi-Step Exclusive Lease + Safe Firmware Flash
+## 7. Image Upload + Multi-Step Exclusive Lease + Safe Firmware Flash (8 Steps)
 
-1. Acquire exclusive lease with mandatory `sessionName`:
+1. Check `dut_status` (`capabilities.flash == true`, `flashPresets`, `transfer`) and list existing images:
+```json
+// Tool: dut_files
+{"dutId": "<id>", "category": "image"}
+```
+2. If the image is not staged yet, upload it to the **same MCP HTTP port** (requires `flash` grant):
+   - **Option A — Streaming `PUT` (`curl`, single command, supports 5GB+ files)**:
+     ```bash
+     SHA=$(sha256sum update.img | awk '{print $1}')
+     NO_PROXY=<LAN-IP> curl -fS -T update.img \
+       -H 'Authorization: Bearer <TOKEN>' \
+       -H "X-Content-SHA256: $SHA" \
+       'http://<LAN-IP>:<PORT>/dut/<id>/image/update.img'
+     ```
+     *(Append `?overwrite=true` to intentionally replace an existing image of the same name.)*
+   - **Option B — Resumable tus 1.0.0 (`ztus`, supports HTTP/2 `h2c` & automatic resume)**:
+     ```bash
+     NO_PROXY=<LAN-IP> ztus upload update.img \
+       'http://<LAN-IP>:<PORT>/dut/<id>/transfer' \
+       --header 'Authorization: Bearer <TOKEN>' \
+       --checksum sha256
+     ```
+3. Acquire exclusive lease with mandatory `sessionName`:
 ```json
 // Tool: dut_control
 {
@@ -117,21 +159,21 @@ When only a `reset` relay is wired (check `dut_status.bootModes`):
   "waitMs": 15000
 }
 ```
-2. List firmware images under `image` category (pass the returned `id` as `fileId`):
-```json
-// Tool: dut_files
-{"dutId": "<id>", "category": "image"}
-```
-3. Enter Loader (`enter_loader`, `adb_exec(op="reboot_loader")`, or U-Boot recipe), verify `inLoader == true`, then flash (set HTTP client timeout ≥ 300s):
+4. Enter Loader (`adb_exec(op="reboot_loader")`, `enter_loader`, or U-Boot recipe), confirm `inLoader == true`, then flash (set HTTP client timeout ≥ 300s):
 ```json
 // Tool: dut_control
 {"dutId": "<id>", "action": "flash_list", "leaseId": "<leaseId>"}
 ```
 ```json
 // Tool: dut_control
-{"dutId": "<id>", "action": "flash_update", "fileId": "<id-from-dut_files>", "leaseId": "<leaseId>"}
+{"dutId": "<id>", "action": "flash_update", "fileId": "image/update.img", "leaseId": "<leaseId>"}
 ```
-4. Always release the lease so waiting Agents proceed immediately:
+5. Reboot into the flashed image and verify boot via `serial_read(sinceSeq, waitRegex)` / `adb_exec(op="shell", command="uname -a")`:
+```json
+// Tool: dut_control
+{"dutId": "<id>", "action": "flash_reboot", "leaseId": "<leaseId>"}
+```
+6. Always release the lease so waiting Agents proceed immediately:
 ```json
 // Tool: dut_control
 {"dutId": "<id>", "action": "release_lease", "leaseId": "<leaseId>"}
@@ -163,7 +205,7 @@ When only a `reset` relay is wired (check `dut_status.bootModes`):
 {"dutId": "<id>", "op": {"kind": "recordStop", "recordingId": 1}}
 ```
 
-## 10. Desktop Notification & Agent Usage Feedback
+## 10. Desktop Notification & Structured Agent Feedback
 
 ```json
 // Tool: notify_user
@@ -174,15 +216,18 @@ When only a `reset` relay is wired (check `dut_status.bootModes`):
   "level": "info"
 }
 ```
+
+Before calling `agent_feedback`, check `dut_files(dutId="<id>", category="feedback")` to avoid duplicates, submit **one issue per entry**, follow the 4-part structure below, and **never include Bearer tokens or host paths**:
+
 ```json
 // Tool: agent_feedback
 {
   "dutId": "<id>",
   "category": "usability",
   "severity": "medium",
-  "title": "Short summary of friction or suggestion",
-  "detail": "Observed behavior and concrete improvement suggestion.",
-  "toolName": "serial_exec",
+  "title": "Concise single-issue summary (<=120 chars)",
+  "detail": "1. Goal & preflight: dutState=ready, capabilities.flash=true.\n2. Exact call & error: dut_control(action=flash_update, fileId=...) returned IMAGE_NOT_FOUND.\n3. Impact: Blocked automated flash step.\n4. Suggestion: Keep available image list and upload hint in the error response.",
+  "toolName": "dut_control",
   "sessionName": "rk3576-flash-verify"
 }
 ```

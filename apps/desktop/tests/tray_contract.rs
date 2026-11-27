@@ -446,8 +446,8 @@ fn notify_user_is_wired_only_for_user_configured_listeners() {
     assert!(!plan_tools.contains(&"serial_exec"));
     assert_eq!(
         plan_tools.len(),
-        10,
-        "PLAN_TOOLS stays at 10 read-only tools"
+        11,
+        "PLAN_TOOLS stays at 11 read-only tools"
     );
 }
 

@@ -6,12 +6,15 @@
 //! - `HostManager::stop` cancels a pending restart without spawning a new
 //!   process.
 //!
-//! The fake ACP program is a PowerShell script that answers `initialize` and
+//! The native Rust fixture answers `initialize` and
 //! `session/new` over stdin/stdout and then exits 0 (or exits immediately in
 //! `fail-early` mode). Every spawn appends one line to a counter file, so the
 //! tests can prove exactly how many processes were started.
 
 #![cfg(windows)]
+
+#[path = "support/agent_fixture.rs"]
+mod agent_fixture;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -146,29 +149,6 @@ impl HostEvents for Events {
     }
 }
 
-/// Fake ACP agent written as a pure `cmd.exe` batch script so it runs inside
-/// MXC PSEC 1.1 on both interactive and headless/isolated CI desktops without
-/// linking `user32.dll`.
-///
-/// - `fail-early`: records a spawn line and exits 3 before answering `initialize`.
-/// - other modes: records a spawn line, answers `initialize` (id=1) and
-///   `session/new` (id=2), briefly stays alive so callers observe `Ready`, then
-///   exits 0.
-const FAKE_ACP_FAIL_EARLY_CMD: &str = "@echo off\r\n\
-echo spawn>>\"%~1\"\r\n\
-exit /b 3\r\n";
-
-const FAKE_ACP_CRASH_AFTER_READY_CMD: &str = "@echo off\r\n\
-echo spawn>>\"%~1\"\r\n\
-set \"line1=\"\r\n\
-set /p \"line1=\" || exit /b 1\r\n\
-echo {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"name\":\"fake-acp\",\"version\":\"0.0.1\"},\"agentCapabilities\":{\"loadSession\":false,\"mcpCapabilities\":{\"http\":true}}}}\r\n\
-set \"line2=\"\r\n\
-set /p \"line2=\" || exit /b 1\r\n\
-echo {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"fake-session-1\",\"_meta\":{\"extensionResults\":[{\"name\":\"duthub\",\"success\":true}]}}}\r\n\
-ping -n 2 127.0.0.1 >nul\r\n\
-exit /b 0\r\n";
-
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "duthub-agent-restart-{tag}-{}",
@@ -184,45 +164,21 @@ fn access_context() -> Arc<AccessContext> {
     Arc::new(AccessContext::new(auth, lease, AuditSink::memory()))
 }
 
-fn cmd_exe() -> PathBuf {
-    let root =
-        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from("C:/Windows"), PathBuf::from);
-    root.join("System32").join("cmd.exe")
-}
-
-/// Build an external ACP definition running the fake batch script inside the
-/// DUT's sandbox cell.
-fn fake_agent(work: &Path, dut: &str, mode: &str, counter: &Path) -> AgentDefinition {
-    let program = cmd_exe();
-    assert!(program.is_file(), "missing cmd.exe: {}", program.display());
-    let key = duthub_core::store::agent_dut_key(dut).expect("DUT id must map to a key");
-    let cell_dir = work.join("agent").join("dut").join(key).join("sandbox");
-    std::fs::create_dir_all(&cell_dir).unwrap();
-    let script = cell_dir.join(format!("fake-acp-{mode}.cmd"));
-    let body = if mode == "fail-early" {
-        FAKE_ACP_FAIL_EARLY_CMD
-    } else {
-        FAKE_ACP_CRASH_AFTER_READY_CMD
-    };
-    std::fs::write(&script, body).unwrap();
+/// Build an external ACP definition backed by the native fixture.
+fn fake_agent(mode: &str, counter: &Path) -> AgentDefinition {
+    let program = agent_fixture::executable();
     AgentDefinition {
         id: format!("fake-{mode}"),
         name: format!("Fake ACP {mode}"),
         kind: AgentKind::Acp,
         program: Some(program.to_string_lossy().into_owned()),
-        args: vec![
-            "/D".into(),
-            "/Q".into(),
-            "/C".into(),
-            script.to_string_lossy().into_owned(),
-            counter.to_string_lossy().into_owned(),
-        ],
+        args: vec![mode.to_owned(), counter.to_string_lossy().into_owned()],
         env_keys: Vec::new(),
         cli_profile: None,
         enabled: true,
         auth_mode: "inherit".into(),
         trust_level: "mcp_only".into(),
-        expected_sha256: Some(duthub_core::store::sha256_file(&program).unwrap()),
+        expected_sha256: Some(duthub_core::store::sha256_file(program).unwrap()),
     }
 }
 
@@ -278,7 +234,7 @@ fn restart_only_after_ready() {
     host.start_with_agent(
         "dut-no-ready",
         None,
-        fake_agent(&work, "dut-no-ready", "fail-early", &early_counter),
+        fake_agent("fail-early", &early_counter),
     )
     .unwrap();
     assert!(
@@ -311,7 +267,7 @@ fn restart_only_after_ready() {
     host.start_with_agent(
         "dut-crash",
         None,
-        fake_agent(&work, "dut-crash", "crash-after-ready", &crash_counter),
+        fake_agent("crash-after-ready", &crash_counter),
     )
     .unwrap();
     assert!(
@@ -388,12 +344,8 @@ fn stop_cancels_pending_restart_without_new_spawn() {
     );
 
     let counter = sandbox_counter(&work, "dut-stop", "crash-after-ready");
-    host.start_with_agent(
-        "dut-stop",
-        None,
-        fake_agent(&work, "dut-stop", "crash-after-ready", &counter),
-    )
-    .unwrap();
+    host.start_with_agent("dut-stop", None, fake_agent("crash-after-ready", &counter))
+        .unwrap();
     wait_until(Duration::from_secs(60), || {
         matches!(
             status_of(&host, "dut-stop"),

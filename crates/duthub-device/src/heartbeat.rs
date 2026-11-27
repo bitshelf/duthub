@@ -94,6 +94,7 @@ pub struct HeartbeatService {
     states: Mutex<HashMap<String, HeartbeatState>>,
     flights: Mutex<HashMap<String, Flight>>,
     next_due: Mutex<HashMap<String, u64>>,
+    last_rx_seq: Mutex<HashMap<String, u64>>,
     alerts: Mutex<Vec<HeartbeatAlert>>,
     /// Serialize desktop timer ticks and immediate MCP probes to avoid double dispatch.
     ticking: Mutex<()>,
@@ -143,6 +144,7 @@ impl HeartbeatService {
             states: Mutex::new(HashMap::new()),
             flights: Mutex::new(HashMap::new()),
             next_due: Mutex::new(HashMap::new()),
+            last_rx_seq: Mutex::new(HashMap::new()),
             alerts: Mutex::new(Vec::new()),
             ticking: Mutex::new(()),
             persist: Mutex::new(None),
@@ -252,7 +254,34 @@ impl HeartbeatService {
     fn reset_schedule(&self, dut_id: &str) {
         duthub_core::util::lock_unpoisoned(&self.flights).remove(dut_id);
         duthub_core::util::lock_unpoisoned(&self.next_due).remove(dut_id);
+        duthub_core::util::lock_unpoisoned(&self.last_rx_seq).remove(dut_id);
         self.note_lease_pause(dut_id, false);
+    }
+
+    fn has_device_output_since(&self, session_id: &str, since_seq: u64) -> bool {
+        self.device
+            .read_log(session_id, since_seq, usize::MAX)
+            .iter()
+            .any(|env| match &env.event {
+                UiEvent::SerialChunk { text, .. } => {
+                    is_response_line(text) && !text.trim().is_empty()
+                }
+                _ => false,
+            })
+    }
+
+    fn note_passive_activity(&self, dut_id: &str, now_ms: u64) -> bool {
+        let mut states = duthub_core::util::lock_unpoisoned(&self.states);
+        let state = states.entry(dut_id.to_string()).or_default();
+        let changed = state.last_ok != Some(true)
+            || state.loss_count != 0
+            || state.paused_by_lease
+            || state.last_at_unix_ms != now_ms;
+        state.last_ok = Some(true);
+        state.last_at_unix_ms = now_ms;
+        state.loss_count = 0;
+        state.paused_by_lease = false;
+        changed
     }
 
     fn note_lease_pause(&self, dut_id: &str, paused: bool) -> bool {
@@ -340,9 +369,10 @@ impl HeartbeatService {
                     if let Some(updated) = answered {
                         changed |= updated;
                         duthub_core::util::lock_unpoisoned(&self.flights).remove(&dut);
-                        self.next_due
-                            .lock()
-                            .unwrap()
+                        let after_seq = self.device.session_last_seq(&dut);
+                        duthub_core::util::lock_unpoisoned(&self.last_rx_seq)
+                            .insert(dut.clone(), after_seq);
+                        duthub_core::util::lock_unpoisoned(&self.next_due)
                             .insert(dut.clone(), now_ms.saturating_add(interval_ms));
                         continue;
                     }
@@ -351,27 +381,52 @@ impl HeartbeatService {
                     // An unanswered dispatched probe counts as a loss once its window expires.
                     changed |= self.note_loss(&dut, &cfg, now_ms);
                     duthub_core::util::lock_unpoisoned(&self.flights).remove(&dut);
-                    self.next_due
-                        .lock()
-                        .unwrap()
+                    let after_seq = self.device.session_last_seq(&dut);
+                    duthub_core::util::lock_unpoisoned(&self.last_rx_seq)
+                        .insert(dut.clone(), after_seq);
+                    duthub_core::util::lock_unpoisoned(&self.next_due)
                         .insert(dut.clone(), now_ms.saturating_add(interval_ms));
                 }
                 continue;
             }
-            // A closed session receives no probe and does not accumulate new losses.
+            // A closed session receives no probe and resets its schedule so reopening does not
+            // immediately inject a heartbeat command on the first tick.
             if !session_open {
+                duthub_core::util::lock_unpoisoned(&self.next_due).remove(&dut);
+                duthub_core::util::lock_unpoisoned(&self.last_rx_seq).remove(&dut);
                 changed |= self.note_lease_pause(&dut, false);
                 continue;
             }
-            let due = self
-                .next_due
-                .lock()
-                .unwrap()
-                .get(&dut)
-                .copied()
-                .unwrap_or(0);
+            let current_seq = self.device.session_last_seq(&dut);
+            let due = {
+                let mut next_due = duthub_core::util::lock_unpoisoned(&self.next_due);
+                if let Some(&existing) = next_due.get(&dut) {
+                    existing
+                } else {
+                    // Arm the first interval upon observing an open session instead of firing
+                    // `uname -a` immediately when the port opens.
+                    duthub_core::util::lock_unpoisoned(&self.last_rx_seq)
+                        .insert(dut.clone(), current_seq);
+                    next_due.insert(dut.clone(), now_ms.saturating_add(interval_ms));
+                    continue;
+                }
+            };
             if now_ms >= due {
-                let cursor = self.device.session_last_seq(&dut);
+                let prev_seq = duthub_core::util::lock_unpoisoned(&self.last_rx_seq)
+                    .get(&dut)
+                    .copied()
+                    .unwrap_or(0);
+                // Any device serial output during the interval proves the board is alive;
+                // skip injecting an intrusive heartbeat command until the port goes silent.
+                if current_seq > prev_seq && self.has_device_output_since(&session_id, prev_seq) {
+                    duthub_core::util::lock_unpoisoned(&self.last_rx_seq)
+                        .insert(dut.clone(), current_seq);
+                    duthub_core::util::lock_unpoisoned(&self.next_due)
+                        .insert(dut.clone(), now_ms.saturating_add(interval_ms));
+                    changed |= self.note_passive_activity(&dut, now_ms);
+                    continue;
+                }
+                let cursor = current_seq;
                 let batch = HeartbeatBatch::from_command(&cfg.command, now_ms).map(Arc::new);
                 let writer = duthub_core::lease::WriteIdentity::system();
                 let sent = match &batch {
@@ -401,16 +456,16 @@ impl HeartbeatService {
                     }
                     Err(DeviceError::NotFound | DeviceError::Lease(_) | DeviceError::Busy) => {
                         // A command that never entered the serial queue does not count as a hardware timeout.
-                        self.next_due
-                            .lock()
-                            .unwrap()
+                        duthub_core::util::lock_unpoisoned(&self.last_rx_seq)
+                            .insert(dut.clone(), self.device.session_last_seq(&dut));
+                        duthub_core::util::lock_unpoisoned(&self.next_due)
                             .insert(dut.clone(), now_ms.saturating_add(interval_ms));
                     }
                     Err(_) => {
                         changed |= self.note_loss(&dut, &cfg, now_ms);
-                        self.next_due
-                            .lock()
-                            .unwrap()
+                        duthub_core::util::lock_unpoisoned(&self.last_rx_seq)
+                            .insert(dut.clone(), self.device.session_last_seq(&dut));
+                        duthub_core::util::lock_unpoisoned(&self.next_due)
                             .insert(dut.clone(), now_ms.saturating_add(interval_ms));
                     }
                 }
@@ -516,8 +571,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         svc.register("dut-a", cfg("uname -a", 1, 2));
 
-        // Dispatch at the due time and ignore output before the captured cursor.
-        assert!(svc.tick_at(1000), "probe dispatch should change state");
+        // First tick upon observing an open session arms the interval without immediate dispatch.
+        assert!(
+            !svc.tick_at(1000),
+            "opening a session must not immediately inject a heartbeat command"
+        );
+        // Dispatch after one full silent interval and ignore output before the captured cursor.
+        assert!(svc.tick_at(2000), "probe dispatch should change state");
         // Wait for the asynchronous serial write to appear in the buffer.
         let mut tx_seen = false;
         for _ in 0..50 {
@@ -535,11 +595,11 @@ mod tests {
         );
         // Wait for the demo shell response, then advance within the response window.
         std::thread::sleep(Duration::from_millis(250));
-        assert!(svc.tick_at(1300));
+        assert!(svc.tick_at(2300));
         let state = svc.state_or_default("dut-a");
         assert_eq!(state.last_ok, Some(true));
         assert_eq!(state.loss_count, 0);
-        assert_eq!(state.last_at_unix_ms, 1300);
+        assert_eq!(state.last_at_unix_ms, 2300);
         assert!(
             state.last_response.contains("aarch64 GNU/Linux"),
             "raw response text must be preserved: {}",
@@ -611,10 +671,12 @@ mod tests {
                 ..cfg("uname -a\r\nuptime", 1, 2)
             },
         );
-        assert!(svc.tick_at(1000));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!svc.tick_at(1000));
+        assert!(svc.tick_at(2000));
         for _ in 0..50 {
             std::thread::sleep(Duration::from_millis(10));
-            svc.tick_at(1200);
+            svc.tick_at(2200);
             if svc.state_or_default("dut-batch").last_ok.is_some() {
                 break;
             }
@@ -643,15 +705,16 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         svc.register("dut-b", cfg("uname -a", 1, 2));
-        // Close the session after sending to simulate a probe that never receives a reply.
-        assert!(svc.tick_at(1000));
+        // Arm interval, then fire after one full silent interval; close before reply arrives.
+        assert!(!svc.tick_at(1000));
+        assert!(svc.tick_at(2000));
         device.close_session("dut-b").ok();
         std::thread::sleep(Duration::from_millis(120));
         assert!(
-            !svc.tick_at(1500),
+            !svc.tick_at(2500),
             "must not evaluate loss before response window expires"
         );
-        assert!(svc.tick_at(2500), "loss detection should change state");
+        assert!(svc.tick_at(3500), "loss detection should change state");
         let state = svc.state_or_default("dut-b");
         assert_eq!(state.last_ok, Some(false));
         assert_eq!(state.loss_count, 1);
@@ -690,11 +753,12 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         svc.register("dut-c", cfg("uname -a", 1, 3));
-        assert!(svc.tick_at(1000));
+        assert!(!svc.tick_at(1000));
+        assert!(svc.tick_at(2000));
         // Inject local annotations as well as a device prompt.
         device.log_mark("dut-c", "继电器 power ON").unwrap();
         std::thread::sleep(Duration::from_millis(250));
-        assert!(svc.tick_at(1300));
+        assert!(svc.tick_at(2300));
         let state = svc.state_or_default("dut-c");
         assert_eq!(state.last_ok, Some(true));
         assert!(
@@ -777,9 +841,12 @@ mod tests {
                 ..cfg("uname -a", 1, 3)
             },
         );
+        std::thread::sleep(Duration::from_millis(150));
         assert!(!svc.tick_at(4_999));
         assert!(svc.state("dut-pause").is_none());
-        assert!(svc.tick_at(5_000));
+        // First unpaused tick arms the interval; next tick after one silent interval probes.
+        assert!(!svc.tick_at(5_000));
+        assert!(svc.tick_at(6_000));
         device.close_session("dut-pause").unwrap();
     }
 
@@ -839,9 +906,11 @@ mod tests {
                 None,
             )
             .unwrap();
+        // First tick arms the interval without dispatching immediately; second tick hits the lease.
+        assert!(!svc.tick_at(1000));
         // A denied system probe sets the deferral flag and leaves its result unset.
         assert!(
-            svc.tick_at(1000),
+            svc.tick_at(2000),
             "setting deferral flag should change state"
         );
         let state = svc.state_or_default("dut-lease");
@@ -859,11 +928,47 @@ mod tests {
         );
         // Release the Agent lease and confirm that the next due dispatch clears the flag.
         lease.release("dut-lease", &grant.lease_id).unwrap();
-        assert!(svc.tick_at(2000), "successful dispatch should change state");
+        assert!(svc.tick_at(3000), "successful dispatch should change state");
         assert!(
             !svc.state_or_default("dut-lease").paused_by_lease,
             "successful probe must clear paused_by_lease"
         );
         device.close_session("dut-lease").ok();
+    }
+
+    #[test]
+    fn active_serial_output_proves_liveness_and_skips_heartbeat_command() {
+        let device = test_device("active-rx");
+        let svc = HeartbeatService::new(device.clone());
+        device
+            .open_session("dut-live", "COM3", 115_200, crate::SessionKind::Demo)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        svc.register("dut-live", cfg("uname -a", 1, 3));
+        // Opening the session arms the interval without sending `uname -a`.
+        assert!(!svc.tick_at(1_000));
+        // Simulate real serial activity on the board before the interval elapses.
+        device
+            .write_line(
+                "dut-live",
+                duthub_core::lease::WriteIdentity::gui(),
+                "echo alive",
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // At due time, observed device RX output proves liveness — no `uname -a` is injected.
+        assert!(svc.tick_at(2_000));
+        let state = svc.state_or_default("dut-live");
+        assert_eq!(state.last_ok, Some(true));
+        assert_eq!(state.loss_count, 0);
+        assert!(
+            !response_texts(&device, "dut-live")
+                .iter()
+                .any(|t| t == "[TX] uname -a"),
+            "active serial output must suppress intrusive heartbeat command"
+        );
+        // Once the port stays silent for a full interval, the heartbeat command is dispatched.
+        assert!(svc.tick_at(3_000));
+        device.close_session("dut-live").ok();
     }
 }
