@@ -119,6 +119,24 @@ mod tests {
             desc_val.chars().count() <= 1024,
             "description must stay within 1024 chars per Agent Skills spec"
         );
+        // Guard against unquoted `: ` in YAML frontmatter scalars, which YAML parsers reject
+        // as invalid nested mappings (breaks `npx skills add`).
+        let frontmatter = md
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .expect("frontmatter must be closed with ---")
+            .0;
+        for line in frontmatter.lines() {
+            if let Some((_, raw_val)) = line.split_once(':') {
+                let val = raw_val.trim();
+                let quoted = (val.starts_with('"') && val.ends_with('"'))
+                    || (val.starts_with('\'') && val.ends_with('\''));
+                assert!(
+                    quoted || !val.contains(": "),
+                    "unquoted YAML frontmatter scalar contains ': ' (breaks YAML parsers): {line}"
+                );
+            }
+        }
         assert!(
             md.lines().count() < 500,
             "core SKILL.md should stay concise (<500 lines) with details in references/"

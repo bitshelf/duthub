@@ -1,8 +1,8 @@
 ---
 name: duthub
-description: Connect to and debug embedded Linux/Android DUTs hosted on Windows duthub.exe over Streamable HTTP MCP (LAN HTTP or SSH tunnel). Use whenever inspecting, troubleshooting, or controlling a DUT via duthub (dut_list, dut_status, serial_read, serial_exec, dut_control, adb_exec, media_streams, log_segments, dut_files, notify_user, agent_feedback): clean ANSI-free serial reads, VT100 screens, cursor-safe waits, logical keys, hardware relay/flash leases, ADB debugging, and HTTP connectivity checks.
+description: "Connect to and debug embedded Linux/Android DUTs hosted on Windows duthub.exe over Streamable HTTP MCP (LAN HTTP or SSH tunnel). Use whenever inspecting, troubleshooting, or controlling a DUT via duthub (dut_list, dut_status, serial_read, serial_exec, dut_control, adb_exec, media_streams, log_segments, dut_files, notify_user, agent_feedback) for clean ANSI-free serial reads, VT100 screens, cursor-safe waits, logical keys, hardware relay/flash leases, ADB debugging, and HTTP connectivity checks."
 license: Apache-2.0
-compatibility: Requires HTTP access to a running duthub.exe Streamable HTTP MCP endpoint with a Bearer token (direct LAN HTTP when lanAccess is enabled, or SSH reverse tunnel). No server-side duthub binary is required.
+compatibility: "Requires HTTP access to a running duthub.exe Streamable HTTP MCP endpoint with a Bearer token (direct LAN HTTP when lanAccess is enabled, or SSH reverse tunnel). No server-side duthub binary is required."
 metadata:
   author: bitshelf
   version: "0.1.1"
