@@ -19,6 +19,7 @@ pub enum NotifyLevel {
 
 impl NotifyLevel {
     /// Parse the wire value. Only these three literals are accepted.
+    #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "info" => Some(Self::Info),
@@ -28,6 +29,7 @@ impl NotifyLevel {
         }
     }
 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Info => "info",
@@ -45,7 +47,7 @@ pub struct NotifyRequest {
     pub level: NotifyLevel,
     /// `None` = the caller did not target a DUT (a global notice).
     pub dut_id: Option<String>,
-    /// Rate-limit key: the authenticated credential id; `None` for LocalAdmin
+    /// Rate-limit key: the authenticated credential id; `None` for `LocalAdmin`
     /// (stdio) where no per-credential bucket exists.
     pub credential_id: Option<String>,
 }
@@ -63,6 +65,7 @@ pub enum NotifyOutcome {
 }
 
 impl NotifyOutcome {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -85,6 +88,7 @@ pub enum ThrottleReason {
 }
 
 impl ThrottleReason {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dedup => "dedup",
@@ -111,6 +115,7 @@ pub const AGENT_NOTICE_SOURCE: &str = "agentNotice";
 ///
 /// Lengths are counted in characters so multi-byte text is never cut inside a
 /// code point.
+#[must_use]
 pub fn sanitize_notify_text(raw: &str, max_chars: usize) -> String {
     let stripped: String = raw.chars().filter(|ch| !ch.is_control()).collect();
     stripped.trim().chars().take(max_chars).collect()

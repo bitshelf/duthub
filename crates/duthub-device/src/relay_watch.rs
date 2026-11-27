@@ -138,6 +138,7 @@ pub enum RelayProbeVerdict {
 ///
 /// Only "the port vanished" and "the port answered, the board did not" are
 /// faults. A busy port or a held gate must never be reported as a dead board.
+#[must_use]
 pub fn classify_probe(sample: &RelayProbeSample) -> RelayProbeVerdict {
     match sample {
         RelayProbeSample::Answered(_) => RelayProbeVerdict::Online,
@@ -161,6 +162,7 @@ pub fn classify_probe(sample: &RelayProbeSample) -> RelayProbeVerdict {
 ///
 /// All four of the latter groups are `Unobservable`: none of them proves the
 /// board is down.
+#[must_use]
 pub fn classify_probe_error(error: &DeviceError) -> RelayProbeSample {
     match error {
         DeviceError::NotFound => {
@@ -193,6 +195,7 @@ pub fn classify_probe_error(error: &DeviceError) -> RelayProbeSample {
 ///
 /// Boards hosted elsewhere (`host` not `local`) are also skipped: there is no
 /// remote relay transport, and opening a same-named local port would be a lie.
+#[must_use]
 pub fn is_watchable_board(board: &RelayBoard) -> bool {
     let driver_supported = board.driver.is_empty() || board.driver.eq_ignore_ascii_case("CH340");
     let local = board.host.is_empty() || board.host.eq_ignore_ascii_case("local");
@@ -211,6 +214,7 @@ pub fn is_watchable_board(board: &RelayBoard) -> bool {
 ///
 /// Feed the result straight into
 /// [`crate::control::ControlRelayProbe::set_channels`].
+#[must_use]
 pub fn board_probe_channels(boards: &[RelayBoard], duts: &[DutConfig]) -> Vec<(String, u8)> {
     let mut picked: BTreeMap<String, u8> = BTreeMap::new();
     for dut in duts {
@@ -299,6 +303,14 @@ pub struct RelayWatchService {
     inner: Mutex<WatchInner>,
 }
 
+impl std::fmt::Debug for RelayWatchService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayWatchService")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RelayWatchService {
     pub fn new(probe: Arc<dyn RelayBoardProbe>) -> Self {
         Self {
@@ -310,6 +322,7 @@ impl RelayWatchService {
 
     /// Override cadence/thresholds (values are clamped, see
     /// [`RelayWatchConfig::sanitized`]).
+    #[must_use]
     pub fn with_config(mut self, config: RelayWatchConfig) -> Self {
         self.config = config.sanitized();
         self
@@ -661,15 +674,15 @@ mod tests {
                 reference_similarity: None,
                 split_logs: false,
             },
-            adb: Default::default(),
+            adb: duthub_core::model::AdbConfig::default(),
             relay: binding,
             mcp: McpConfig::StreamableHttp {
                 url: "http://127.0.0.1:8787/mcp".into(),
             },
-            a2a: Default::default(),
-            flash: Default::default(),
-            media: Default::default(),
-            heartbeat: Default::default(),
+            a2a: duthub_core::model::DutA2aConfig::default(),
+            flash: duthub_core::model::FlashConfig::default(),
+            media: duthub_core::model::DutMediaConfig::default(),
+            heartbeat: duthub_core::model::HeartbeatConfig::default(),
         }
     }
 
@@ -710,7 +723,7 @@ mod tests {
         );
         // A DUT bound to a board that is not in the watch set is ignored.
         let without_b1 = vec![board("b2", "COM26", "CH340")];
-        assert!(board_probe_channels(&without_b1, &duts).is_empty());
+        assert_eq!(board_probe_channels(&without_b1, &duts), [] as [(std::string::String, u8); 0]);
         // Legacy per-DUT serial relay / PDU / disabled bindings never map.
         let legacy = vec![
             dut(RelayConfig::UsbSerial {
@@ -723,11 +736,11 @@ mod tests {
                 },
             }),
             dut(RelayConfig::SnmpPdu {
-                snmp: Default::default(),
-                outlets: Default::default(),
+                snmp: duthub_core::model::SnmpConfig::default(),
+                outlets: duthub_core::model::PduOutlets::default(),
             }),
             dut(RelayConfig::Disabled),
         ];
-        assert!(board_probe_channels(&boards, &legacy).is_empty());
+        assert_eq!(board_probe_channels(&boards, &legacy), [] as [(std::string::String, u8); 0]);
     }
 }

@@ -151,18 +151,13 @@ fn main() {
     // returns — it must outlive a window hidden to the notification area.
     let _instance_guard = if self_test {
         None
-    } else {
-        match duthub_desktop::tray::single_instance::acquire() {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                crate::i18n::Lang::from_setting(&settings.appearance.language).activate();
-                duthub_desktop::tray::single_instance::show_already_running(
-                    crate::i18n::label("alreadyRunningTitle"),
-                    crate::i18n::label("alreadyRunningBody"),
-                );
-                exit(0);
-            }
-        }
+    } else if let Ok(guard) = duthub_desktop::tray::single_instance::acquire() { Some(guard) } else {
+        crate::i18n::Lang::from_setting(&settings.appearance.language).activate();
+        duthub_desktop::tray::single_instance::show_already_running(
+            crate::i18n::label("alreadyRunningTitle"),
+            crate::i18n::label("alreadyRunningBody"),
+        );
+        exit(0);
     };
     // 工作目录解析 + 创建 + 可写校验（不可用回退默认并提示）
     let (artifact_root, workdir_notice) = match duthub_core::store::ensure_portable_work_dir(

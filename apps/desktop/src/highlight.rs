@@ -209,7 +209,7 @@ mod tests {
         segments.iter().map(|s| s.text.as_str()).collect()
     }
 
-    /// 分段三元组（text, color, is_cursor）整表比较辅助。
+    /// Helper returning `(text, color, is_cursor)` tuples for table comparison.
     fn cells(segments: &[Segment]) -> Vec<(&str, Option<&str>, bool)> {
         segments
             .iter()
@@ -295,7 +295,7 @@ mod tests {
         );
     }
 
-    /// 单条规则多处命中全部染色（find_iter 语义），中间默认色段隔开。
+    /// Colors every non-overlapping match of a single rule (`find_iter` semantics).
     #[test]
     fn single_rule_matches_everywhere() {
         let compiled = rules(&[(r"err", "#c")]);
@@ -407,9 +407,8 @@ mod tests {
         );
     }
 
-    /// 多字节行的越界光标按字符长度收敛（坑 #46 同源：cursor_char 是字符
-    /// 偏移，与字节长度混比会在多字节行尾误判）——传入字节视角下"合法"的
-    /// 偏移 9（"中文ok" 是 4 字符 / 12 字节），实际收敛为行尾虚拟空格。
+    /// Clamps out-of-range cursor columns on multibyte lines by character length
+    /// (`cursor_char` is a char offset, not a byte offset).
     #[test]
     fn multibyte_beyond_clamps_to_char_len() {
         let compiled = rules(&[(r"中文", "#a")]);

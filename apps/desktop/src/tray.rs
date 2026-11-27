@@ -32,14 +32,6 @@
 //! - A failed `TaskbarCreated` replay surfaces as [`TrayEvent::IconLost`] so the
 //!   UI can bring the window back instead of pretending everything is fine.
 
-#![cfg_attr(
-    windows,
-    expect(
-        clippy::undocumented_unsafe_blocks,
-        reason = "Win32 tray shell FFI isolated in tray.rs"
-    )
-)]
-
 use std::fmt;
 
 /// Icon/balloon severity.
@@ -113,7 +105,7 @@ pub struct TrayProbe {
 /// `respect_quiet_time` is `false` for critical device alerts: Windows drops a
 /// balloon outright when `NIIF_RESPECT_QUIET_TIME` is set during quiet time
 /// (it is not queued), so a critical alert must omit the flag or the
-/// presentation policy's "QuietTime only lets critical through" could never be
+/// presentation policy's "`QuietTime` only lets critical through" could never be
 /// honoured. Non-critical alerts keep the flag; the presentation matrix
 /// (`tray_ui::alert_presentation`) does not ask for a balloon while the gate is
 /// quiet anyway.
@@ -204,7 +196,7 @@ mod platform {
     };
     use windows::core::{BOOL, GUID, PCWSTR};
 
-    use super::*;
+    use super::{TrayEvent, TrayNotification, TrayBackend, TrayOptions, TrayError, TrayNotifyLevel, TrayProbe};
     use crate::tray_ui::{self, FLASH_INTERVAL_MS, FLASH_MAX_MS, NotificationGate};
 
     /// Tray icon resource id (`assets/app.ico`). `build.rs` embeds it as ID 1.
@@ -315,7 +307,7 @@ mod platform {
         },
     }
 
-    /// State owned by the tray thread (and by the WndProc that runs on it).
+    /// State owned by the tray thread (and by the `WndProc` that runs on it).
     struct TrayCtx {
         shared: Arc<Shared>,
         base_icon: HICON,
@@ -338,6 +330,7 @@ mod platform {
     /// The smoke test renders a few frames and exits; it must not leave a
     /// notification icon behind, so [`install`] refuses to start a tray thread in
     /// that mode and returns an inert handle instead.
+    #[must_use]
     pub fn self_test_requested() -> bool {
         std::env::args_os().any(|arg| arg.to_str() == Some("--self-test"))
     }
@@ -369,8 +362,7 @@ mod platform {
             ));
         }
         let exe_path = std::env::current_exe()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|path| path.to_string_lossy().into_owned());
         let guid = guid_from_bytes(tray_ui::identity_guid_bytes(&exe_path));
         let shared = Arc::new(Shared::new(
             guid,
@@ -422,6 +414,9 @@ mod platform {
                 // bounded chance to exit, so no bare thread is left behind.
                 let tid = shared.tray_tid.load(Ordering::SeqCst);
                 if tid != 0 {
+                    // SAFETY: `tid` is the Win32 thread id published by the tray thread
+                    // before entering its message loop; `PostThreadMessageW` safely
+                    // returns an error if the thread has already exited.
                     unsafe {
                         let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
                     }
@@ -472,6 +467,8 @@ mod platform {
             if !self.set_icon_visible(true) {
                 return false;
             }
+            // SAFETY: `main_window_valid()` verified the HWND is live; `ShowWindowAsync`
+            // is safe to call from any thread and posts the hide command asynchronously.
             unsafe {
                 let _ = ShowWindowAsync(self.main_window(), SW_HIDE);
             }
@@ -486,6 +483,8 @@ mod platform {
             if !self.enabled || !self.main_window_valid() {
                 return false;
             }
+            // SAFETY: `main_window_valid()` verified the HWND is live; `ShowWindowAsync`
+            // is thread-safe and posts the show command asynchronously.
             unsafe {
                 let _ = ShowWindowAsync(self.main_window(), SW_SHOW);
             }
@@ -494,11 +493,15 @@ mod platform {
 
         /// Whether the main window is currently visible.
         pub fn main_visible(&self) -> bool {
+            // SAFETY: `main_window_valid()` checked the HWND is non-null and valid;
+            // `IsWindowVisible` is safe for any HWND and returns `FALSE` if destroyed concurrently.
             self.main_window_valid() && unsafe { IsWindowVisible(self.main_window()).as_bool() }
         }
 
         /// Whether the main window is currently minimized to the taskbar.
         pub fn main_minimized(&self) -> bool {
+            // SAFETY: `main_window_valid()` checked the HWND is non-null and valid;
+            // `IsIconic` is safe for any HWND and returns `FALSE` if destroyed concurrently.
             self.main_window_valid() && unsafe { IsIconic(self.main_window()).as_bool() }
         }
 
@@ -515,8 +518,10 @@ mod platform {
                 uCount: 0,
                 dwTimeout: 0,
             };
+            // SAFETY: `info` is fully initialized with its exact `cbSize`, refers to
+            // a validated HWND, and lives for the entire synchronous `FlashWindowEx` call.
             unsafe {
-                let _ = FlashWindowEx(&info);
+                let _ = FlashWindowEx(&raw const info);
             }
         }
 
@@ -532,8 +537,10 @@ mod platform {
                 uCount: 0,
                 dwTimeout: 0,
             };
+            // SAFETY: `info` is fully initialized with its exact `cbSize`, refers to
+            // a validated HWND, and lives for the entire synchronous `FlashWindowEx` call.
             unsafe {
-                let _ = FlashWindowEx(&info);
+                let _ = FlashWindowEx(&raw const info);
             }
         }
 
@@ -608,8 +615,7 @@ mod platform {
             self.shared
                 .menu_labels
                 .lock()
-                .map(|labels| labels.clone())
-                .unwrap_or_default()
+                .map_or_default(|labels| labels.clone())
         }
 
         /// Starts (`true`) or stops (`false`) the blinking alert state.
@@ -691,6 +697,8 @@ mod platform {
                 }
                 let tid = self.shared.tray_tid.load(Ordering::SeqCst);
                 if tid != 0 {
+                    // SAFETY: `tid` is the Win32 thread id of the tray message-loop thread;
+                    // `PostThreadMessageW` is thread-safe and ignores an already-exited thread.
                     unsafe {
                         let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
                     }
@@ -746,8 +754,7 @@ mod platform {
             self.shared
                 .tooltip
                 .lock()
-                .map(|tooltip| tooltip.clone())
-                .unwrap_or_default()
+                .map_or_default(|tooltip| tooltip.clone())
         }
 
         fn main_window(&self) -> HWND {
@@ -755,12 +762,16 @@ mod platform {
         }
 
         fn main_window_valid(&self) -> bool {
+            // SAFETY: `IsWindow` accepts any non-null HWND value and safely reports
+            // whether the kernel still recognizes it as a live window.
             self.main_hwnd != 0 && unsafe { IsWindow(Some(self.main_window())).as_bool() }
         }
 
         fn request_command_drain(&self) {
             let tray_hwnd = self.shared.tray_hwnd.load(Ordering::SeqCst);
             if tray_hwnd != 0 {
+                // SAFETY: `tray_hwnd` is the tray host window created on the tray thread;
+                // `PostMessageW` is thread-safe and fails cleanly if the window was destroyed.
                 unsafe {
                     let _ = PostMessageW(
                         Some(HWND(tray_hwnd as *mut c_void)),
@@ -904,13 +915,16 @@ mod platform {
     /// A failed query is treated as "enabled": the balloon is unaffected either way
     /// and a missing blink is less bad than silently dropping the alert motion for
     /// people who did not turn it off.
+    #[must_use]
     pub fn animations_enabled() -> bool {
         let mut enabled = BOOL(1);
+        // SAFETY: `SPI_GETCLIENTAREAANIMATION` writes a single `BOOL` to the
+        // `pvParam` out-pointer; `enabled` is uniquely borrowed and properly aligned.
         let result = unsafe {
             SystemParametersInfoW(
                 SPI_GETCLIENTAREAANIMATION,
                 0,
-                Some(&mut enabled as *mut BOOL as *mut c_void),
+                Some(std::ptr::from_mut(&mut enabled).cast::<c_void>()),
                 SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
             )
         };
@@ -927,7 +941,10 @@ mod platform {
     /// presentation mode, full-screen D3D, locked/screen-saver, unknown — maps to
     /// [`NotificationGate::Blocked`], which suppresses the balloon and keeps the
     /// alert queued.
+    #[must_use]
     pub fn notification_gate() -> NotificationGate {
+        // SAFETY: `SHQueryUserNotificationState` takes an out-pointer managed by the
+        // `windows` crate wrapper and has no caller preconditions.
         match unsafe { SHQueryUserNotificationState() } {
             Ok(state) if state == QUNS_ACCEPTS_NOTIFICATIONS => NotificationGate::Allowed,
             Ok(state) if state == QUNS_QUIET_TIME => NotificationGate::QuietTime,
@@ -945,10 +962,13 @@ mod platform {
         ready: SyncSender<Result<(), TrayError>>,
         done: SyncSender<()>,
     ) {
+        // SAFETY: Called once on the dedicated tray thread before any message loop starts.
         let setup = unsafe { tray_setup(&shared, commands) };
         match setup {
             Ok(ctx) => {
                 let _ = ready.send(Ok(()));
+                // SAFETY: `ctx` was created by `tray_setup` on this exact thread and its
+                // `HWND` and `HICON` handles are owned exclusively by this thread.
                 unsafe { tray_run(ctx) };
             }
             Err(err) => {
@@ -958,38 +978,52 @@ mod platform {
         let _ = done.send(());
     }
 
+    /// Registers the hidden tray host window class, creates the host window, loads
+    /// tray icons, and installs the thread-local [`TrayCtx`].
+    ///
+    /// # Safety
+    ///
+    /// Must be called on the dedicated tray thread (at most once per thread) before
+    /// [`tray_run`]. The returned `Rc<TrayCtx>` owns thread-affine Win32 `HWND` and
+    /// `HICON` handles that must only be used and destroyed on this same thread.
     unsafe fn tray_setup(
         shared: &Arc<Shared>,
         commands: Receiver<TrayCommand>,
     ) -> Result<Rc<TrayCtx>, TrayError> {
-        unsafe {
-            let hmodule = GetModuleHandleW(PCWSTR::null())
-                .map_err(|err| TrayError::WindowCreate(format!("GetModuleHandleW: {err}")))?;
-            let hinst = HINSTANCE(hmodule.0);
-            let class_name = windows::core::w!("DuthubTrayHost");
-            let wnd_class = WNDCLASSW {
-                style: WNDCLASS_STYLES(0),
-                lpfnWndProc: Some(tray_wndproc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: hinst,
-                hIcon: HICON::default(),
-                hCursor: HCURSOR::default(),
-                hbrBackground: HBRUSH::default(),
-                lpszMenuName: PCWSTR::null(),
-                lpszClassName: class_name,
-            };
-            // A zero atom usually means the class already exists (a second install
-            // in this process); CreateWindowExW below reports a real failure.
-            if RegisterClassW(&wnd_class) == 0 {
-                eprintln!(
-                    "[tray] RegisterClassW returned 0; assuming the class is already registered"
-                );
-            }
+        // SAFETY: Passing `PCWSTR::null()` queries the current executable module handle.
+        let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()) }
+            .map_err(|err| TrayError::WindowCreate(format!("GetModuleHandleW: {err}")))?;
+        let hinst = HINSTANCE(hmodule.0);
+        let class_name = windows::core::w!("DuthubTrayHost");
+        let wnd_class = WNDCLASSW {
+            style: WNDCLASS_STYLES(0),
+            lpfnWndProc: Some(tray_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: HICON::default(),
+            hCursor: HCURSOR::default(),
+            hbrBackground: HBRUSH::default(),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: class_name,
+        };
+        // A zero atom usually means the class already exists (a second install
+        // in this process); CreateWindowExW below reports a real failure.
+        // SAFETY: `wnd_class` holds a valid static wide class name, current module
+        // instance, and `tray_wndproc` callback with the matching system ABI.
+        if unsafe { RegisterClassW(&raw const wnd_class) } == 0 {
+            eprintln!(
+                "[tray] RegisterClassW returned 0; assuming the class is already registered"
+            );
+        }
 
-            // Top-level (not HWND_MESSAGE) so broadcasts such as TaskbarCreated
-            // reach it; tool window + popup keeps it out of the taskbar.
-            let hwnd = CreateWindowExW(
+        // Top-level (not HWND_MESSAGE) so broadcasts such as TaskbarCreated
+        // reach it; tool window + popup keeps it out of the taskbar.
+        // SAFETY: `class_name` and window title are static NUL-terminated UTF-16
+        // literals, `hinst` is the current module, and `tray_wndproc` handles
+        // messages safely even before `TRAY_CTX` is populated.
+        let hwnd = unsafe {
+            CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 class_name,
                 windows::core::w!("duthub tray host"),
@@ -1003,47 +1037,61 @@ mod platform {
                 Some(hinst),
                 None,
             )
-            .map_err(|err| TrayError::WindowCreate(format!("CreateWindowExW: {err}")))?;
-
-            // `TaskbarCreated` must be registered before the first NIM_ADD, which
-            // happens later on this same thread.
-            let taskbar_created = RegisterWindowMessageW(windows::core::w!("TaskbarCreated"));
-            if taskbar_created == 0 {
-                eprintln!(
-                    "[tray] RegisterWindowMessageW(TaskbarCreated) failed; icon loss cannot be recovered"
-                );
-            }
-
-            let base_icon = load_icon(hinst, RESOURCE_APP_ICON).ok_or_else(|| {
-                TrayError::IconAdd(format!("resource {RESOURCE_APP_ICON} failed to load"))
-            })?;
-            let alert_icon = load_alert_icon(hinst);
-
-            shared.tray_hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
-            shared
-                .tray_tid
-                .store(GetCurrentThreadId(), Ordering::SeqCst);
-            shared
-                .taskbar_created_msg
-                .store(taskbar_created, Ordering::SeqCst);
-
-            let ctx = Rc::new(TrayCtx {
-                shared: Arc::clone(shared),
-                base_icon,
-                alert_icon,
-                flash_started: Mutex::new(None),
-                flash_lit: AtomicBool::new(false),
-                commands: Mutex::new(Some(commands)),
-                menu_active: AtomicBool::new(false),
-            });
-            TRAY_CTX.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&ctx)));
-            Ok(ctx)
         }
+        .map_err(|err| TrayError::WindowCreate(format!("CreateWindowExW: {err}")))?;
+
+        // `TaskbarCreated` must be registered before the first NIM_ADD, which
+        // happens later on this same thread.
+        // SAFETY: Static NUL-terminated UTF-16 message name.
+        let taskbar_created =
+            unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
+        if taskbar_created == 0 {
+            eprintln!(
+                "[tray] RegisterWindowMessageW(TaskbarCreated) failed; icon loss cannot be recovered"
+            );
+        }
+
+        // SAFETY: `hinst` is the valid module handle for this executable; returned
+        // `HICON`s are stored in `TrayCtx` and destroyed in `tray_run`.
+        let base_icon = unsafe { load_icon(hinst, RESOURCE_APP_ICON) }.ok_or_else(|| {
+            TrayError::IconAdd(format!("resource {RESOURCE_APP_ICON} failed to load"))
+        })?;
+        // SAFETY: Same module handle invariant; optional alert icon is destroyed in `tray_run`.
+        let alert_icon = unsafe { load_alert_icon(hinst) };
+
+        shared.tray_hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
+        // SAFETY: `GetCurrentThreadId` has no preconditions and always succeeds.
+        shared
+            .tray_tid
+            .store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+        shared
+            .taskbar_created_msg
+            .store(taskbar_created, Ordering::SeqCst);
+
+        let ctx = Rc::new(TrayCtx {
+            shared: Arc::clone(shared),
+            base_icon,
+            alert_icon,
+            flash_started: Mutex::new(None),
+            flash_lit: AtomicBool::new(false),
+            commands: Mutex::new(Some(commands)),
+            menu_active: AtomicBool::new(false),
+        });
+        TRAY_CTX.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&ctx)));
+        Ok(ctx)
     }
 
+    /// Loads a small icon resource from `hinst` by integer resource ID.
+    ///
+    /// # Safety
+    ///
+    /// `hinst` must be a valid module handle for the current process. The caller
+    /// takes ownership of the returned `HICON` and must release it with `DestroyIcon`.
     unsafe fn load_icon(hinst: HINSTANCE, resource_id: u16) -> Option<HICON> {
         // MAKEINTRESOURCEW: the low word carries the resource id, no string table.
         let name = PCWSTR(resource_id as usize as *const u16);
+        // SAFETY: `hinst` is guaranteed valid by the caller and `name` is an integer
+        // resource identifier (`MAKEINTRESOURCEW`) accepted by `LoadIconMetric`.
         match unsafe { LoadIconMetric(Some(hinst), name, LIM_SMALL) } {
             Ok(icon) => Some(icon),
             Err(err) => {
@@ -1059,30 +1107,48 @@ mod platform {
     /// Otherwise a private copy of the system warning icon is used so the blink
     /// still reads as a warning without ever painting the normal app icon as the
     /// "alert" frame. `None` means "no blink, balloon only".
+    ///
+    /// # Safety
+    ///
+    /// `hinst` must be a valid module handle for the current process. The caller
+    /// takes ownership of the returned `HICON` (always a private icon or copy) and
+    /// must release it with `DestroyIcon`.
     unsafe fn load_alert_icon(hinst: HINSTANCE) -> Option<HICON> {
+        // SAFETY: `hinst` is guaranteed valid by the caller.
         if let Some(icon) = unsafe { load_icon(hinst, RESOURCE_ALERT_ICON) } {
             return Some(icon);
         }
+        // SAFETY: `IDI_WARNING` is a predefined system icon identifier with `None` hInstance.
         let shared = unsafe { LoadIconW(None, IDI_WARNING) };
-        match shared.map(|icon| unsafe { CopyIcon(icon) }) {
-            Ok(Ok(copy)) => Some(copy),
-            _ => {
-                eprintln!("[tray] no alert icon available; the alert will use the balloon only");
-                None
-            }
+        // SAFETY: `CopyIcon` clones the shared system icon into a private `HICON` that
+        // can safely be destroyed via `DestroyIcon`.
+        if let Ok(Ok(copy)) = shared.map(|icon| unsafe { CopyIcon(icon) }) { Some(copy) } else {
+            eprintln!("[tray] no alert icon available; the alert will use the balloon only");
+            None
         }
     }
 
+    /// Runs the tray thread's Win32 message loop until `WM_QUIT`, then tears down
+    /// the tray icon, hidden host window, and owned `HICON` handles.
+    ///
+    /// # Safety
+    ///
+    /// Must be called on the same thread that created `ctx` via [`tray_setup`], and
+    /// at most once per `ctx`. After this function returns, `ctx`'s `HWND` and
+    /// `HICON` handles have been destroyed and must not be reused.
     unsafe fn tray_run(ctx: Rc<TrayCtx>) {
         let mut msg = MSG::default();
         loop {
-            let received = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+            // SAFETY: `msg` is uniquely borrowed and properly aligned; `GetMessageW`
+            // pumps the current thread's message queue.
+            let received = unsafe { GetMessageW(&raw mut msg, None, 0, 0) };
             if received.0 == 0 || received.0 == -1 {
                 break;
             }
+            // SAFETY: `msg` was populated by `GetMessageW` on this thread.
             unsafe {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+                let _ = TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
             }
         }
 
@@ -1090,11 +1156,14 @@ mod platform {
         // messages that must not reach a WndProc whose icons are being freed.
         let taken = TRAY_CTX.with(|slot| slot.borrow_mut().take());
         let hwnd = HWND(ctx.shared.tray_hwnd.load(Ordering::SeqCst) as *mut c_void);
+        // SAFETY: Runs exclusively on the tray thread after detaching `TRAY_CTX` so
+        // `tray_wndproc` cannot observe destroyed icons during `DestroyWindow`.
+        // `hwnd`, `base_icon`, and `alert_icon` are owned by this thread and freed once.
         unsafe {
             let _ = KillTimer(Some(hwnd), FLASH_TIMER_ID);
             if ctx.shared.icon_added.load(Ordering::SeqCst) {
                 let nid = ctx.nid_with_flags(NIF_GUID);
-                let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+                let _ = Shell_NotifyIconW(NIM_DELETE, &raw const nid);
                 ctx.shared.icon_added.store(false, Ordering::SeqCst);
             }
             let _ = DestroyWindow(hwnd);
@@ -1109,6 +1178,13 @@ mod platform {
         drop(taken);
     }
 
+    /// Win32 window procedure for the hidden tray host window.
+    ///
+    /// # Safety
+    ///
+    /// Invoked only by the Windows message dispatcher (`DispatchMessageW` /
+    /// `SendMessageW`) on the tray thread with valid Win32 window-procedure
+    /// arguments (`hwnd`, `msg`, `wparam`, `lparam`).
     unsafe extern "system" fn tray_wndproc(
         hwnd: HWND,
         msg: u32,
@@ -1121,6 +1197,8 @@ mod platform {
         {
             return result;
         }
+        // SAFETY: Forwards unhandled messages to Win32's default window procedure
+        // using the exact arguments provided by the OS dispatcher.
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
@@ -1159,6 +1237,8 @@ mod platform {
                     Some(LRESULT(0))
                 }
                 WM_DESTROY => {
+                    // SAFETY: Called on the tray thread while its host window is being
+                    // destroyed; posts `WM_QUIT` to terminate the thread's `GetMessageW` loop.
                     unsafe { PostQuitMessage(0) };
                     Some(LRESULT(0))
                 }
@@ -1172,8 +1252,7 @@ mod platform {
             let flash_active = self
                 .flash_started
                 .lock()
-                .map(|started| started.is_some())
-                .unwrap_or(false);
+                .is_ok_and(|started| started.is_some());
             if tray_ui::flash_stops_for_animation_change(flash_active, animations_enabled()) {
                 self.stop_flash();
             }
@@ -1193,8 +1272,7 @@ mod platform {
             self.shared
                 .menu_labels
                 .lock()
-                .map(|labels| labels.clone())
-                .unwrap_or_default()
+                .map_or_default(|labels| labels.clone())
         }
 
         /// Bottom-left corner of the hosted icon, used to place the menu when the
@@ -1262,9 +1340,14 @@ mod platform {
             let (x, y) = anchor
                 .or_else(|| self.icon_anchor())
                 .unwrap_or_else(cursor_position);
+            // SAFETY: `hwnd` is the live tray host window owned by this thread;
+            // setting it foreground is required by Win32 before `TrackPopupMenuEx`.
             unsafe {
                 let _ = SetForegroundWindow(hwnd);
             }
+            // SAFETY: `menu` is a valid `HMENU` built by `build_tray_menu`, `hwnd` is
+            // the live tray host window on this thread, and `menu_active` prevents
+            // re-entrant popup invocation.
             let command = unsafe {
                 TrackPopupMenuEx(
                     menu,
@@ -1275,6 +1358,8 @@ mod platform {
                     None,
                 )
             };
+            // SAFETY: `hwnd` is the tray host window and `menu` is exclusively owned
+            // by this function and destroyed once after `TrackPopupMenuEx` returns.
             unsafe {
                 // Required so the menu closes when the user clicks elsewhere.
                 let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
@@ -1284,8 +1369,10 @@ mod platform {
             if command == 0 {
                 // Dismissed: hand focus back to the notification area.
                 let nid = self.nid_with_flags(NIF_GUID);
+                // SAFETY: `nid` is fully initialized with `cbSize` and valid `hWnd`/GUID
+                // and remains alive for the synchronous `Shell_NotifyIconW` call.
                 unsafe {
-                    let _ = Shell_NotifyIconW(NIM_SETFOCUS, &nid);
+                    let _ = Shell_NotifyIconW(NIM_SETFOCUS, &raw const nid);
                 }
             } else if let Some(event) = menu_command_event(command) {
                 self.push_event(event);
@@ -1316,6 +1403,7 @@ mod platform {
             if disconnected {
                 // The UI side dropped its handle without removing the tray; end the
                 // loop instead of spinning on a dead channel.
+                // SAFETY: Runs on the tray thread; posts `WM_QUIT` to exit its message loop.
                 unsafe { PostQuitMessage(0) };
             }
         }
@@ -1374,20 +1462,24 @@ mod platform {
         fn try_add_icon(&self) -> bool {
             let nid =
                 self.nid_with_flags(NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID | NIF_SHOWTIP);
-            if !unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool() {
+            // SAFETY: `nid` is initialized with `cbSize`, a live tray `hWnd`, valid
+            // `HICON`, and NUL-terminated UTF-16 `szTip` for the synchronous call.
+            if !unsafe { Shell_NotifyIconW(NIM_ADD, &raw const nid) }.as_bool() {
                 return false;
             }
             let mut version = self.nid_with_flags(NIF_GUID);
             version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            // SAFETY: `version` is initialized with `cbSize` and `NIF_GUID` for the call.
             unsafe {
-                let _ = Shell_NotifyIconW(NIM_SETVERSION, &version);
+                let _ = Shell_NotifyIconW(NIM_SETVERSION, &raw const version);
             }
             true
         }
 
         fn delete_icon(&self) -> bool {
             let nid = self.nid_with_flags(NIF_GUID);
-            unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) }.as_bool()
+            // SAFETY: `nid` is initialized with `cbSize` and `NIF_GUID` for the call.
+            unsafe { Shell_NotifyIconW(NIM_DELETE, &raw const nid) }.as_bool()
         }
 
         fn apply_alert(&self, alerting: bool) {
@@ -1422,8 +1514,7 @@ mod platform {
             let running = self
                 .flash_started
                 .lock()
-                .map(|started| started.is_some())
-                .unwrap_or(false);
+                .is_ok_and(|started| started.is_some());
             if running {
                 return;
             }
@@ -1431,6 +1522,8 @@ mod platform {
                 *started = Some(Instant::now());
             }
             self.flash_lit.store(false, Ordering::SeqCst);
+            // SAFETY: `hwnd` is the live tray host window owned by this thread;
+            // `None` timer proc delivers `WM_TIMER` to `tray_wndproc`.
             unsafe {
                 SetTimer(Some(hwnd), FLASH_TIMER_ID, FLASH_INTERVAL_MS as u32, None);
             }
@@ -1439,6 +1532,7 @@ mod platform {
         fn stop_flash(&self) {
             self.shared.alerting.store(false, Ordering::SeqCst);
             if let Some(hwnd) = self.tray_hwnd() {
+                // SAFETY: `hwnd` is the live tray host window owned by this thread.
                 unsafe {
                     let _ = KillTimer(Some(hwnd), FLASH_TIMER_ID);
                 }
@@ -1456,6 +1550,7 @@ mod platform {
             let started = self.flash_started.lock().ok().and_then(|started| *started);
             let Some(started) = started else {
                 if let Some(hwnd) = self.tray_hwnd() {
+                    // SAFETY: `hwnd` is the live tray host window owned by this thread.
                     unsafe {
                         let _ = KillTimer(Some(hwnd), FLASH_TIMER_ID);
                     }
@@ -1481,8 +1576,10 @@ mod platform {
             }
             let mut nid = self.nid_with_flags(NIF_ICON | NIF_GUID);
             nid.hIcon = icon;
+            // SAFETY: `nid` is fully initialized with a live `HICON` owned by `TrayCtx`
+            // on this thread and valid `cbSize`.
             unsafe {
-                let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &raw const nid);
             }
         }
 
@@ -1491,8 +1588,9 @@ mod platform {
                 return;
             }
             let nid = self.nid_with_flags(NIF_TIP | NIF_SHOWTIP | NIF_GUID);
+            // SAFETY: `nid` is initialized with `cbSize` and NUL-terminated `szTip`.
             unsafe {
-                let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &raw const nid);
             }
         }
 
@@ -1510,7 +1608,9 @@ mod platform {
             nid.dwInfoFlags = flags;
             copy_utf16(&mut nid.szInfoTitle, &notification.title, TITLE_MAX_UNITS);
             copy_utf16(&mut nid.szInfo, &notification.body, BODY_MAX_UNITS);
-            if unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) }.as_bool() {
+            // SAFETY: `nid` is initialized with `cbSize` and NUL-terminated UTF-16
+            // `szInfoTitle` and `szInfo` buffers.
+            if unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const nid) }.as_bool() {
                 self.shared.balloons_sent.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -1565,6 +1665,8 @@ mod platform {
     }
 
     fn build_tray_menu(show_label: &str, quit_label: &str) -> Option<HMENU> {
+        // SAFETY: `CreatePopupMenu` has no preconditions; the returned `HMENU` is
+        // owned by the caller (or destroyed below on failure).
         let menu = unsafe { CreatePopupMenu() }.ok()?;
         let show: Vec<u16> = show_label
             .encode_utf16()
@@ -1574,12 +1676,15 @@ mod platform {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
+        // SAFETY: `menu` is a live `HMENU` created above; `show` and `quit` are
+        // NUL-terminated UTF-16 buffers that outlive the `AppendMenuW` calls.
         let built = unsafe {
             AppendMenuW(menu, MF_STRING, MENU_SHOW_ID, PCWSTR(show.as_ptr())).is_ok()
                 && AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()).is_ok()
                 && AppendMenuW(menu, MF_STRING, MENU_QUIT_ID, PCWSTR(quit.as_ptr())).is_ok()
         };
         if !built {
+            // SAFETY: `menu` is exclusively owned here and not returned on failure.
             unsafe {
                 let _ = DestroyMenu(menu);
             }
@@ -1612,7 +1717,8 @@ mod platform {
     /// and the user can move it, so this is not worth aborting.
     fn cursor_position() -> (i32, i32) {
         let mut cursor = POINT::default();
-        let _ = unsafe { GetCursorPos(&mut cursor) };
+        // SAFETY: `cursor` is uniquely borrowed and properly aligned out-parameter.
+        let _ = unsafe { GetCursorPos(&raw mut cursor) };
         (cursor.x, cursor.y)
     }
 
@@ -1623,7 +1729,8 @@ mod platform {
             uID: 0,
             guidItem: guid,
         };
-        match unsafe { Shell_NotifyIconGetRect(&identifier) } {
+        // SAFETY: `identifier` is initialized with `cbSize` and lives for the call.
+        match unsafe { Shell_NotifyIconGetRect(&raw const identifier) } {
             Ok(rect) => Some([rect.left, rect.top, rect.right, rect.bottom]),
             Err(_) => None,
         }
@@ -1645,6 +1752,7 @@ mod platform {
     /// `0` (dismissed) maps to `None`; the caller then returns focus to the
     /// notification area instead of acting.
     #[doc(hidden)]
+    #[must_use]
     pub fn menu_command_event(command: usize) -> Option<TrayEvent> {
         match command {
             MENU_SHOW_ID => Some(TrayEvent::Show),
@@ -1659,9 +1767,12 @@ mod platform {
     /// modal menu (which needs a human). Returns `None` if the menu could not be
     /// created.
     #[doc(hidden)]
+    #[must_use]
     pub fn test_menu_layout(options: &TrayOptions) -> Option<Vec<usize>> {
         let menu = build_tray_menu(&options.show_label, &options.quit_label)?;
         let mut ids = Vec::new();
+        // SAFETY: `menu` is a valid `HMENU` exclusively owned by this function and
+        // destroyed once after querying its item ids.
         unsafe {
             let count = GetMenuItemCount(Some(menu));
             for index in 0..count {

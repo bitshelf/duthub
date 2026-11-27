@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Context, LogLine, SharedString, i18n, LineKind, AppContext, prepare_paste_bytes, FluentBuilder, Point, Pixels, Window, Styled, px, DEFAULT_TERMINAL_FONT_SIZE, terminal_col_for_x, MouseDownEvent, InteractiveElement, LinkState};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -119,11 +119,11 @@ impl Workbench {
         Some((annotations, rows_len, item_count, is_device))
     }
 
-    pub(super) fn terminal_item_text<'a>(
-        &'a self,
+    pub(super) fn terminal_item_text(
+        &self,
         session_idx: usize,
         item_idx: usize,
-    ) -> Option<std::borrow::Cow<'a, str>> {
+    ) -> Option<std::borrow::Cow<'_, str>> {
         let session = self.sessions.get(session_idx)?;
         let (annotations, rows_len, item_count, is_device) =
             self.terminal_item_layout(session_idx)?;
@@ -219,8 +219,7 @@ impl Workbench {
         };
         let row_text = self
             .terminal_item_text(session_idx, point.row)
-            .map(std::borrow::Cow::into_owned)
-            .unwrap_or_default();
+            .map_or_default(std::borrow::Cow::into_owned);
         let selection = match ev.click_count {
             0 | 1 => TerminalSelection::start_char(point),
             2 => TerminalSelection::start_word(point.row, point.col, &row_text),
@@ -258,8 +257,7 @@ impl Workbench {
         };
         let row_text = self
             .terminal_item_text(active, point.row)
-            .map(std::borrow::Cow::into_owned)
-            .unwrap_or_default();
+            .map_or_default(std::borrow::Cow::into_owned);
         if let Some(session) = self.sessions.get_mut(active)
             && let Some(selection) = session.selection.as_mut()
             && selection.update(point, &row_text)

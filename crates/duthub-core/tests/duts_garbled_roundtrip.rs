@@ -12,8 +12,8 @@ fn empty_duts() -> DutsFile {
         version: 1,
         hosts: Vec::new(),
         relay_boards: Vec::new(),
-        alerts_by_dut: Default::default(),
-        garbled_by_dut: Default::default(),
+        alerts_by_dut: std::collections::BTreeMap::new(),
+        garbled_by_dut: std::collections::BTreeMap::new(),
         duts: Vec::new(),
     }
 }

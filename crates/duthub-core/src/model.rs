@@ -55,6 +55,7 @@ pub struct SettingsFile {
 }
 
 impl SettingsFile {
+    #[must_use]
     pub fn dut_storage_gib(&self) -> u32 {
         self.dut_storage_gib
             .filter(|limit| *limit > 0)
@@ -192,6 +193,10 @@ pub struct Appearance {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "flat JSON settings schema preserved for settings.json compatibility"
+)]
 pub struct TerminalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
@@ -240,6 +245,10 @@ fn serial_is_default(serial: &SerialSettings) -> bool {
     serial == &SerialSettings::default()
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -285,6 +294,7 @@ impl Default for PromptRule {
 /// rule anchors at the end of the row. Callers seed these only when the user
 /// has no rules configured; every entry stays editable, disableable and
 /// deletable like a hand-written one.
+#[must_use]
 pub fn default_highlight_rules() -> Vec<PromptRule> {
     vec![
         PromptRule {
@@ -413,7 +423,7 @@ fn is_default_hdc(tool: &str) -> bool {
 pub struct ToolsSettings {
     #[serde(default = "default_adb")]
     pub adb_executable: String,
-    /// OpenHarmony hdc 可执行文件（PATH 命令名或绝对路径）
+    /// `OpenHarmony` hdc 可执行文件（PATH 命令名或绝对路径）
     #[serde(default = "default_hdc", skip_serializing_if = "is_default_hdc")]
     pub hdc_executable: String,
     #[serde(default, skip_serializing_if = "capture_is_empty")]
@@ -480,6 +490,10 @@ fn download_proxy_is_default(proxy: &DownloadProxySettings) -> bool {
     proxy == &DownloadProxySettings::default()
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn proxy_mode_is_default(mode: &DownloadProxyMode) -> bool {
     *mode == DownloadProxyMode::default()
 }
@@ -489,7 +503,7 @@ fn proxy_mode_is_default(mode: &DownloadProxyMode) -> bool {
 pub enum DownloadProxyMode {
     /// Direct connection: ignore proxy environment variables entirely.
     Off,
-    /// Follow the standard proxy environment variables (HTTP_PROXY etc.).
+    /// Follow the standard proxy environment variables (`HTTP_PROXY` etc.).
     #[default]
     Env,
     /// Force the configured proxy URL (http/https/socks5).
@@ -508,6 +522,7 @@ pub struct DutMediaConfig {
 }
 
 impl DutMediaConfig {
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled != Some(false)
             && (self.hdmi != CaptureInput::default()
@@ -541,6 +556,7 @@ pub struct CaptureInput {
 }
 
 impl CaptureInput {
+    #[must_use]
     pub fn same_capture(&self, other: &Self) -> bool {
         self.is_enabled() == other.is_enabled()
             && self.video == other.video
@@ -550,11 +566,13 @@ impl CaptureInput {
             && self.port == other.port
     }
 
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
             .unwrap_or_else(|| !self.video.trim().is_empty())
     }
 
+    #[must_use]
     pub fn has_video(&self) -> bool {
         self.is_enabled() && !self.video.trim().is_empty()
     }
@@ -647,6 +665,7 @@ impl DutsFile {
         }
     }
 
+    #[must_use]
     pub fn resolve_relay(&self, relay: &RelayConfig) -> RelayConfig {
         let RelayConfig::UsbBoard { board_id, channels } = relay else {
             return relay.clone();
@@ -791,6 +810,7 @@ impl Default for AdbConfig {
 }
 
 impl AdbConfig {
+    #[must_use]
     pub fn auto_detect(&self) -> bool {
         self.tool != "hdc" && self.mode == "auto"
     }
@@ -938,7 +958,7 @@ mod tests {
     fn flash_preset_parses_without_id() {
         let raw = r#"{"name":"upgrade_tool","executable":"upgrade_tool","testArgs":"--help"}"#;
         let preset: FlashToolPreset = serde_json::from_str(raw).unwrap();
-        assert!(preset.id.is_empty());
+        assert_eq!(preset.id, "");
         assert_eq!(preset.test_args, "--help");
     }
 
@@ -970,12 +990,12 @@ mod tests {
         let legacy: DutConfig = serde_json::from_value(serde_json::json!({
             "id": "dut-a",
             "name": "RK3576",
-            "serial": {"host": "local", "port": "COM8", "baud": 115200, "format": "8N1"}
+            "serial": {"host": "local", "port": "COM8", "baud": 115_200, "format": "8N1"}
         }))
         .unwrap();
         assert!(!legacy.a2a.enabled);
         assert_eq!(legacy.a2a.port, 8790);
-        assert!(legacy.a2a.agent_name.is_empty());
+        assert_eq!(legacy.a2a.agent_name, "");
 
         let back = serde_json::to_value(&legacy).unwrap();
         assert!(back.get("a2a").is_none(), "默认 a2a 段必须省略: {back}");
@@ -996,7 +1016,7 @@ mod tests {
         let base_json = serde_json::json!({
             "id": "dut-a",
             "name": "RK3576",
-            "serial": {"host": "local", "port": "COM8", "baud": 115200, "format": "8N1"}
+            "serial": {"host": "local", "port": "COM8", "baud": 115_200, "format": "8N1"}
         });
 
         // 缺省 = None，序列化省略 bindAddr（默认 a2a 段整体省略的口径不变）。
@@ -1032,7 +1052,10 @@ mod tests {
             rules.iter().map(|rule| rule.color.as_str()).collect();
         assert_eq!(colors.len(), 3, "三类语义应各有一种颜色");
         // 空串与默认值保持原契约（播种只发生在 load 路径，roundtrip 不受影响）
-        assert!(SerialSettings::default().highlight_rules.is_empty());
+        assert_eq!(
+            SerialSettings::default().highlight_rules,
+            Vec::<PromptRule>::new()
+        );
     }
 
     #[test]
@@ -1040,7 +1063,7 @@ mod tests {
         // 旧 settings.json 无 alerts 段 → 默认开启、无抑制
         let legacy: AlertSettings = serde_json::from_str("{}").unwrap();
         assert!(legacy.enabled);
-        assert!(legacy.suppressed_sources.is_empty());
+        assert_eq!(legacy.suppressed_sources, Vec::<String>::new());
         // 往返必须写 camelCase 键（snake_case 会被静默丢弃落 default，坑 #15）
         let value = serde_json::json!({
             "enabled": false,

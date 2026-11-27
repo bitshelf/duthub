@@ -23,17 +23,21 @@ pub const APPROVAL_TTL_SECS: u64 = 300;
 /// 进程内审批指纹环容量（长期运行的 MCP 进程不无限增长）。
 const AUDIT_TAIL_CAP: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ApprovalError {
-    /// 未携带 token
+    /// Missing approval token.
+    #[error("缺少审批令牌：先调用 approval.request 签发")]
     Missing,
-    /// token 不存在（过期或已使用）
+    /// Unknown, expired, or already-consumed approval token.
+    #[error("审批令牌无效或已使用/过期：重新调用 approval.request")]
     Unknown,
-    /// dut / action / 参数哈希 与签发时不匹配
+    /// Token does not match the requested DUT, action, or argument hash.
+    #[error("审批令牌与本次操作的 dut/action/参数不匹配")]
     Mismatch,
 }
 
 impl ApprovalError {
+    #[must_use]
     pub fn message(&self) -> &'static str {
         match self {
             ApprovalError::Missing => "缺少审批令牌：先调用 approval.request 签发",
@@ -73,6 +77,7 @@ pub struct ApprovalFingerprint {
 
 impl ApprovalFingerprint {
     /// One-line summary for the audit tail and `AuditSink` detail.
+    #[must_use]
     pub fn summary(&self) -> String {
         format!(
             "token_sha256={} dut={} action={} args_sha256={}",
@@ -81,6 +86,7 @@ impl ApprovalFingerprint {
     }
 }
 
+#[must_use]
 pub fn args_hash(dut_id: &str, action: &str, args_json: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(dut_id.as_bytes());
@@ -104,6 +110,16 @@ pub struct ApprovalManager {
     audit_sink: Option<Arc<AuditSink>>,
 }
 
+impl std::fmt::Debug for ApprovalManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pending = crate::util::lock_unpoisoned(&self.entries).len();
+        f.debug_struct("ApprovalManager")
+            .field("pending", &pending)
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for ApprovalManager {
     fn default() -> Self {
         Self::new()
@@ -111,6 +127,7 @@ impl Default for ApprovalManager {
 }
 
 impl ApprovalManager {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
@@ -122,6 +139,7 @@ impl ApprovalManager {
 
     /// Attach the authoritative audit sink (desktop runtime); issue/consume then
     /// emit `approval.issue` / `approval.consume` events with fingerprints only.
+    #[must_use]
     pub fn with_audit(mut self, sink: Arc<AuditSink>) -> Self {
         self.audit_sink = Some(sink);
         self
@@ -135,7 +153,7 @@ impl ApprovalManager {
         let hash = args_hash(dut_id, action, args_json);
         let token = format!("apr-{}", generate_token());
         {
-            let mut entries = self.entries.lock().unwrap();
+            let mut entries = crate::util::lock_unpoisoned(&self.entries);
             entries.retain(|_, entry| entry.issued.elapsed() <= self.ttl);
             entries.insert(
                 token.clone(),
@@ -191,7 +209,7 @@ impl ApprovalManager {
         if token.trim().is_empty() {
             return Err(ApprovalError::Missing);
         }
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = crate::util::lock_unpoisoned(&self.entries);
         let Some(entry) = entries.get(token) else {
             return Err(ApprovalError::Unknown);
         };
@@ -212,7 +230,7 @@ impl ApprovalManager {
         if token.trim().is_empty() {
             return Err(ApprovalError::Missing);
         }
-        let Some(entry) = self.entries.lock().unwrap().remove(token) else {
+        let Some(entry) = crate::util::lock_unpoisoned(&self.entries).remove(token) else {
             return Err(ApprovalError::Unknown);
         };
         let fingerprint = ApprovalFingerprint {
@@ -227,7 +245,7 @@ impl ApprovalManager {
 
     /// 审计日志（近期记录；只含指纹，绝不含明文令牌）。
     pub fn audit_tail(&self, limit: usize) -> Vec<String> {
-        let audit = self.audit.lock().unwrap();
+        let audit = crate::util::lock_unpoisoned(&self.audit);
         audit
             .iter()
             .rev()
@@ -239,7 +257,7 @@ impl ApprovalManager {
 
     fn record_fingerprint(&self, action: &str, fingerprint: &ApprovalFingerprint) {
         {
-            let mut audit = self.audit.lock().unwrap();
+            let mut audit = crate::util::lock_unpoisoned(&self.audit);
             if audit.len() >= AUDIT_TAIL_CAP {
                 audit.pop_front();
             }
@@ -284,7 +302,7 @@ mod tests {
             Err(ApprovalError::Mismatch)
         );
         assert_eq!(
-            mgr.validate(&token.token, "dut-a", "control.reset", r#"{}"#),
+            mgr.validate(&token.token, "dut-a", "control.reset", "{}"),
             Err(ApprovalError::Mismatch)
         );
         assert_eq!(

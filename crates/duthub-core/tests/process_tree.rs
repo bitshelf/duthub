@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 use duthub_core::error::DeviceError;
 use duthub_core::process::{ProcessRunner, RealProcessRunner};
 
-/// 孙进程持有输出管道的时长（必须显著大于 DRAIN_TIMEOUT + 测试断言上限）。
+/// 孙进程持有输出管道的时长（必须显著大于 `DRAIN_TIMEOUT` + 测试断言上限）。
 const HOLD_SECS: u64 = 12;
 /// 回归测试给执行器的超时。
 const RUN_TIMEOUT: Duration = Duration::from_secs(3);
-/// 修复后 run() 必须有界返回的上限（远小于 HOLD_SECS）。
+/// 修复后 `run()` 必须有界返回的上限（远小于 `HOLD_SECS`）。
 const BOUND: Duration = Duration::from_secs(9);
 
 /// 当前进程是否以"假工具模式"被子调用拉起。
@@ -29,7 +29,7 @@ fn is_fake_tool_mode() -> bool {
         .any(|arg| arg == "--exact")
 }
 
-/// 以假工具模式拉起本二进制：只运行指定测试（孙进程持有输出管道 HOLD_SECS）。
+/// 以假工具模式拉起本二进制：只运行指定测试（孙进程持有输出管道 `HOLD_SECS`）。
 fn spawn_hold_child() -> std::process::Child {
     let exe = std::env::current_exe().expect("测试二进制路径");
     Command::new(exe)
@@ -44,7 +44,7 @@ fn spawn_hold_child() -> std::process::Child {
 // 假工具模式（仅子调用时执行实际逻辑）
 // ---------------------------------------------------------------------------
 
-/// 假工具模式：持有输出管道 HOLD_SECS 后退出（管道写端因此被长期占用）。
+/// 假工具模式：持有输出管道 `HOLD_SECS` 后退出（管道写端因此被长期占用）。
 #[test]
 fn fake_tool_hold_output() {
     if !is_fake_tool_mode() {
@@ -60,20 +60,26 @@ fn fake_tool_spawn_and_exit() {
     if !is_fake_tool_mode() {
         return;
     }
-    // 故意不 wait：本测试模拟"父进程立即退出"，孙进程持有继承的管道。
-    #[allow(clippy::zombie_processes)]
+    // Intentionally not waited: simulates a parent exiting while a grandchild holds inherited pipes.
+    #[expect(
+        clippy::zombie_processes,
+        reason = "test intentionally exits parent without waiting on grandchild"
+    )]
     let _child = spawn_hold_child();
     println!("fake-tool parent exits immediately");
 }
 
-/// 假工具模式：父进程长驻（长于执行器超时），用于验证超时终止进程树。
+/// Fake tool mode: parent stays alive longer than runner timeout to test tree termination.
 #[test]
 fn fake_tool_hang_parent() {
     if !is_fake_tool_mode() {
         return;
     }
-    // 故意不 wait：父进程由执行器按超时整树终止，wait() 永远不会到达。
-    #[allow(clippy::zombie_processes)]
+    // Intentionally not waited: the runner kills the whole process tree on timeout.
+    #[expect(
+        clippy::zombie_processes,
+        reason = "runner terminates the process tree before wait() could ever run"
+    )]
     let _child = spawn_hold_child();
     std::thread::sleep(Duration::from_secs(60));
 }
@@ -99,8 +105,8 @@ fn harness_args(test: &str) -> Vec<String> {
     ]
 }
 
-/// 主进程正常退出但孙进程持有输出管道：run() 必须有界返回（旧行为会阻塞
-/// 到孙进程退出，约 HOLD_SECS）。
+/// 主进程正常退出但孙进程持有输出管道：`run()` 必须有界返回（旧行为会阻塞
+/// 到孙进程退出，约 `HOLD_SECS`）。
 #[test]
 fn runner_returns_when_grandchild_holds_pipe() {
     let runner = RealProcessRunner;
@@ -121,8 +127,8 @@ fn runner_returns_when_grandchild_holds_pipe() {
     }
 }
 
-/// 父进程长驻超过超时：执行器必须按进程树终止并在远小于 HOLD_SECS 的时间内返回。
-/// 旧行为只杀主进程，孙进程持有管道会把读取线程拖到约 HOLD_SECS。
+/// 父进程长驻超过超时：执行器必须按进程树终止并在远小于 `HOLD_SECS` 的时间内返回。
+/// 旧行为只杀主进程，孙进程持有管道会把读取线程拖到约 `HOLD_SECS`。
 #[test]
 fn runner_timeout_kills_tree() {
     let runner = RealProcessRunner;
@@ -161,9 +167,6 @@ fn runner_normal_exit_still_ok() {
 #[cfg(windows)]
 #[test]
 fn fake_tool_console_state() {
-    if !is_fake_tool_mode() {
-        return;
-    }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetConsoleWindow() -> *mut std::ffi::c_void;
@@ -172,6 +175,9 @@ fn fake_tool_console_state() {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn IsWindowVisible(window: *mut std::ffi::c_void) -> i32;
+    }
+    if !is_fake_tool_mode() {
+        return;
     }
     let mut processes = [0; 2];
     // SAFETY: The array is writable for the provided capacity, and IsWindowVisible
@@ -183,7 +189,10 @@ fn fake_tool_console_state() {
             "后台工具不能显示控制台"
         );
         assert!(
-            GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) <= 1,
+            GetConsoleProcessList(
+                processes.as_mut_ptr(),
+                u32::try_from(processes.len()).unwrap()
+            ) <= 1,
             "后台工具不能继承父进程控制台"
         );
     }

@@ -37,9 +37,9 @@ fn status_of(response: &str) -> u16 {
 }
 
 fn post_request(path: &str, metadata: &str, token: Option<&str>) -> String {
-    let authorization = token
-        .map(|token| format!("Authorization: Bearer {token}\r\n"))
-        .unwrap_or_default();
+    let authorization = token.map_or_else(String::new, |token| {
+        format!("Authorization: Bearer {token}\r\n")
+    });
     format!(
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{authorization}Tus-Resumable: 1.0.0\r\n\
          Upload-Length: 4\r\nUpload-Metadata: {metadata}\r\nContent-Length: 0\r\n\

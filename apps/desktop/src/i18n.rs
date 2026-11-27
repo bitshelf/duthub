@@ -54,10 +54,16 @@ pub struct Lang(usize);
 
 impl Lang {
     #[cfg(test)]
-    #[allow(non_upper_case_globals)]
+    #[expect(
+        non_upper_case_globals,
+        reason = "matches locale enum-variant naming used across i18n unit tests"
+    )]
     const ZhCn: Self = Self(0);
     #[cfg(test)]
-    #[allow(non_upper_case_globals)]
+    #[expect(
+        non_upper_case_globals,
+        reason = "matches locale enum-variant naming used across i18n unit tests"
+    )]
     const EnUs: Self = Self(1);
 
     pub fn from_setting(value: &str) -> Lang {

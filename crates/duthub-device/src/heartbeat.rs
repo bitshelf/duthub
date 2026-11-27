@@ -101,6 +101,13 @@ pub struct HeartbeatService {
     config_changed: AtomicBool,
 }
 
+impl std::fmt::Debug for HeartbeatService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeartbeatService").finish_non_exhaustive()
+    }
+}
+
+#[must_use]
 pub fn now_unix_ms() -> u64 {
     duthub_core::util::unix_ms()
 }
@@ -144,8 +151,9 @@ impl HeartbeatService {
     }
 
     /// 挂持久化钩子（builder）。
+    #[must_use]
     pub fn with_persist(self, hook: HeartbeatPersistHook) -> Self {
-        *self.persist.lock().unwrap() = Some(hook);
+        *duthub_core::util::lock_unpoisoned(&self.persist) = Some(hook);
         self
     }
 
@@ -169,7 +177,7 @@ impl HeartbeatService {
 
     /// 最近一次状态（None 尚未探测 / Some(ok)）。
     pub fn state(&self, dut_id: &str) -> Option<HeartbeatState> {
-        self.states.lock().unwrap().get(dut_id).cloned()
+        duthub_core::util::lock_unpoisoned(&self.states).get(dut_id).cloned()
     }
 
     pub fn state_or_default(&self, dut_id: &str) -> HeartbeatState {
@@ -191,13 +199,13 @@ impl HeartbeatService {
         dut_id: &str,
         update: impl FnOnce(HeartbeatConfig) -> HeartbeatConfig,
     ) -> Result<HeartbeatConfig, String> {
-        let _tick_guard = self.ticking.lock().unwrap();
+        let _tick_guard = duthub_core::util::lock_unpoisoned(&self.ticking);
         let config = update(self.config(dut_id));
         let cfg = HeartbeatConfig {
             interval_secs: config.normalized_interval(),
             ..config
         };
-        let hook = self.persist.lock().unwrap().clone();
+        let hook = duthub_core::util::lock_unpoisoned(&self.persist).clone();
         if let Some(hook) = &hook {
             hook(dut_id, &cfg)?;
         }
@@ -217,11 +225,11 @@ impl HeartbeatService {
         drafts: &HashMap<String, HeartbeatConfig>,
         save: impl FnOnce(&HashMap<String, HeartbeatConfig>) -> Result<(), String>,
     ) -> Result<(), String> {
-        let _tick_guard = self.ticking.lock().unwrap();
-        let mut candidate = self.configs.lock().unwrap().clone();
+        let _tick_guard = duthub_core::util::lock_unpoisoned(&self.ticking);
+        let mut candidate = duthub_core::util::lock_unpoisoned(&self.configs).clone();
         candidate.extend(drafts.iter().map(|(id, cfg)| (id.clone(), cfg.clone())));
         save(&candidate)?;
-        *self.configs.lock().unwrap() = candidate;
+        *duthub_core::util::lock_unpoisoned(&self.configs) = candidate;
         for dut_id in drafts.keys() {
             self.reset_schedule(dut_id);
         }
@@ -229,9 +237,9 @@ impl HeartbeatService {
     }
 
     pub fn unregister(&self, dut_id: &str) {
-        let _tick_guard = self.ticking.lock().unwrap();
-        self.configs.lock().unwrap().remove(dut_id);
-        self.states.lock().unwrap().remove(dut_id);
+        let _tick_guard = duthub_core::util::lock_unpoisoned(&self.ticking);
+        duthub_core::util::lock_unpoisoned(&self.configs).remove(dut_id);
+        duthub_core::util::lock_unpoisoned(&self.states).remove(dut_id);
         self.alerts
             .lock()
             .unwrap()
@@ -240,13 +248,13 @@ impl HeartbeatService {
     }
 
     fn reset_schedule(&self, dut_id: &str) {
-        self.flights.lock().unwrap().remove(dut_id);
-        self.next_due.lock().unwrap().remove(dut_id);
+        duthub_core::util::lock_unpoisoned(&self.flights).remove(dut_id);
+        duthub_core::util::lock_unpoisoned(&self.next_due).remove(dut_id);
         self.note_lease_pause(dut_id, false);
     }
 
     fn note_lease_pause(&self, dut_id: &str, paused: bool) -> bool {
-        let mut states = self.states.lock().unwrap();
+        let mut states = duthub_core::util::lock_unpoisoned(&self.states);
         if paused {
             let state = states.entry(dut_id.to_owned()).or_default();
             return !std::mem::replace(&mut state.paused_by_lease, true);
@@ -258,7 +266,7 @@ impl HeartbeatService {
 
     /// 取走全部丢联告警（弹窗阶段消费；当前 UI 先转 toast）。
     pub fn drain_alerts(&self) -> Vec<HeartbeatAlert> {
-        std::mem::take(&mut *self.alerts.lock().unwrap())
+        std::mem::take(&mut *duthub_core::util::lock_unpoisoned(&self.alerts))
     }
 
     /// 产品入口：真实时钟 tick。返回本 tick 是否有状态变化（供 UI 决定重绘）。
@@ -269,7 +277,7 @@ impl HeartbeatService {
     /// tick 主体（`now_ms` 可注入，测试不依赖真实时钟）。
     /// `ticking` 互斥串行化并发 tick（UI 定时 + MCP 即时探测）。
     pub fn tick_at(&self, now_ms: u64) -> bool {
-        let _tick_guard = self.ticking.lock().unwrap();
+        let _tick_guard = duthub_core::util::lock_unpoisoned(&self.ticking);
         let mut changed = self.config_changed.swap(false, Ordering::AcqRel);
         let entries: Vec<(String, HeartbeatConfig)> = self
             .configs
@@ -287,7 +295,7 @@ impl HeartbeatService {
             let session_id = format!("sess-{dut}");
             let source = self.device.session_source(&dut);
             let session_open = source.is_some();
-            let flight = self.flights.lock().unwrap().get(&dut).cloned();
+            let flight = duthub_core::util::lock_unpoisoned(&self.flights).get(&dut).cloned();
             if let Some(f) = flight {
                 if session_open {
                     let lines: Vec<String> = self
@@ -327,7 +335,7 @@ impl HeartbeatService {
                     };
                     if let Some(updated) = answered {
                         changed |= updated;
-                        self.flights.lock().unwrap().remove(&dut);
+                        duthub_core::util::lock_unpoisoned(&self.flights).remove(&dut);
                         self.next_due
                             .lock()
                             .unwrap()
@@ -338,7 +346,7 @@ impl HeartbeatService {
                 if now_ms >= f.deadline_ms {
                     // 窗口到期无响应（含会话中途关闭）→ 丢联一次
                     changed |= self.note_loss(&dut, &cfg, now_ms);
-                    self.flights.lock().unwrap().remove(&dut);
+                    duthub_core::util::lock_unpoisoned(&self.flights).remove(&dut);
                     self.next_due
                         .lock()
                         .unwrap()
@@ -377,7 +385,7 @@ impl HeartbeatService {
                 );
                 match sent {
                     Ok(()) => {
-                        self.flights.lock().unwrap().insert(
+                        duthub_core::util::lock_unpoisoned(&self.flights).insert(
                             dut.clone(),
                             Flight {
                                 cursor_seq: cursor,
@@ -410,7 +418,7 @@ impl HeartbeatService {
     /// 记录一次成功响应（原文保存 + 系统信息提取 + 丢联清零）。
     pub fn note_response(&self, dut_id: &str, lines: &[String], now_ms: u64) -> bool {
         let joined = lines.join("\n");
-        let mut states = self.states.lock().unwrap();
+        let mut states = duthub_core::util::lock_unpoisoned(&self.states);
         let state = states.entry(dut_id.to_string()).or_default();
         state.last_ok = Some(true);
         state.last_at_unix_ms = now_ms;
@@ -423,7 +431,7 @@ impl HeartbeatService {
     /// 记录一次无响应（丢联计数 +1；达到阈值产出告警事件，不重复刷屏）。
     pub fn note_loss(&self, dut_id: &str, cfg: &HeartbeatConfig, now_ms: u64) -> bool {
         let (loss_count, crossed) = {
-            let mut states = self.states.lock().unwrap();
+            let mut states = duthub_core::util::lock_unpoisoned(&self.states);
             let state = states.entry(dut_id.to_string()).or_default();
             state.last_ok = Some(false);
             state.last_at_unix_ms = now_ms;
@@ -432,7 +440,7 @@ impl HeartbeatService {
             (state.loss_count, state.loss_count == threshold)
         };
         if crossed {
-            self.alerts.lock().unwrap().push(HeartbeatAlert {
+            duthub_core::util::lock_unpoisoned(&self.alerts).push(HeartbeatAlert {
                 dut_id: dut_id.to_string(),
                 loss_count,
                 message: format!("DUT {dut_id} 心跳丢联：连续 {loss_count} 次无响应"),
@@ -495,7 +503,7 @@ mod tests {
         let device = test_device("roundtrip");
         let svc = HeartbeatService::new(device.clone());
         device
-            .open_session("dut-a", "COM3", 115200, crate::SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, crate::SessionKind::Demo)
             .unwrap();
         // demo 驱动启动日志（delay=0，短暂等待落缓冲）
         std::thread::sleep(Duration::from_millis(150));
@@ -529,7 +537,7 @@ mod tests {
         );
         assert_eq!(state.sysinfo.hostname.as_deref(), Some("rk3576"));
         assert_eq!(state.sysinfo.cpu.as_deref(), Some("aarch64"));
-        assert!(svc.drain_alerts().is_empty());
+        assert_eq!(svc.drain_alerts(), [] as [duthub_core::HeartbeatAlert; 0]);
         device.close_session("dut-a").ok();
     }
 
@@ -584,7 +592,7 @@ mod tests {
         let device = test_device("batch");
         let svc = HeartbeatService::new(device.clone());
         device
-            .open_session("dut-batch", "DEMO", 115200, crate::SessionKind::Demo)
+            .open_session("dut-batch", "DEMO", 115_200, crate::SessionKind::Demo)
             .unwrap();
         svc.register(
             "dut-batch",
@@ -621,7 +629,7 @@ mod tests {
         let device = test_device("loss");
         let svc = HeartbeatService::new(device.clone());
         device
-            .open_session("dut-b", "COM3", 115200, crate::SessionKind::Demo)
+            .open_session("dut-b", "COM3", 115_200, crate::SessionKind::Demo)
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         svc.register("dut-b", cfg("uname -a", 1, 2));
@@ -646,7 +654,7 @@ mod tests {
         assert!(alerts[0].message.contains("2 次无响应"));
         // 持续丢联不再刷屏（避免弹窗风暴）
         svc.note_loss("dut-b", &cfg("uname -a", 1, 2), 4000);
-        assert!(svc.drain_alerts().is_empty());
+        assert_eq!(svc.drain_alerts(), [] as [duthub_core::HeartbeatAlert; 0]);
         // 恢复响应后丢联清零
         assert!(svc.note_response("dut-b", &["pong".into()], 5000));
         assert_eq!(svc.state_or_default("dut-b").loss_count, 0);
@@ -658,7 +666,7 @@ mod tests {
         let device = test_device("filter");
         let svc = HeartbeatService::new(device.clone());
         device
-            .open_session("dut-c", "COM3", 115200, crate::SessionKind::Demo)
+            .open_session("dut-c", "COM3", 115_200, crate::SessionKind::Demo)
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         svc.register("dut-c", cfg("uname -a", 1, 3));
@@ -709,7 +717,7 @@ mod tests {
         let device = test_device("disabled");
         let svc = HeartbeatService::new(device.clone());
         device
-            .open_session("dut-d", "COM3", 115200, crate::SessionKind::Demo)
+            .open_session("dut-d", "COM3", 115_200, crate::SessionKind::Demo)
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         svc.register(
@@ -734,7 +742,7 @@ mod tests {
         let device = test_device("paused");
         let svc = HeartbeatService::new(device.clone());
         device
-            .open_session("dut-pause", "COM3", 115200, crate::SessionKind::Demo)
+            .open_session("dut-pause", "COM3", 115_200, crate::SessionKind::Demo)
             .unwrap();
         svc.register(
             "dut-pause",
@@ -775,7 +783,7 @@ mod tests {
         );
     }
 
-    /// P2-036：探测因 Lease 被拒 → paused_by_lease 置位（不计丢联、last_ok
+    /// P2-036：探测因 Lease 被拒 → `paused_by_lease` `置位（不计丢联、last_ok`
     /// 保持未探测）；租约释放后探测成功 → 标记清除。
     #[test]
     fn probe_deferred_by_lease_sets_paused_flag_until_success() {
@@ -788,7 +796,7 @@ mod tests {
         let device =
             Arc::new(DeviceService::custom(256, dir, 0).with_lease_authority(lease.clone()));
         device
-            .open_session("dut-lease", "COM3", 115200, crate::SessionKind::Demo)
+            .open_session("dut-lease", "COM3", 115_200, crate::SessionKind::Demo)
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         let svc = HeartbeatService::new(device.clone());

@@ -18,6 +18,7 @@ pub enum Provider {
 }
 
 impl Provider {
+    #[must_use]
     pub fn from_setting(value: &str) -> Option<Provider> {
         match value {
             "openai" => Some(Provider::Openai),
@@ -30,6 +31,7 @@ impl Provider {
         }
     }
 
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Provider::Openai => "OpenAI",
@@ -42,6 +44,7 @@ impl Provider {
     }
 
     /// Default API base URL (`Compatible` requires an explicit URL).
+    #[must_use]
     pub const fn default_base(self) -> &'static str {
         match self {
             Provider::Openai => "https://api.openai.com/v1",
@@ -55,6 +58,7 @@ impl Provider {
 }
 
 /// Scope a stored provider credential to its API format and destination.
+#[must_use]
 pub fn model_provider_credential_id(id: &str, provider: Provider, base_url: &str) -> String {
     let destination = format!("{}\n{base_url}", provider.label());
     let fingerprint = Sha256::digest(destination.as_bytes());

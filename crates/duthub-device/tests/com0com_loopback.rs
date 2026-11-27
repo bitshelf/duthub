@@ -30,8 +30,7 @@ fn com0com_loopback_smoke_or_skip() {
         .filter(|p| {
             p.description
                 .as_deref()
-                .map(|d| d.to_ascii_lowercase().contains("com0com"))
-                .unwrap_or(false)
+                .is_some_and(|d| d.to_ascii_lowercase().contains("com0com"))
         })
         .collect();
 
@@ -45,7 +44,7 @@ fn com0com_loopback_smoke_or_skip() {
 
     // 发现成对端口 → 打开/关闭冒烟（同一时刻只能绑定一个会话）
     let port_a = pairs[0].port.clone();
-    let session = service.open_session("com0com-a", &port_a, 115200, SessionKind::Real);
+    let session = service.open_session("com0com-a", &port_a, 115_200, SessionKind::Real);
     match session {
         Ok(session_id) => {
             eprintln!("OK: com0com 端口 {port_a} 打开成功（session={session_id}）");

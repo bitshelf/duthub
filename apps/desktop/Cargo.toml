@@ -23,6 +23,7 @@ real-hardware = ["duthub-device/real-hardware", "duthub-control/real-hardware"]
 
 [dependencies]
 alacritty_terminal.workspace = true
+anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
 duthub-a2a = { path = "../../crates/duthub-a2a" }

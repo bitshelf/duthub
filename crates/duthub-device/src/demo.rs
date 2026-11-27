@@ -2,7 +2,7 @@
 //!
 //! Demo 驱动回放 `tests/fixture-logs/` 样本（正常启动 + 内核 panic），随后进入
 //! 交互式模拟 shell（移植原型 `response()` 行为），无硬件即可驱动全链路。
-//! 真实驱动（M1.2）实现同一命令通道，走 tokio-serial + alacritty_terminal 仿真
+//! 真实驱动（M1.2）实现同一命令通道，走 tokio-serial + `alacritty_terminal` 仿真
 //! （行重组/本地回显已废弃：回显与提示符由设备 shell 经仿真器渲染）。
 
 use std::collections::HashMap;
@@ -39,9 +39,9 @@ pub(crate) const TX_MERGE_BYTES: usize = 256;
 pub(crate) fn absorb_keystrokes(
     cmd_rx: &mut tokio::sync::mpsc::Receiver<SessionCommand>,
     first: Vec<u8>,
-    lease: &Option<WriteCtx>,
+    lease: Option<&WriteCtx>,
 ) -> (Vec<Vec<u8>>, Option<SessionCommand>) {
-    let total = |batch: &[Vec<u8>]| batch.iter().map(|b| b.len()).sum::<usize>();
+    let total = |batch: &[Vec<u8>]| batch.iter().map(std::vec::Vec::len).sum::<usize>();
     let mut batch = vec![first];
     let mut deferred = None;
     while total(&batch) < TX_MERGE_BYTES {
@@ -49,7 +49,7 @@ pub(crate) fn absorb_keystrokes(
             Ok(SessionCommand::WriteBytes {
                 bytes: more,
                 lease: more_lease,
-            }) if &more_lease == lease && total(&batch) + more.len() <= TX_MERGE_BYTES => {
+            }) if more_lease.as_ref() == lease && total(&batch) + more.len() <= TX_MERGE_BYTES => {
                 batch.push(more);
             }
             Ok(other) => {
@@ -76,7 +76,7 @@ pub enum SessionCommand {
         batch: std::sync::Arc<crate::heartbeat::HeartbeatBatch>,
         lease: Option<WriteCtx>,
     },
-    /// 原始字节直写（PuTTY 键盘路径：typed_char/Enter \r/Backspace 0x7f），
+    /// 原始字节直写（PuTTY `键盘路径：typed_char/Enter` \r/Backspace 0x7f），
     /// 不做行尾追加、不发 [TX] 回显
     WriteBytes {
         bytes: Vec<u8>,
@@ -92,12 +92,48 @@ pub enum SessionCommand {
         skip: usize,
         reply: tokio::sync::oneshot::Sender<crate::term::TerminalHistoryPage>,
     },
-    /// 会话级行尾策略（发送路径生效，见 LineEnding；仅 write_line 路径）
+    /// 会话级行尾策略（发送路径生效，见 LineEnding；仅 `write_line` 路径）
     SetEnding(LineEnding),
     /// 分段标记（日志分割）：写 `[mark] {label}` 行（Mark 样式），文本与索引同步
     Mark(String),
     /// 请求关闭
     Close,
+}
+
+impl std::fmt::Debug for SessionCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write { text, lease } => f
+                .debug_struct("Write")
+                .field("text_len", &text.len())
+                .field("lease", lease)
+                .finish(),
+            Self::WriteHeartbeatBatch { text, lease, .. } => f
+                .debug_struct("WriteHeartbeatBatch")
+                .field("text_len", &text.len())
+                .field("lease", lease)
+                .finish_non_exhaustive(),
+            Self::WriteBytes { bytes, lease } => f
+                .debug_struct("WriteBytes")
+                .field("bytes_len", &bytes.len())
+                .field("lease", lease)
+                .finish(),
+            Self::SetBaud(baud) => f.debug_tuple("SetBaud").field(baud).finish(),
+            Self::Resize { cols, rows } => f
+                .debug_struct("Resize")
+                .field("cols", cols)
+                .field("rows", rows)
+                .finish(),
+            Self::ResetTerminal => f.write_str("ResetTerminal"),
+            Self::ReadTerminalHistory { skip, .. } => f
+                .debug_struct("ReadTerminalHistory")
+                .field("skip", skip)
+                .finish_non_exhaustive(),
+            Self::SetEnding(ending) => f.debug_tuple("SetEnding").field(ending).finish(),
+            Self::Mark(label) => f.debug_tuple("Mark").field(label).finish(),
+            Self::Close => f.write_str("Close"),
+        }
+    }
 }
 
 /// 日志管道消息（异步写线程按入队顺序消费；字节与分段顺序严格保持）。
@@ -107,12 +143,12 @@ pub(crate) enum LogMsg {
         bytes: Vec<u8>,
         text: String,
     },
-    /// TX 线上字节 + [TX] 标记行（append；emit_tx / log_tx 共用）。
+    /// TX 线上字节 + [TX] `标记行（append；emit_tx` / `log_tx` 共用）。
     Tx {
         wire: Vec<u8>,
         text: String,
     },
-    /// 键入字节审计：仅 .bin（append_raw）。
+    /// 键入字节审计：仅 .`bin（append_raw`）。
     Keystrokes(Vec<u8>),
     /// 注记行（note）。
     Note(String),
@@ -230,11 +266,11 @@ fn apply_log_msg(
 /// 只是移出 RX/写命令路径——磁盘 I/O 不再卡回显显示。recv 返回 Err 表示
 /// 通道关闭且队列已排空，此时才退出（会话关闭后一字节不少）。
 fn run_log_writer(
-    logs: Arc<Mutex<SessionLogWriter>>,
-    rx: std::sync::mpsc::Receiver<LogMsg>,
-    session_id: String,
-    dut_id: String,
-    finished: Arc<(Mutex<bool>, Condvar)>,
+    logs: &Arc<Mutex<SessionLogWriter>>,
+    rx: &std::sync::mpsc::Receiver<LogMsg>,
+    session_id: &str,
+    dut_id: &str,
+    finished: &(Mutex<bool>, Condvar),
 ) {
     let mut last_error = None;
     let mut on_error = |err: &DeviceError| {
@@ -245,7 +281,7 @@ fn run_log_writer(
         }
     };
     while let Ok(msg) = rx.recv() {
-        apply_log_msg(&logs, msg, &mut on_error);
+        apply_log_msg(logs, msg, &mut on_error);
     }
     let pending_error = logs
         .lock()
@@ -254,7 +290,7 @@ fn run_log_writer(
     if let Some(error) = pending_error {
         on_error(&error);
     }
-    let (lock, cvar) = &*finished;
+    let (lock, cvar) = finished;
     *lock.lock().unwrap() = true;
     cvar.notify_all();
 }
@@ -279,6 +315,15 @@ pub struct SessionCtx {
     garble_enabled: Option<Arc<Mutex<HashMap<String, bool>>>>,
     /// Raw-byte garble meter (baud-rate mismatch heuristic; RX path only).
     garble: Mutex<crate::garbled::GarbleMeter>,
+}
+
+impl std::fmt::Debug for SessionCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionCtx")
+            .field("dut_id", &self.dut_id)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionCtx {
@@ -306,6 +351,7 @@ impl SessionCtx {
 
     /// 挂接每 DUT 乱码检测开关（与 `DeviceService` 共享同一 map：运行中切换
     /// 对活动会话即时生效）。
+    #[must_use]
     pub fn with_garble(mut self, map: Arc<Mutex<HashMap<String, bool>>>) -> Self {
         self.garble_enabled = Some(map);
         self
@@ -354,6 +400,7 @@ impl SessionCtx {
     /// 挂接日志管道（原始字节副本 + utf8-lossy 文本，M1.5）。
     /// 同时启动专用写线程：逐条 write + flush 语义与同步路径完全一致
     /// （实时落盘、零丢失），仅把磁盘 I/O 移出 RX 回显关键路径。
+    #[must_use]
     pub fn with_logs(mut self, logs: Arc<Mutex<SessionLogWriter>>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<LogMsg>();
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
@@ -364,7 +411,7 @@ impl SessionCtx {
                 let session_id = self.session_id.clone();
                 let dut_id = self.dut_id.clone();
                 let finished = Arc::clone(&finished);
-                move || run_log_writer(logs_for_thread, rx, session_id, dut_id, finished)
+                move || run_log_writer(&logs_for_thread, &rx, &session_id, &dut_id, &finished)
             });
         if spawned.is_ok() {
             self.log_tx = Some(tx);
@@ -409,18 +456,21 @@ impl SessionCtx {
     }
 
     /// 挂接手动重连唤醒（H1.4：退避等待期间可被提前唤醒）。
+    #[must_use]
     pub fn with_reconnect_notify(mut self, notify: std::sync::Arc<Notify>) -> Self {
         self.reconnect_notify = Some(notify);
         self
     }
 
     /// 挂接租约复核（[E] actor 复核：SPEC §6.5.1 唯一 Actor 写前验证代数）。
+    #[must_use]
     pub fn with_lease_authority(mut self, authority: Option<Arc<dyn LeaseAuthority>>) -> Self {
         self.lease_authority = authority;
         self
     }
 
     /// 挂接审计接收端。
+    #[must_use]
     pub fn with_audit(mut self, audit: Option<Arc<AuditSink>>) -> Self {
         self.audit = audit;
         self
@@ -498,7 +548,7 @@ impl SessionCtx {
         );
     }
 
-    /// TX 仅审计（real 驱动 write_line 路径）：.bin 记真实线上字节、.log 记
+    /// TX 仅审计（real 驱动 `write_line` 路径）：.bin 记真实线上字节、.log 记
     /// `[TX]` 标记行，但不再进终端流/总线（PuTTY 行为：无本地回显，屏幕内容
     /// 由设备 shell 经仿真器渲染）。
     pub fn log_tx(&self, wire_payload: &[u8], display_text: &str) {
@@ -510,8 +560,8 @@ impl SessionCtx {
     }
 
     /// RX 原始字节块：.bin 记真字节（不转码），.log 记 utf8-lossy 文本，总线发
-    /// SerialChunk（MCP serial_read / 录制 / 审计的文本来源；终端 UI 渲染走
-    /// SerialScreen 网格快照，不重复显示该文本）。
+    /// SerialChunk（MCP `serial_read` / 录制 / 审计的文本来源；终端 UI 渲染走
+    /// `SerialScreen` 网格快照，不重复显示该文本）。
     pub fn emit_raw(&self, bytes: &[u8]) {
         // Garble detection samples the raw bytes before any lossy decoding and
         // before the terminal emulator (which swallows most control bytes).
@@ -533,7 +583,7 @@ impl SessionCtx {
         });
     }
 
-    /// 键入字节审计（real 驱动 WriteBytes 路径）：只进 .bin 原始流；.log 与终端流
+    /// 键入字节审计（real 驱动 `WriteBytes` 路径）：只进 .bin 原始流；.log 与终端流
     /// 由随后的设备回显承担（避免逐键 [TX] 刷屏）。
     pub fn log_keystrokes(&self, bytes: &[u8]) {
         self.enqueue_log(LogMsg::Keystrokes(bytes.to_vec()));
@@ -566,8 +616,8 @@ impl SessionCtx {
                 let notified = notify.notified();
                 tokio::pin!(notified);
                 tokio::select! {
-                    _ = &mut notified => {}
-                    _ = tokio::time::sleep(backoff) => {}
+                    () = &mut notified => {}
+                    () = tokio::time::sleep(backoff) => {}
                 }
             }
             None => tokio::time::sleep(backoff).await,
@@ -599,6 +649,7 @@ fn single_line_tx(text: &str) -> String {
 }
 
 /// 内核行分类：错误行（panic/oops/BUG/failed）标红、prompt 标亮，其余常规。
+#[must_use]
 pub fn classify_line(text: &str) -> ChunkStyle {
     let lower = text.to_ascii_lowercase();
     if lower.contains("panic")
@@ -938,8 +989,8 @@ mod tests {
         );
     }
 
-    /// P2-034b：[TX] 注记单行化——emit_tx（终端流）与 log_tx（.log 审计流）
-    /// 把 display_text 的换行转义为字面 `\n` / `\r`，不出现无前缀续行；
+    /// P2-034b：[TX] `注记单行化——emit_tx（终端流）与` `log_tx（.log` 审计流）
+    /// 把 `display_text` 的换行转义为字面 `\n` / `\r`，不出现无前缀续行；
     /// wire 原始字节（.bin）保留真实线上字节。
     #[test]
     fn tx_annotation_is_single_line_for_multiline_text() {
@@ -1025,7 +1076,7 @@ mod tests {
         // 分段（mark）把后续输出切进新段文件：rx-2 必须出现在任一段文件里
         let seg_files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.path())
             .filter(|p| {
                 let name = p.to_string_lossy();
@@ -1038,8 +1089,7 @@ mod tests {
                     .unwrap_or_default()
                     .contains("rx-2")
             }),
-            "分段后的 RX 必须落在新段：{:?}",
-            seg_files
+            "分段后的 RX 必须落在新段：{seg_files:?}"
         );
         let raw = std::fs::read(dir.join("sess-logorder.bin")).unwrap();
         let raw = String::from_utf8_lossy(&raw).to_string();
@@ -1073,13 +1123,13 @@ mod tests {
 
     fn push_writes(
         tx: &tokio::sync::mpsc::Sender<SessionCommand>,
-        lease: Option<WriteCtx>,
+        lease: Option<&WriteCtx>,
         payloads: &[&[u8]],
     ) {
         for p in payloads {
             tx.try_send(SessionCommand::WriteBytes {
                 bytes: p.to_vec(),
-                lease: lease.clone(),
+                lease: lease.cloned(),
             })
             .unwrap();
         }
@@ -1094,8 +1144,8 @@ mod tests {
             lease_id: "gui-1".into(),
             generation: 3,
         });
-        push_writes(&tx, lease.clone(), &[b"a", b"bc", b"def"]);
-        let (batch, deferred) = absorb_keystrokes(&mut rx, b"x".to_vec(), &lease);
+        push_writes(&tx, lease.as_ref(), &[b"a", b"bc", b"def"]);
+        let (batch, deferred) = absorb_keystrokes(&mut rx, b"x".to_vec(), lease.as_ref());
         assert!(deferred.is_none(), "无异型命令残留");
         assert_eq!(batch.concat(), b"xabcdef".to_vec(), "顺序必须保持");
         assert_eq!(batch.len(), 4, "逐条原始边界保留");
@@ -1113,10 +1163,10 @@ mod tests {
             lease_id: "agent-9".into(),
             generation: 7,
         });
-        push_writes(&tx, agent.clone(), &[b"agent"]);
+        push_writes(&tx, agent.as_ref(), &[b"agent"]);
         tx.try_send(SessionCommand::Resize { cols: 80, rows: 24 })
             .unwrap();
-        let (batch, deferred) = absorb_keystrokes(&mut rx, b"gui".to_vec(), &gui);
+        let (batch, deferred) = absorb_keystrokes(&mut rx, b"gui".to_vec(), gui.as_ref());
         assert_eq!(batch, vec![b"gui".to_vec()], "异租约不得并入");
         let Some(SessionCommand::WriteBytes { bytes, lease }) = deferred else {
             panic!("异租约键入必须交回队列");
@@ -1124,7 +1174,7 @@ mod tests {
         assert_eq!(bytes, b"agent".to_vec());
         assert_eq!(lease, agent);
         // 再吸收一次：Resize 必须原样交回
-        let (batch, deferred) = absorb_keystrokes(&mut rx, b"z".to_vec(), &agent);
+        let (batch, deferred) = absorb_keystrokes(&mut rx, b"z".to_vec(), agent.as_ref());
         assert_eq!(batch, vec![b"z".to_vec()], "同租约但队列中已无键入");
         let Some(SessionCommand::Resize { cols, rows }) = deferred else {
             panic!("Resize 必须原样交回");
@@ -1147,8 +1197,8 @@ mod tests {
             lease: lease.clone(),
         })
         .unwrap();
-        let (batch, deferred) = absorb_keystrokes(&mut rx, big, &lease);
-        assert_eq!(batch.iter().map(|b| b.len()).sum::<usize>(), 200);
+        let (batch, deferred) = absorb_keystrokes(&mut rx, big, lease.as_ref());
+        assert_eq!(batch.iter().map(std::vec::Vec::len).sum::<usize>(), 200);
         let Some(SessionCommand::WriteBytes { bytes, lease: l }) = deferred else {
             panic!("超限键入必须整条留给下一轮");
         };
@@ -1161,7 +1211,7 @@ mod tests {
     fn empty_queue_returns_first_only() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         drop(tx);
-        let (batch, deferred) = absorb_keystrokes(&mut rx, b"only".to_vec(), &None);
+        let (batch, deferred) = absorb_keystrokes(&mut rx, b"only".to_vec(), None);
         assert_eq!(batch, vec![b"only".to_vec()]);
         assert!(deferred.is_none());
     }
@@ -1183,13 +1233,13 @@ mod tests {
         let ten = vec![b'c'; 10];
         push_writes(
             &tx,
-            lease.clone(),
+            lease.as_ref(),
             &[one_fiftysix.as_slice(), ten.as_slice()],
         );
-        let (batch, deferred) = absorb_keystrokes(&mut rx, hundred, &lease);
+        let (batch, deferred) = absorb_keystrokes(&mut rx, hundred, lease.as_ref());
         assert_eq!(batch.len(), 2, "恰好触顶的那条必须并入");
         assert_eq!(
-            batch.iter().map(|b| b.len()).sum::<usize>(),
+            batch.iter().map(std::vec::Vec::len).sum::<usize>(),
             TX_MERGE_BYTES,
             "合并后恰好等于上限"
         );
@@ -1213,8 +1263,8 @@ mod tests {
         });
         let at_cap = vec![b'x'; TX_MERGE_BYTES];
         let small = vec![b'y'; 5];
-        push_writes(&tx, lease.clone(), &[small.as_slice()]);
-        let (batch, deferred) = absorb_keystrokes(&mut rx, at_cap.clone(), &lease);
+        push_writes(&tx, lease.as_ref(), &[small.as_slice()]);
+        let (batch, deferred) = absorb_keystrokes(&mut rx, at_cap.clone(), lease.as_ref());
         assert_eq!(batch, vec![at_cap], "已达上限：批次只含首条，整条不拆分");
         assert!(deferred.is_none());
         let SessionCommand::WriteBytes { bytes, lease: l } = rx.try_recv().unwrap() else {
@@ -1235,25 +1285,25 @@ mod tests {
             generation: 4,
         });
         let cmds: Vec<Vec<u8>> = (0..10u8).map(|i| vec![b'0' + i; 60]).collect();
-        let rest: Vec<&[u8]> = cmds[1..].iter().map(|c| c.as_slice()).collect();
-        push_writes(&tx, lease.clone(), &rest);
-        let (b1, d1) = absorb_keystrokes(&mut rx, cmds[0].clone(), &lease);
+        let rest: Vec<&[u8]> = cmds[1..].iter().map(std::vec::Vec::as_slice).collect();
+        push_writes(&tx, lease.as_ref(), &rest);
+        let (b1, d1) = absorb_keystrokes(&mut rx, cmds[0].clone(), lease.as_ref());
         let Some(SessionCommand::WriteBytes { bytes, lease: l }) = d1 else {
             panic!("第 5 条必须整条退回");
         };
         assert_eq!(bytes, cmds[4]);
         assert_eq!(l, lease);
-        let (b2, d2) = absorb_keystrokes(&mut rx, bytes, &lease);
+        let (b2, d2) = absorb_keystrokes(&mut rx, bytes, lease.as_ref());
         let Some(SessionCommand::WriteBytes { bytes, lease: l }) = d2 else {
             panic!("第 9 条必须整条退回");
         };
         assert_eq!(bytes, cmds[8]);
         assert_eq!(l, lease);
-        let (b3, d3) = absorb_keystrokes(&mut rx, bytes, &lease);
+        let (b3, d3) = absorb_keystrokes(&mut rx, bytes, lease.as_ref());
         assert!(d3.is_none(), "突发应全部消化");
         for batch in [&b1, &b2, &b3] {
             assert!(
-                batch.iter().map(|b| b.len()).sum::<usize>() <= TX_MERGE_BYTES,
+                batch.iter().map(std::vec::Vec::len).sum::<usize>() <= TX_MERGE_BYTES,
                 "每轮批次不得超过合并上限"
             );
         }
@@ -1283,11 +1333,11 @@ mod tests {
         let c1 = vec![b'b'; 50];
         let c2 = vec![b'c'; 50];
         let c3 = vec![b'd'; 50];
-        push_writes(&tx, agent.clone(), &[c1.as_slice()]);
-        push_writes(&tx, gui.clone(), &[c2.as_slice(), c3.as_slice()]);
+        push_writes(&tx, agent.as_ref(), &[c1.as_slice()]);
+        push_writes(&tx, gui.as_ref(), &[c2.as_slice(), c3.as_slice()]);
         // 轮 1：c0(gui) 后紧跟异租约 c1 → 立即截断：批次只含首条，c1 原样交回
         // （若 absorb 跳过异租约继续吸收，b1 会变成 [c0, c2, c3]）
-        let (b1, d1) = absorb_keystrokes(&mut rx, c0.clone(), &gui);
+        let (b1, d1) = absorb_keystrokes(&mut rx, c0.clone(), gui.as_ref());
         assert_eq!(b1, vec![c0.clone()], "异租约前的批次只含首条");
         let Some(SessionCommand::WriteBytes {
             bytes: deferred1,
@@ -1300,7 +1350,7 @@ mod tests {
         assert_eq!(l1, agent);
         // 轮 2：退回的 c1(agent) 后是 gui 的 c2 → 再次截断。deferred2 == c2
         // 同时证明轮 1 未跳过/丢弃异租约后面的同租约键入（c2 仍在 c3 之前）。
-        let (b2, d2) = absorb_keystrokes(&mut rx, deferred1, &agent);
+        let (b2, d2) = absorb_keystrokes(&mut rx, deferred1, agent.as_ref());
         assert_eq!(b2, vec![c1.clone()]);
         let Some(SessionCommand::WriteBytes {
             bytes: deferred2,
@@ -1312,14 +1362,14 @@ mod tests {
         assert_eq!(deferred2, c2);
         assert_eq!(l2, gui);
         // 轮 3：c2 与 c3 同租约 → 合并，突发全部消化
-        let (b3, d3) = absorb_keystrokes(&mut rx, deferred2, &gui);
+        let (b3, d3) = absorb_keystrokes(&mut rx, deferred2, gui.as_ref());
         assert!(d3.is_none());
         assert_eq!(b3, vec![c2.clone(), c3.clone()]);
     }
 
     // ---- RX 日志管道（PERF-2：总线同步发布 + 磁盘 I/O 只在写线程）----
 
-    /// PERF-2：emit_raw 必须先同步把 SerialChunk 发上总线（MCP serial_read /
+    /// PERF-2：emit_raw 必须先同步把 `SerialChunk` 发上总线（MCP `serial_read` /
     /// 审计源不变），且调用路径零磁盘 I/O。用「测试线程持锁卡住写线程」的
     /// 手法确定性证明（代替会闪断的时限断言）：写线程被挡住期间 .log/.bin
     /// 必然为空——若有同步写盘，文件早就非空；放锁 + 排空屏障后逐条落齐。
@@ -1506,7 +1556,7 @@ mod tests {
     /// LOG-12：portable 归档模式（桌面产品实际装配形状）下写线程链路零丢失
     /// ——saving 开启时首条消息触发段目录创建，drop 排空后 txt/bin/rec 三流
     /// 同段落盘。名字用合法形状（COM 口名是 Windows 保留名，直传会被
-    /// name_component 拒绝且错误被写线程静默吞掉——桌面侧由
+    /// `name_component` 拒绝且错误被写线程静默吞掉——桌面侧由
     /// `archive_safe_name` 守卫兜底）。
     #[test]
     fn ctx_portable_archive_drains_all_three_streams() {
@@ -1535,9 +1585,21 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 3, "三条流各一段: {entries:?}");
         assert!(entries.iter().all(|name| name.starts_with("dut-com8-001_")));
-        assert!(entries.iter().any(|name| name.ends_with(".txt")));
-        assert!(entries.iter().any(|name| name.ends_with(".bin")));
-        assert!(entries.iter().any(|name| name.ends_with(".rec")));
+        assert!(entries.iter().any(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+        }));
+        assert!(entries.iter().any(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+        }));
+        assert!(entries.iter().any(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rec"))
+        }));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1561,10 +1623,10 @@ mod tests {
         let backspace = vec![0x7f_u8];
         push_writes(
             &tx,
-            lease.clone(),
+            lease.as_ref(),
             &[second.as_slice(), backspace.as_slice()],
         );
-        let (batch, deferred) = absorb_keystrokes(&mut rx, b"l".to_vec(), &lease);
+        let (batch, deferred) = absorb_keystrokes(&mut rx, b"l".to_vec(), lease.as_ref());
         assert!(deferred.is_none());
         assert_eq!(
             batch,
@@ -1595,7 +1657,7 @@ mod tests {
         );
     }
 
-    /// 乱码检测接线：开关来自共享的每 DUT map，原始字节在 emit_raw 采样，
+    /// 乱码检测接线：开关来自共享的每 DUT map，原始字节在 `emit_raw` 采样，
     /// 结论随快照发布；关闭即复位为 Clean。SerialChunk 文本/顺序不受影响。
     #[test]
     fn garble_reaches_the_snapshot_only_when_enabled() {

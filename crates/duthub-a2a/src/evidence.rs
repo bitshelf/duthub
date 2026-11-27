@@ -18,7 +18,7 @@ use rmcp::service::ServiceExt;
 use rmcp::transport::async_rw::AsyncRwTransport;
 
 /// The only skills the A2A surface accepts — the W1 evidence tool list.
-/// The executor fails any other skill (and any TextPart) with a policy
+/// The executor fails any other skill (and any `TextPart`) with a policy
 /// rejection before the MCP server is even started.
 pub const EVIDENCE_SKILLS: [&str; 5] = duthub_mcp::server::EVIDENCE_TOOL_NAMES;
 

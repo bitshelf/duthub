@@ -69,7 +69,7 @@ fn dut_with_serial_relay() -> DutConfig {
             reference_similarity: None,
             split_logs: false,
         },
-        adb: Default::default(),
+        adb: duthub_core::model::AdbConfig::default(),
         relay: RelayConfig::UsbSerial {
             host: "local".into(),
             node: "COM25".into(),
@@ -85,10 +85,10 @@ fn dut_with_serial_relay() -> DutConfig {
         mcp: McpConfig::StreamableHttp {
             url: "http://127.0.0.1:8787/mcp".into(),
         },
-        a2a: Default::default(),
-        flash: Default::default(),
-        media: Default::default(),
-        heartbeat: Default::default(),
+        a2a: duthub_core::model::DutA2aConfig::default(),
+        flash: duthub_core::model::FlashConfig::default(),
+        media: duthub_core::model::DutMediaConfig::default(),
+        heartbeat: duthub_core::model::HeartbeatConfig::default(),
     }
 }
 

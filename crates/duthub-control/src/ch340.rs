@@ -25,11 +25,13 @@ pub const DEFAULT_BAUD: u32 = 9600;
 pub const MAX_CHANNELS: u8 = 8;
 
 /// 构造 4 字节命令帧。
+#[must_use]
 pub fn frame(channel: u8, opcode: u8) -> [u8; 4] {
     [HEADER, channel, opcode, checksum(channel, opcode)]
 }
 
 /// 帧校验和：`(0xA0 + channel + opcode) & 0xFF`。
+#[must_use]
 pub fn checksum(channel: u8, opcode: u8) -> u8 {
     HEADER.wrapping_add(channel).wrapping_add(opcode)
 }
@@ -55,6 +57,7 @@ pub enum EchoCheck<'a> {
 }
 
 /// 在读回缓冲中扫描期望的回显帧（从每个 0xA0 位置起尝试）。
+#[must_use]
 pub fn classify_echo(buf: &[u8], channel: u8, opcode: u8) -> EchoCheck<'_> {
     let mut fallback = EchoCheck::Absent;
     for start in 0..buf.len() {
@@ -88,6 +91,7 @@ pub fn classify_echo(buf: &[u8], channel: u8, opcode: u8) -> EchoCheck<'_> {
 /// 只接受「帧头 + 通道匹配 + 状态字节 0/1 + 校验通过」的帧；串口噪声里
 /// 恰好形似的字节（如文本字节 0x50/0x72）不会误报为通道状态。
 /// 返回 `None` 表示未找到有效应答（板卡不回答 STATUS 或数据损坏）。
+#[must_use]
 pub fn scan_status(buf: &[u8], channel: u8) -> Option<u8> {
     if buf.len() < 4 {
         return None;

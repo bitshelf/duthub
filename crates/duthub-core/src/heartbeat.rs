@@ -23,7 +23,7 @@ pub struct HeartbeatConfig {
     pub expected_response: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused_until_unix_ms: Option<u64>,
-    /// 连续多少次无响应判定丢联（发 AlertEvent）。
+    /// 连续多少次无响应判定丢联（发 `AlertEvent`）。
     pub loss_threshold: u32,
 }
 
@@ -42,15 +42,18 @@ impl Default for HeartbeatConfig {
 
 impl HeartbeatConfig {
     /// 与默认完全一致时序列化省略整段（保持旧 duts.json 形状）。
+    #[must_use]
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
 
     /// 间隔下限保护（1 秒）：0 会让 tick 每帧狂发命令。
+    #[must_use]
     pub fn normalized_interval(&self) -> u32 {
         self.interval_secs.clamp(1, 86_400)
     }
 
+    #[must_use]
     pub fn is_paused_at(&self, now_ms: u64) -> bool {
         self.paused_until_unix_ms
             .is_some_and(|until| now_ms < until)
@@ -93,6 +96,7 @@ pub struct HeartbeatAlert {
 }
 
 /// 判定一行是否为「设备响应」（排除本机回显/驱动信令/分段标记）。
+#[must_use]
 pub fn is_response_line(text: &str) -> bool {
     !text.is_empty()
         && !text.starts_with("[TX] ")
@@ -127,8 +131,7 @@ pub fn extract_sysinfo(text: &str) -> SysInfo {
             // 截掉 load average 段，再去掉结尾的 users 计数段（`, 2 users` / `, 1 user`）
             let mut seg = rest
                 .split_once("load average")
-                .map(|(head, _)| head)
-                .unwrap_or(rest)
+                .map_or(rest, |(head, _)| head)
                 .trim_end()
                 .to_string();
             if let Some(pos) = seg.rfind(" user") {

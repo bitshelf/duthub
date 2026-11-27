@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Palette, Window, Context, Div, div, InteractiveElement, switch_panel_header, StatefulInteractiveElement, toggle, collapsible_panel, Styled, px, ParentElement, subtle, FluentBuilder, SessionStatus, SharedString, bundle, AppContext, btn, BtnVariant, IntoElement, Input, Disableable, TranscriptEntry, TranscriptKind, Stateful, panel_shell, In, field};
 
 pub(super) fn connection_agent_panel(
     w: &mut Workbench,
@@ -27,7 +27,7 @@ pub(super) fn connection_agent_panel(
 }
 
 /// 「Agent 会话」面板（每 DUT）：goose 进程状态、启动/停止/取消、流式 transcript、
-/// 每 DUT 独立草稿输入。真实会话在 `agent_host` 工作线程；本面板只读 SessionView
+/// 每 DUT 独立草稿输入。真实会话在 `agent_host` 工作线程；本面板只读 `SessionView`
 /// 并下发命令（停止只发请求，等待/杀进程树在工作线程，F12）。
 pub(super) fn agent_session_panel(
     w: &mut Workbench,
@@ -55,8 +55,7 @@ pub(super) fn agent_session_panel(
     let has_view = view.is_some();
     let status = view
         .as_ref()
-        .map(|view| view.status())
-        .unwrap_or(SessionStatus::Stopped);
+        .map_or(SessionStatus::Stopped, |view| view.status());
     let running = has_view && !status.is_terminal() && status != SessionStatus::Stopped;
     let busy = status == SessionStatus::Busy;
     let ready = status == SessionStatus::Ready;
@@ -93,22 +92,19 @@ pub(super) fn agent_session_panel(
     }
     // W4c：Authenticode 徽标按实际程序来源展示——内嵌 goose 显示 manifest
     // 记录状态；外部程序（或选中的外部条目）一律「未验证」，绝不谎称已签名。
-    let (badge_source, badge_signature) = match &actual_launch {
-        Some(spec) => (
-            duthub_desktop::agent_ui::program_source(Some(spec), false),
-            spec.signature.clone(),
-        ),
-        None => {
-            let selected_external = w
-                .agents
-                .agent(&selected_agent)
-                .and_then(|agent| agent.program_path())
-                .is_some();
-            (
-                duthub_desktop::agent_ui::program_source(None, selected_external),
-                bundle::authenticode_status().to_owned(),
-            )
-        }
+    let (badge_source, badge_signature) = if let Some(spec) = &actual_launch { (
+        duthub_desktop::agent_ui::program_source(Some(spec), false),
+        spec.signature.clone(),
+    ) } else {
+        let selected_external = w
+            .agents
+            .agent(&selected_agent)
+            .and_then(|agent| agent.program_path())
+            .is_some();
+        (
+            duthub_desktop::agent_ui::program_source(None, selected_external),
+            bundle::authenticode_status().to_owned(),
+        )
     };
     meta = meta.child(authenticode_badge(
         "agent-session-authenticode",
@@ -125,9 +121,7 @@ pub(super) fn agent_session_panel(
         .agents
         .agents
         .iter()
-        .find(|entry| entry.id == w.agent_id_for_dut(&dut.id))
-        .map(|entry| entry.trust_level.clone())
-        .unwrap_or_else(|| "mcp_only".into());
+        .find(|entry| entry.id == w.agent_id_for_dut(&dut.id)).map_or_else(|| "mcp_only".into(), |entry| entry.trust_level.clone());
     let trust_label = localized_trust_label(&trust_level, proof);
     let isolation_text = format_sandbox_status(&sandbox_status);
     body = body.child(
@@ -282,22 +276,21 @@ pub(super) fn agent_session_panel(
     // 2000 条截断后 `transcript.len()` 停涨，只有它能在 2000 条后继续贴底。
     let item_count = view
         .as_ref()
-        .map(|view| {
+        .map_or(0, |view| {
             // A poisoned transcript lock only means some worker panicked while
             // holding it; the render path must degrade, not panic the UI thread.
             view.transcript
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len()
-        })
-        .unwrap_or(0);
+        });
     let scroll = w
         .agent_transcript_scroll
         .entry(dut.id.clone())
         .or_default()
         .clone();
     let seen = w.agent_transcript_seen.get(&dut.id).copied().unwrap_or(0);
-    let total_entries = view.as_ref().map(|view| view.total_entries()).unwrap_or(0);
+    let total_entries = view.as_ref().map_or(0, |view| view.total_entries());
     if duthub_desktop::agent_ui::should_follow(seen, total_entries) {
         let near_bottom = {
             let state = scroll.0.borrow();
@@ -384,7 +377,7 @@ pub(super) fn agent_session_panel(
     body
 }
 
-/// Transcript 单行（固定行高供 uniform_list 统一度量）。
+/// Transcript 单行（固定行高供 `uniform_list` 统一度量）。
 /// W4c：Agent 行的说话者标签用当前 Agent 名（host.launch 或注册表定义名），
 /// 不再硬编码 "GOOSE"。
 pub(super) fn agent_transcript_row(
@@ -487,9 +480,7 @@ pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> g
     body = body.child(inspector_row(
         crate::i18n::label("agentInspectorLaunch"),
         &launch
-            .as_ref()
-            .map(|spec| spec.display())
-            .unwrap_or_else(|| crate::i18n::label("agentInspectorNotRecorded").to_owned()),
+            .as_ref().map_or_else(|| crate::i18n::label("agentInspectorNotRecorded").to_owned(), duthub_desktop::agent_host::AgentLaunchSpec::display),
         p,
     ));
     if let Some(port) = view.port() {
@@ -581,13 +572,12 @@ pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> g
     let audit_rows = w
         .device
         .audit_sink()
-        .map(|sink| {
+        .map_or_default(|sink| {
             duthub_desktop::agent_ui::inspector_audit_events(
                 &sink.recent(200),
                 view.credential_id().as_deref(),
             )
-        })
-        .unwrap_or_default();
+        });
     body = body.child(
         div()
             .flex()
@@ -1070,13 +1060,11 @@ pub(super) fn agent_registry_section(
         let toggle_id = agent.id.clone();
         let source = agent.program_path().map_or_else(
             || crate::i18n::label("agentRegistryEmbedded").to_owned(),
-            |path| path.to_owned(),
+            std::borrow::ToOwned::to_owned,
         );
         let hash = agent
             .expected_sha256
-            .as_deref()
-            .map(|hash| format!("{}…", hash.get(..12).unwrap_or(hash)))
-            .unwrap_or_else(|| crate::i18n::label("agentRegistryHashUnpinned").to_owned());
+            .as_deref().map_or_else(|| crate::i18n::label("agentRegistryHashUnpinned").to_owned(), |hash| format!("{}…", hash.get(..12).unwrap_or(hash)));
         let state = if agent.enabled {
             crate::i18n::label("agentRegistryEnabled")
         } else {

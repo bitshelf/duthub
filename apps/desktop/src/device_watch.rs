@@ -80,7 +80,7 @@ pub trait DeviceProbe: Send + Sync {
     fn probe_usb(&self, tool: &str, executable: &str) -> Result<Vec<String>, String>;
 }
 
-/// Production probe using FFmpeg DirectShow/V4L2 and ADB/HDC CLIs.
+/// Production probe using `FFmpeg` DirectShow/V4L2 and ADB/HDC CLIs.
 pub struct RealDeviceProbe;
 
 impl DeviceProbe for RealDeviceProbe {
@@ -391,7 +391,7 @@ mod tests {
 
         // Both online -> no events, and display name is learned.
         assert!(watch.tick_at(1_000));
-        assert!(watch.drain_events().is_empty());
+        assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
 
         // Both unplug -> Offline events with resolved friendly device name.
         *probe.media.lock().unwrap() = Ok(Vec::new());
@@ -418,13 +418,13 @@ mod tests {
 
         // Inside remind window -> silent.
         assert!(watch.tick_at(15_000));
-        assert!(watch.drain_events().is_empty());
+        assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
 
         // Probe errors do not trigger false alerts or drop offline state.
         *probe.media.lock().unwrap() = Err("ffmpeg missing".into());
         *probe.usb.lock().unwrap() = Err("adb error".into());
         assert!(watch.tick_at(80_000));
-        assert!(watch.drain_events().is_empty());
+        assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
 
         // Both reconnect -> Recovered events.
         *probe.media.lock().unwrap() = Ok(vec![MediaDeviceSnapshot {

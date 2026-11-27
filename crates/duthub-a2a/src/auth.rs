@@ -24,6 +24,7 @@ use crate::task::TaskOwnership;
 /// swap the credential without rebinding the listener.
 pub type SharedToken = Arc<RwLock<Arc<str>>>;
 
+#[must_use]
 pub fn shared_token(initial: &str) -> SharedToken {
     Arc::new(RwLock::new(Arc::from(initial)))
 }
@@ -37,6 +38,7 @@ pub fn token_snapshot(token: &SharedToken) -> String {
 }
 
 /// Split `Authorization: Bearer <token>` (scheme case-insensitive per RFC 7235).
+#[must_use]
 pub fn parse_bearer(header_value: &str) -> Option<&str> {
     let (scheme, rest) = header_value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {
@@ -48,6 +50,7 @@ pub fn parse_bearer(header_value: &str) -> Option<&str> {
 
 /// Constant-time comparison: both sides are hashed first, so response timing
 /// never reflects token content or length.
+#[must_use]
 pub fn bearer_matches(header_value: &str, expected: &str) -> bool {
     let Some(provided) = parse_bearer(header_value) else {
         return false;
@@ -137,6 +140,16 @@ pub struct EvidenceAuthorizer {
     dut_id: Arc<str>,
 }
 
+impl std::fmt::Debug for EvidenceAuthorizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvidenceAuthorizer")
+            .field("token", &"<redacted>")
+            .field("ownership", &self.ownership)
+            .field("dut_id", &self.dut_id)
+            .finish()
+    }
+}
+
 impl EvidenceAuthorizer {
     pub fn new(token: SharedToken, ownership: Arc<TaskOwnership>, dut_id: Arc<str>) -> Self {
         Self {
@@ -177,6 +190,7 @@ pub struct AuthFailureLimiter {
 }
 
 impl AuthFailureLimiter {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -219,6 +233,15 @@ pub struct AuthMiddlewareState {
     pub limiter: Arc<AuthFailureLimiter>,
 }
 
+impl std::fmt::Debug for AuthMiddlewareState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthMiddlewareState")
+            .field("token", &"<redacted>")
+            .field("limiter", &self.limiter)
+            .finish()
+    }
+}
+
 impl AuthMiddlewareState {
     pub fn new(token: SharedToken) -> Self {
         Self {
@@ -230,6 +253,7 @@ impl AuthMiddlewareState {
 
 /// Reject browser-supplied non-loopback `Origin` headers to prevent cross-site
 /// DNS-rebinding / CSRF against the loopback JSON-RPC endpoint.
+#[must_use]
 pub fn is_allowed_loopback_origin(origin: &str) -> bool {
     let trimmed = origin.trim();
     let Some(rest) = trimmed
@@ -259,7 +283,7 @@ pub async fn require_bearer(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if let Some(origin) = request.headers().get(axum::http::header::ORIGIN) {
-        let allowed = origin.to_str().ok().is_some_and(is_allowed_loopback_origin);
+        let allowed = origin.to_str().is_ok_and(is_allowed_loopback_origin);
         if !allowed {
             return (
                 axum::http::StatusCode::FORBIDDEN,

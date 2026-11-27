@@ -71,7 +71,7 @@
 //!
 //! - the transfer listener port must join the global uniqueness/occupancy
 //!   probe (AGENTS.md pit #45) and align with `PortRegistry`
-//!   (crates/duthub-a2a/src/ports.rs:41 — reserve/release/is_reserved/owner_of);
+//!   (crates/duthub-a2a/src/ports.rs:41 — `reserve/release/is_reserved/owner_of`);
 //! - persisting `TransferConfig` into `SettingsFile` (serde shape already
 //!   follows the section conventions so `docs/examples/settings.json`
 //!   roundtrips stay untouched);
@@ -108,33 +108,24 @@ use crate::store::{ExpiringDiskStore, FreeSpace, Fs4FreeSpace};
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// Server assembly failures.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TransferError {
     /// Filesystem or socket problem while setting up the listener.
-    Io(std::io::Error),
+    #[error("transfer io error: {0}")]
+    Io(#[from] std::io::Error),
     /// Configuration could not be resolved.
-    Config(TransferConfigError),
+    #[error("transfer config error: {0}")]
+    Config(#[from] TransferConfigError),
     /// Bind policy violation: non-loopback listener without an authorizer.
+    #[error("bind policy violation: {0}")]
     BindPolicy(String),
     /// The transfer directory is already served by another instance/process.
+    #[error("transfer directory locked: {0}")]
     Locked(String),
     /// The executable directory could not be located for path anchoring.
+    #[error("cannot locate the executable directory")]
     ExeDir,
 }
-
-impl std::fmt::Display for TransferError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "transfer io error: {error}"),
-            Self::Config(error) => write!(f, "transfer config error: {error}"),
-            Self::BindPolicy(msg) => write!(f, "bind policy violation: {msg}"),
-            Self::Locked(msg) => write!(f, "transfer directory locked: {msg}"),
-            Self::ExeDir => write!(f, "cannot locate the executable directory"),
-        }
-    }
-}
-
-impl std::error::Error for TransferError {}
 
 impl TransferError {
     /// Keep the underlying `io::Error` when Salvo has one, so a refused bind
@@ -162,6 +153,19 @@ pub struct TransferServer {
     authorizer: Option<Arc<dyn UploadAuthorizer>>,
     /// DUT served by this instance; `None` for a standalone root.
     dut_id: Option<String>,
+}
+
+impl std::fmt::Debug for TransferServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransferServer")
+            .field("config", &self.config)
+            .field("transfer_dir", &self.transfer_dir)
+            .field("base", &self.base)
+            .field("store", &self.store)
+            .field("authorizer_configured", &self.authorizer.is_some())
+            .field("dut_id", &self.dut_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TransferServer {
@@ -204,7 +208,14 @@ impl TransferServer {
             .map_err(TransferError::Config)?;
         config::ensure_transfer_dir_writable(&transfer_dir, &work_root)
             .map_err(TransferError::Config)?;
-        Self::assemble(config, base, transfer_dir, free_space, authorizer, None)
+        Ok(Self::assemble(
+            config,
+            base,
+            transfer_dir,
+            free_space,
+            authorizer,
+            None,
+        ))
     }
 
     /// Build the receiver for one DUT. `dut_dir` is the directory the host
@@ -242,14 +253,14 @@ impl TransferServer {
         let transfer_dir = dut_dir.join("images");
         config::ensure_transfer_dir_writable(&transfer_dir, &dut_dir)
             .map_err(TransferError::Config)?;
-        Self::assemble(
+        Ok(Self::assemble(
             config,
             base,
             transfer_dir,
             Arc::new(Fs4FreeSpace),
             authorizer,
             Some(dut_id),
-        )
+        ))
     }
 
     fn assemble(
@@ -259,7 +270,7 @@ impl TransferServer {
         free_space: Arc<dyn FreeSpace>,
         authorizer: Option<Arc<dyn UploadAuthorizer>>,
         dut_id: Option<String>,
-    ) -> Result<Self, TransferError> {
+    ) -> Self {
         let locker = MemoryLocker::new();
         let store = Arc::new(ExpiringDiskStore::new(
             transfer_dir.clone(),
@@ -267,7 +278,7 @@ impl TransferServer {
             config.lock_timeout(),
             Arc::new(locker.clone()),
         ));
-        Ok(Self {
+        Self {
             config,
             transfer_dir,
             base,
@@ -276,12 +287,13 @@ impl TransferServer {
             free_space,
             authorizer,
             dut_id,
-        })
+        }
     }
 
     /// Router for hosts that embed the surface into their own Salvo service.
     /// The periodic sweep only runs inside [`TransferServer::serve`]; hosts
     /// that embed the router drive [`TransferServer::gc_now`] themselves.
+    #[must_use]
     pub fn transfer_router(&self) -> Router {
         let mut tus = Tus::new()
             .path(self.base.clone())
@@ -397,16 +409,19 @@ impl TransferServer {
     }
 
     /// Resolved transfer directory.
+    #[must_use]
     pub fn transfer_dir(&self) -> &Path {
         &self.transfer_dir
     }
 
     /// Normalized mount path, e.g. `/transfer`.
+    #[must_use]
     pub fn base_path(&self) -> &str {
         &self.base
     }
 
     /// Store access for hosts and tests asserting the on-disk state.
+    #[must_use]
     pub fn store(&self) -> &ExpiringDiskStore {
         &self.store
     }
@@ -495,9 +510,8 @@ mod tests {
                 transfer_dir: Some(bad.to_string()),
                 ..test_config(tmp.path())
             };
-            let error = match TransferServer::new_in(tmp.path(), config, None) {
-                Err(error) => error,
-                Ok(_) => panic!("expected a config error for {bad:?}"),
+            let Err(error) = TransferServer::new_in(tmp.path(), config, None) else {
+                panic!("expected a config error for {bad:?}");
             };
             assert!(matches!(error, TransferError::Config(_)), "{bad:?}");
         }

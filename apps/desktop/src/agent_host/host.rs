@@ -72,7 +72,7 @@ mod recovery {
 }
 
 /// 有未完成 prompt 时允许的最长无事件时间（F24：10 分钟）。
-pub const PROMPT_HANG_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const PROMPT_HANG_TIMEOUT: Duration = Duration::from_mins(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -217,6 +217,16 @@ pub struct HostManager {
     dirty: Arc<AtomicBool>,
 }
 
+impl std::fmt::Debug for HostManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostManager")
+            .field("work_dir", &self.work_dir)
+            .field("sessions", &self.sessions.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl HostManager {
     pub fn new(
         work_dir: PathBuf,
@@ -295,6 +305,7 @@ impl HostManager {
         // F19：start 内统一 trim + 校验协议/Base URL/模型/密钥，legacy 调用方
         // （非目录路径）也不能绕过协议白名单。
         let binding = binding
+            .as_ref()
             .map(model_env::normalize_binding)
             .transpose()
             .map_err(HostError::Invalid)?;
@@ -320,9 +331,10 @@ impl HostManager {
         let pending = Arc::new(AtomicBool::new(false));
         let last_activity_ms = Arc::new(AtomicU64::new(now_ms()));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let thread_name = format!("duthub-agent-{dut_id}-{}", agent.id);
         let context = WorkerContext {
             dut_id: dut_id.to_owned(),
-            agent: agent.clone(),
+            agent,
             binding,
             launch: launch.clone(),
             work_dir: self.work_dir.clone(),
@@ -340,8 +352,8 @@ impl HostManager {
             mcp_url_override: None,
         };
         let join = std::thread::Builder::new()
-            .name(format!("duthub-agent-{dut_id}-{}", agent.id))
-            .spawn(move || run_worker(context, rx))
+            .name(thread_name)
+            .spawn(move || run_worker(&context, &rx))
             .map_err(|error| HostError::Invalid(format!("Agent 工作线程启动失败: {error}")))?;
         self.sessions.insert(
             dut_id.to_owned(),
@@ -381,9 +393,10 @@ impl HostManager {
         let pending = Arc::new(AtomicBool::new(false));
         let last_activity_ms = Arc::new(AtomicU64::new(now_ms()));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let thread_name = format!("duthub-agent-{dut_id}-{}", agent.id);
         let context = cli::CliWorkerContext {
             dut_id: dut_id.to_owned(),
-            agent: agent.clone(),
+            agent,
             work_dir: self.work_dir.clone(),
             view: view.clone(),
             state: self.state.clone(),
@@ -399,11 +412,11 @@ impl HostManager {
             mcp_url_override: None,
         };
         let join = std::thread::Builder::new()
-            .name(format!("duthub-agent-{dut_id}-{}", agent.id))
+            .name(thread_name)
             .spawn(move || {
                 // `run_cli_worker` records its own terminal state; the JoinHandle
                 // only exists so `tick`/`stop_and_join` can reconcile.
-                let _ = cli::run_cli_worker(context, rx);
+                let _ = cli::run_cli_worker(&context, &rx);
             })
             .map_err(|error| HostError::Invalid(format!("Agent 工作线程启动失败: {error}")))?;
         self.sessions.insert(
@@ -546,6 +559,7 @@ impl HostManager {
     }
 
     /// Arc 视图（不每帧克隆 transcript Vec；渲染层锁 `view.transcript`）。
+    #[must_use]
     pub fn view(&self, dut_id: &str) -> Option<Arc<SessionView>> {
         self.sessions
             .get(dut_id)
@@ -553,6 +567,7 @@ impl HostManager {
     }
 
     /// 本次会话实际解析到的程序/参数/环境（外部 goose 是否被采用）。
+    #[must_use]
     pub fn launch(&self, dut_id: &str) -> Option<AgentLaunchSpec> {
         self.sessions
             .get(dut_id)
@@ -565,7 +580,7 @@ impl HostManager {
     /// 兜底置 Failed；终止态的 entry 保留到下一次 `start` 时再回收（UI 需要显示）。
     pub fn tick(&mut self) -> bool {
         let mut reconciled: Vec<(String, String)> = Vec::new();
-        for (dut_id, session) in self.sessions.iter_mut() {
+        for (dut_id, session) in &mut self.sessions {
             if !session.join.as_ref().is_some_and(JoinHandle::is_finished) {
                 continue;
             }
@@ -604,7 +619,7 @@ impl HostManager {
     }
 
     /// 仅在「会话已终止且工作线程已 join」时回收 entry；线程仍在收尾时保留，
-    /// 避免快速重启出现两个 goose 共享同一 GOOSE_PATH_ROOT（F8）。
+    /// 避免快速重启出现两个 goose 共享同一 `GOOSE_PATH_ROOT（F8`）。
     fn remove_finished(&mut self, dut_id: &str) -> bool {
         let finished = self.sessions.get(dut_id).is_some_and(|session| {
             session.view.status().is_terminal()
@@ -635,17 +650,17 @@ impl Drop for HostManager {
     }
 }
 
-fn run_worker(context: WorkerContext, rx: Receiver<WorkerCommand>) {
+fn run_worker(context: &WorkerContext, rx: &Receiver<WorkerCommand>) {
     let mut budget = RestartBudget::new();
     let mut ready_once = false;
     let mut restarts = 0usize;
     loop {
-        let outcome = prepare_and_run(&context, &rx);
+        let outcome = prepare_and_run(context, rx);
         ready_once |= outcome.ready_reached;
-        cleanup_attempt(&context);
+        cleanup_attempt(context);
 
-        if outcome.stopped || is_stop_requested(&context) {
-            finalize_stopped(&context);
+        if outcome.stopped || is_stop_requested(context) {
+            finalize_stopped(context);
             break;
         }
         if !recovery::should_restart(ready_once, outcome.stopped, outcome.terminal_failure) {
@@ -653,18 +668,18 @@ fn run_worker(context: WorkerContext, rx: Receiver<WorkerCommand>) {
         }
         if !budget.allow(Instant::now()) {
             // A stop that raced the crash wins over the budget failure.
-            if is_stop_requested(&context) {
-                finalize_stopped(&context);
+            if is_stop_requested(context) {
+                finalize_stopped(context);
             } else {
-                fail_restart_budget(&context);
+                fail_restart_budget(context);
             }
             break;
         }
         if !context.view.reset_for_restart() {
             // Only a `Stopped` session is revived. `Failed` is terminal, and a
             // concurrent stop has already moved the view to `Stopping`.
-            if is_stop_requested(&context) {
-                finalize_stopped(&context);
+            if is_stop_requested(context) {
+                finalize_stopped(context);
             }
             break;
         }
@@ -675,12 +690,12 @@ fn run_worker(context: WorkerContext, rx: Receiver<WorkerCommand>) {
             delay.as_secs()
         )));
         context.dirty.store(true, Ordering::Relaxed);
-        if !wait_for_restart(&context, &rx, delay) {
-            finalize_stopped(&context);
+        if !wait_for_restart(context, rx, delay) {
+            finalize_stopped(context);
             break;
         }
     }
-    cleanup_attempt(&context);
+    cleanup_attempt(context);
     // F3 兜底：任何异常返回路径都必须留下终止态，否则会话永远无法重启。
     if !context.view.status().is_terminal() {
         let message = "Agent 工作线程意外结束".to_owned();
@@ -962,13 +977,12 @@ fn run_attempt(
                     fatal = Some("会话尚无 sessionId，无法发送 prompt".into());
                 }
             }
-            Ok(WorkerCommand::Stop) => stop_requested = true,
+            Ok(WorkerCommand::Stop) | Err(TryRecvError::Disconnected) => stop_requested = true,
             Ok(WorkerCommand::Cancel) => {
                 if let Some(session_id) = context.view.session_id() {
                     acp.cancel(&session_id);
                 }
             }
-            Err(TryRecvError::Disconnected) => stop_requested = true,
             Err(TryRecvError::Empty) => {}
         }
         if stop_requested {
@@ -1087,7 +1101,7 @@ fn run_attempt(
 
         if context.pending.load(Ordering::Relaxed) {
             let idle = now_ms().saturating_sub(context.last_activity_ms.load(Ordering::Relaxed));
-            if idle >= PROMPT_HANG_TIMEOUT.as_millis() as u64 {
+            if idle >= u64::try_from(PROMPT_HANG_TIMEOUT.as_millis()).unwrap_or(u64::MAX) {
                 let message = "prompt 超过 10 分钟无任何 ACP 事件，已停止会话".to_owned();
                 context
                     .view
@@ -1233,18 +1247,13 @@ fn wait_for_restart(
             return false;
         }
         match rx.try_recv() {
-            Ok(WorkerCommand::Stop) => {
+            Ok(WorkerCommand::Stop) | Err(TryRecvError::Disconnected) => {
                 context.stop_flag.store(true, Ordering::Relaxed);
                 return false;
             }
             // No session is `Ready` during the backoff, so a prompt or cancel
             // cannot be served; it is ignored rather than queued forever.
-            Ok(WorkerCommand::Prompt(_) | WorkerCommand::Cancel) => {}
-            Err(TryRecvError::Disconnected) => {
-                context.stop_flag.store(true, Ordering::Relaxed);
-                return false;
-            }
-            Err(TryRecvError::Empty) => {}
+            Ok(WorkerCommand::Prompt(_) | WorkerCommand::Cancel) | Err(TryRecvError::Empty) => {}
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -1309,13 +1318,14 @@ fn read_resume_state(path: &Path) -> Result<Option<ResumeState>, String> {
     }
     let value: Value =
         serde_json::from_str(&text).map_err(|error| format!("JSON 解析失败: {error}"))?;
-    let version = value
+    let raw_version = value
         .get("version")
         .and_then(Value::as_u64)
-        .unwrap_or(u64::from(resume_state_version())) as u32;
-    if version != resume_state_version() {
-        return Err(format!("不支持的版本 {version}"));
+        .unwrap_or_else(|| u64::from(resume_state_version()));
+    if raw_version != u64::from(resume_state_version()) {
+        return Err(format!("不支持的版本 {raw_version}"));
     }
+    let version = resume_state_version();
     let field = |key: &str| {
         value
             .get(key)
@@ -1493,7 +1503,7 @@ where
 /// F1：`session/new` 的 `_meta.extensionResults` 必须恰好是 duthub 成功。
 ///
 /// managed config 关闭内置扩展只是前提；运行时仍须校验实际结果，
-/// 否则 GOOSE_MODE 配置漂移或 MCP 不可达时工具面会静默扩大。
+/// 否则 `GOOSE_MODE` 配置漂移或 MCP 不可达时工具面会静默扩大。
 pub fn validate_extension_results(results: &Value) -> Result<(), String> {
     let Some(entries) = results.as_array() else {
         return Err("session/new 未返回 _meta.extensionResults 数组".into());
@@ -1543,10 +1553,13 @@ fn code_text(code: Option<i32>) -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn redact_binding(message: &str, binding: Option<&GooseBinding>) -> String {
@@ -1925,7 +1938,7 @@ mod tests {
             mcp_url_override: Some("http://127.0.0.1:1/mcp".into()),
         };
         let (_tx, rx) = mpsc::channel();
-        run_worker(context, rx);
+        run_worker(&context, &rx);
 
         match view.status() {
             SessionStatus::Failed(message) => {

@@ -18,6 +18,18 @@ pub struct TestRequest {
     pub prompt: String,
 }
 
+impl std::fmt::Debug for TestRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestRequest")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &"[REDACTED]")
+            .field("prompt", &self.prompt)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TestResponse {
     pub latency_ms: u64,
@@ -151,7 +163,7 @@ pub async fn test_model_api(req: &TestRequest) -> Result<TestResponse, String> {
         return Err("Response did not include a model list".into());
     }
     Ok(TestResponse {
-        latency_ms: started.elapsed().as_millis() as u64,
+        latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         reply: String::new(),
     })
 }
@@ -229,7 +241,7 @@ pub async fn test_model_connection(req: &TestRequest) -> Result<TestResponse, St
     };
 
     Ok(TestResponse {
-        latency_ms: started.elapsed().as_millis() as u64,
+        latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         reply: truncate_redacted(&reply, &req.api_key, MAX_REPLY_CHARS),
     })
 }
@@ -377,7 +389,7 @@ mod tests {
             api_key: "local-fixture-key".into(),
             prompt: "Reply with OK.".into(),
         };
-        assert!(test_model_api(&req).await.unwrap().reply.is_empty());
+        assert_eq!(test_model_api(&req).await.unwrap().reply, "");
         assert_eq!(test_model_connection(&req).await.unwrap().reply, "OK");
         server.join().unwrap();
     }

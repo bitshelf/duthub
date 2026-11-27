@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, FluentBuilder, InteractiveElement, i18n, AgentRegistryEdit, In, AppContext, Context, PendingRegistrySave, agent_host, AlertSource, Arc, AgentHostEvents, Mutex, BindingSource, Window, Entity, InputState, InputEvent, AgentPromptEditor, provider_setting, store, PendingGooseSave};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -331,7 +331,7 @@ impl Workbench {
                 self.notify_toast(crate::i18n::label("agentRegistrySaved"));
             }
             Err(error) => {
-                self.notify_toast(format!("{} {error}", crate::i18n::label("saveFailed")))
+                self.notify_toast(format!("{} {error}", crate::i18n::label("saveFailed")));
             }
         }
     }
@@ -608,7 +608,7 @@ impl Workbench {
         self.notify_toast(crate::i18n::label("agentRegistryDeleted"));
     }
 
-    /// Journal + toast + shared AlertCenter entry for agent env cleanup that
+    /// Journal + toast + shared `AlertCenter` entry for agent env cleanup that
     /// did not finish (W4b). The journal is retried at next startup.
     pub(super) fn report_agent_env_cleanup(
         &mut self,
@@ -624,7 +624,7 @@ impl Workbench {
         ) {
             self.notify_toast(i18n::message(
                 "recordPendingCleanupFailed",
-                &[("error", &error.to_string())],
+                &[("error", &error.clone())],
             ));
         }
         let (title, detail) = crate::alerts::control_action_alert_texts(
@@ -657,7 +657,7 @@ impl Workbench {
                 self.agents_error = None;
             }
             Err(error) => {
-                self.notify_toast(format!("{} {error}", crate::i18n::label("saveFailed")))
+                self.notify_toast(format!("{} {error}", crate::i18n::label("saveFailed")));
             }
         }
     }
@@ -692,7 +692,7 @@ impl Workbench {
     /// W4b：产品启动入口统一走 `host.start_entry` —— CLI profile 由它路由到
     /// per-turn CLI 分支；模型绑定只在 goose ACP 时以 `FromSettings` 传入，
     /// CLI 与第三方 ACP 永远拿到 `None`（自带认证，绝不转发 duthub 模型
-    /// Token），绑定解析失败由 start_entry 返回 `HostError::Invalid`。
+    /// Token），绑定解析失败由 `start_entry` 返回 `HostError::Invalid`。
     pub fn start_agent_session(&mut self, dut_id: &str, cx: &mut Context<Self>) {
         if !self.agent_bindings.is_enabled(dut_id) {
             return;
@@ -800,7 +800,7 @@ impl Workbench {
 
     /// 50ms tick：回收已结束的 Agent 工作线程 + 转发 transcript/状态变化（流式重绘）。
     pub fn agent_host_tick(&mut self) -> bool {
-        let host_dirty = self.agent_host.as_mut().is_some_and(|host| host.tick());
+        let host_dirty = self.agent_host.as_mut().is_some_and(duthub_desktop::agent_host::HostManager::tick);
         let toasts: Vec<String> = {
             let mut queue = self.agent_host_toasts.lock().unwrap();
             queue.drain(..).collect()
@@ -854,8 +854,7 @@ impl Workbench {
         let current = self
             .agent_prompts
             .get(dut_id)
-            .map(|editor| editor.state.read(cx).value().to_owned())
-            .unwrap_or_default();
+            .map_or_default(|editor| editor.state.read(cx).value().clone());
         // Value-matched clear (pinned by prompt_clear_only_if_value_matches).
         if duthub_desktop::agent_ui::should_clear_prompt(&current, &sent)
             && let Some(editor) = self.agent_prompts.get(dut_id)

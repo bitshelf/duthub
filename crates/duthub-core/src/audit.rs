@@ -6,7 +6,7 @@
 //! - 双通道：内存环（容量 1000，GUI 面板读取）+ 按日轮换 JSONL 文件
 //!   `<工作目录>/audit/agent-access-YYYYMMDD.jsonl`（权威落盘）。
 //! - **脱敏红线**：token/approval token/authorization 一律不落审计（含 detail
-//!   自由文本，写入前经 [`redact_detail`] 强制擦除）；lease_id 是高熵句柄
+//!   自由文本，写入前经 [`redact_detail`] `强制擦除）；lease_id` 是高熵句柄
 //!   （SPEC §6.3：句柄 ≠ 权限）允许记录。
 //! - **磁盘红线**：单日文件超过 [`MAX_AUDIT_FILE_BYTES`] 时轮转为新文件；
 //!   轮转到 [`MAX_AUDIT_ROTATIONS`] 后停止当日落盘（内存环照常工作），
@@ -39,6 +39,7 @@ pub enum AuditOutcome {
 }
 
 impl AuditOutcome {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             AuditOutcome::Ok => "ok",
@@ -68,17 +69,18 @@ pub struct AuditEvent {
 }
 
 impl AuditEvent {
+    #[must_use]
     pub fn to_jsonl(&self) -> String {
         // 单行压缩：jsonl 每行一个对象
         serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
     }
 }
 
+#[must_use]
 pub fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// 脱敏自由文本：擦除敏感键后跟的值部分（大小写不敏感）。
@@ -87,6 +89,7 @@ pub fn unix_ms() -> u64 {
 /// `authorization`/`bearer`，或以 `token`/`key`/`secret`/`password` 结尾。
 /// 这样 `access_token`、`api-key`、`clientSecret`、`approvalToken` 等变体
 /// 都会命中；`lease_id`、`credential_id` 等非敏感键保持原样（句柄 ≠ 权限）。
+#[must_use]
 pub fn redact_detail(text: &str) -> String {
     let mut cut_ranges: Vec<(usize, usize)> = Vec::new();
     for (start, end) in key_candidates(text) {
@@ -215,6 +218,14 @@ pub struct AuditSink {
     day_file: Mutex<Option<DayFile>>,
 }
 
+impl std::fmt::Debug for AuditSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditSink")
+            .field("dir", &self.dir)
+            .finish_non_exhaustive()
+    }
+}
+
 /// 当日审计文件状态（字节计数驱动轮转，句柄为 `None` 表示已停写）。
 struct DayFile {
     day: String,
@@ -281,7 +292,7 @@ fn open_day_file(dir: &Path, day: &str) -> Result<DayFile, String> {
         .append(true)
         .open(&path)
         .map_err(|err| format!("审计文件打开失败 {}: {err}", path.display()))?;
-    let bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let bytes = file.metadata().map_or(0, |meta| meta.len());
     Ok(DayFile {
         day: day.to_string(),
         file: Some(file),
@@ -295,21 +306,22 @@ fn open_day_file(dir: &Path, day: &str) -> Result<DayFile, String> {
 fn count_rotations(dir: &Path, day: &str) -> u32 {
     let prefix = format!("agent-access-{day}.r");
     std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
+        .map_or(0, |entries| {
+            let count = entries
                 .flatten()
                 .filter(|entry| {
                     let name = entry.file_name();
                     let name = name.to_string_lossy();
                     name.starts_with(&prefix) && name.ends_with(".jsonl")
                 })
-                .count() as u32
+                .count();
+            u32::try_from(count).unwrap_or(u32::MAX)
         })
-        .unwrap_or(0)
 }
 
 impl AuditSink {
     /// 内存环模式（测试 / 无工作目录场景）。
+    #[must_use]
     pub fn memory() -> Arc<Self> {
         Arc::new(Self {
             ring: Mutex::new(VecDeque::new()),
@@ -319,6 +331,7 @@ impl AuditSink {
     }
 
     /// 落盘模式：`<dir>/agent-access-YYYYMMDD.jsonl` 按日轮换（目录即工作目录 `audit/`）。
+    #[must_use]
     pub fn at_dir(dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             ring: Mutex::new(VecDeque::new()),
@@ -328,8 +341,7 @@ impl AuditSink {
     }
 
     /// 记录一条审计事件（脱敏 → 内存环 → tracing → 文件）。全程 best-effort：
-    /// 审计失败不阻断业务操作，仅 tracing::warn。
-    #[allow(clippy::too_many_arguments)]
+    /// 审计失败不阻断业务操作，仅 `tracing::warn`。
     pub fn record(
         &self,
         action: &str,
@@ -349,7 +361,7 @@ impl AuditSink {
             detail: detail.map(redact_detail),
         };
         {
-            let mut ring = self.ring.lock().unwrap();
+            let mut ring = crate::util::lock_unpoisoned(&self.ring);
             if ring.len() >= RING_CAP {
                 ring.pop_front();
             }
@@ -370,7 +382,7 @@ impl AuditSink {
         let Some(dir) = &self.dir else { return };
         let day = day_key(event.ts_unix_ms);
         let line = format!("{}\n", event.to_jsonl());
-        let mut guard = self.day_file.lock().unwrap();
+        let mut guard = crate::util::lock_unpoisoned(&self.day_file);
         let needs_open = guard.as_ref().is_none_or(|state| state.day != day);
         if needs_open {
             match open_day_file(dir, &day) {
@@ -410,14 +422,14 @@ impl AuditSink {
 
     /// 内存环最近 `limit` 条（时间升序，GUI 面板数据源）。
     pub fn recent(&self, limit: usize) -> Vec<AuditEvent> {
-        let ring = self.ring.lock().unwrap();
+        let ring = crate::util::lock_unpoisoned(&self.ring);
         ring.iter().rev().take(limit).rev().cloned().collect()
     }
 }
 
 fn day_key(ts_unix_ms: u64) -> String {
     // 天数 → YYYYMMDD（civil from days 算法，无 chrono 依赖）
-    let days = (ts_unix_ms / 86_400_000) as i64;
+    let days = i64::try_from(ts_unix_ms / 86_400_000).unwrap_or(i64::MAX);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

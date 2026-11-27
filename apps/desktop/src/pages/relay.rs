@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Palette, Window, Context, IntoElement, FluentBuilder, InteractiveElement, ParentElement, Styled, div, px, StatefulInteractiveElement, SharedString, AppContext, InputState, InputEvent, In, setting_row, Input, icon_btn, Disableable, btn, BtnVariant, subtle, RelayConfig, switch_panel_header, toggle, RelayChannels, collapsible_panel, field, Checkbox, chip};
 
 pub(crate) fn render_relay_boards(
     w: &mut Workbench,
@@ -375,9 +375,7 @@ pub(super) fn relay_panel(
         RelayConfig::UsbBoard { board_id, .. } => board_ids.iter().position(|id| id == board_id),
         _ => None,
     };
-    let value = selected
-        .map(|i| options[i].0.clone())
-        .unwrap_or_else(|| crate::i18n::label("controlDeviceUnavailable").into());
+    let value = selected.map_or_else(|| crate::i18n::label("controlDeviceUnavailable").into(), |i| options[i].0.clone());
     let available_channels = if let RelayConfig::UsbBoard { board_id, .. } = &dut.relay {
         w.duts
             .file
@@ -512,7 +510,7 @@ pub(super) fn relay_panel(
                         element.cursor_pointer().on_mouse_down(
                             gpui_kit::MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
-                                this.press_relay(&target, key, channel, window, cx)
+                                this.press_relay(&target, key, channel, window, cx);
                             }),
                         )
                     })

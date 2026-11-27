@@ -1,11 +1,11 @@
 //! 真实串口驱动（M1.2，`--features real-hardware`；D1：tokio-serial）。
 //!
 //! - 单 task 独占 UART 句柄，读写都经由命令通道（docs/ARCHITECTURE.md 线程边界）。
-//! - 终端仿真（PuTTY 模式）：串口字节流直接进 alacritty_terminal `Term`
-//!   （[crate::term] 模块），设备 shell 自己负责回显/提示符/光标/ANSI——本地
+//! - 终端仿真（PuTTY 模式）：串口字节流直接进 `alacritty_terminal` `Term`
+//!   （[`crate::term`] 模块），设备 shell 自己负责回显/提示符/光标/ANSI——本地
 //!   不再伪造 [TX] 行、不做行重组；UI 渲染源是 Term 网格快照（SerialScreen）。
 //! - 日志管道：RX 原始字节块进 .bin（真字节）+ .log（utf8-lossy 文本）+ 总线
-//!   SerialChunk（MCP serial_read 审计源）；TX 走 `log_tx`/`log_keystrokes`
+//!   SerialChunk（MCP `serial_read` 审计源）；TX 走 `log_tx`/`log_keystrokes`
 //!   仅审计不进终端流。
 //! - 断线：`SerialDisconnected` + 指数退避重连（`reconnect_backoff`，上限可配）。
 //!   仿真器跨重连保持（设备 shell 的屏幕状态不因链路抖动丢失）。
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 use duthub_core::ipc::ChunkStyle;
 
@@ -181,7 +182,7 @@ pub async fn run_real_session(
                     // 一次 USB 写事务）。同租约合并不改变 admit 语义（租约上下文
                     // 逐命令已在入口复核，actor 复核对同 ctx 批次等效）；异租约/
                     // 异型命令退回 pending 按序执行。
-                    let (batch, deferred) = absorb_keystrokes(&mut cmd_rx, bytes, &lease);
+                    let (batch, deferred) = absorb_keystrokes(&mut cmd_rx, bytes, lease.as_ref());
                     if let Some(other) = deferred {
                         pending.push_back(other);
                     }
@@ -192,7 +193,6 @@ pub async fn run_real_session(
                         continue 'event;
                     }
                     // 键盘路径（PuTTY）：字节原样下发，无行尾追加、无本地回显
-                    use tracing::Instrument as _;
                     let write = stream
                         .write_all(&merged)
                         .instrument(tracing::info_span!(
@@ -289,7 +289,7 @@ pub fn available_ports() -> duthub_core::DeviceResult<Vec<duthub_core::SerialPor
                 ),
                 tokio_serial::SerialPortType::BluetoothPort => Some("Bluetooth".into()),
                 tokio_serial::SerialPortType::PciPort => Some("PCI".into()),
-                _ => None,
+                tokio_serial::SerialPortType::Unknown => None,
             },
         })
         .collect())
@@ -326,7 +326,7 @@ mod live_tests {
         assert!(started, "{port} was enumerated but did not open");
     }
 
-    /// 从订阅 + 会话缓冲收集 SerialChunk 文本（缓冲为准）。
+    /// 从订阅 + 会话缓冲收集 `SerialChunk` 文本（缓冲为准）。
     fn collect(
         service: &crate::DeviceService,
         rx: &mut crate::broadcast::Receiver<EventEnvelope>,
@@ -367,8 +367,8 @@ mod live_tests {
     /// H1.3 波特率热切换真机验证（`cargo test -p duthub-device --features real-hardware -- --ignored --nocapture`）。
     ///
     /// 前置：对端为可执行 shell 的真实串口（实测 COM30 @ 115200，root shell）。
-    /// 步骤：115200 打开 → 写 `echo` 得到设备执行输出 → SetBaud 9600（关闭重开
-    /// 路径，期间不发送任何字节）→ 断言"@ 9600 已打开"→ SetBaud 115200 →
+    /// 步骤：115200 打开 → 写 `echo` 得到设备执行输出 → `SetBaud` 9600（关闭重开
+    /// 路径，期间不发送任何字节）→ 断言"@ 9600 已打开"→ `SetBaud` 115200 →
     /// 写 `echo` 再次得到设备输出（链路完整恢复）。
     ///
     /// 终端仿真重构后的断言形态：串口读侧按原始块进 SerialChunk（回显与执行

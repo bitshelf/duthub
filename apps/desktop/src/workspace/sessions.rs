@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, i18n, InteractiveElement, In, store, AppContext, FluentBuilder, InstallFinishedOutcome, ToolPurpose, tool_failure_label, SessionView, UiEvent, AlertSource, ChunkStyle, LineKind, parse_serial_open_baud, agent, LinkState, LogLine, SharedString, Ordering, broadcast};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -42,24 +42,19 @@ impl Workbench {
         let mut candidate = self.settings.clone();
         if value.is_empty() || value == spec.url {
             candidate.tools.download.urls.remove(spec.id);
+        } else if let Ok(url) = duthub_tooldown::validate_download_url(spec, value) {
+            candidate
+                .tools
+                .download
+                .urls
+                .insert(spec.id.to_owned(), url.to_string());
         } else {
-            match duthub_tooldown::validate_download_url(spec, value) {
-                Ok(url) => {
-                    candidate
-                        .tools
-                        .download
-                        .urls
-                        .insert(spec.id.to_owned(), url.to_string());
-                }
-                Err(_) => {
-                    self.notify_toast(i18n::label(if spec.id == "goose" {
-                        "toolGooseUrlInvalid"
-                    } else {
-                        "toolFailDownloadUrl"
-                    }));
-                    return;
-                }
-            }
+            self.notify_toast(i18n::label(if spec.id == "goose" {
+                "toolGooseUrlInvalid"
+            } else {
+                "toolFailDownloadUrl"
+            }));
+            return;
         }
         if let Err(error) = store::save_settings_secured(&self.data_dir, &candidate) {
             self.notify_toast(format!("{} {error}", i18n::label("saveFailed")));
@@ -311,7 +306,7 @@ impl Workbench {
                     ChunkStyle::Mark => LineKind::Mark,
                 };
                 if self.rec_on {
-                    self.rec_buffer.push(text.clone().to_string());
+                    self.rec_buffer.push(text.clone().clone());
                 }
                 let opened_baud = if view.source == "device" && *style == ChunkStyle::Dim {
                     parse_serial_open_baud(text)
@@ -393,9 +388,7 @@ impl Workbench {
                 .file
                 .duts
                 .iter()
-                .find(|d| d.id == dut_id)
-                .map(|d| d.name.clone())
-                .unwrap_or_else(|| dut_id.clone());
+                .find(|d| d.id == dut_id).map_or_else(|| dut_id.clone(), |d| d.name.clone());
             self.report_serial_session_failure(
                 &dut_id,
                 &dut_label,
@@ -478,9 +471,7 @@ impl Workbench {
                 .file
                 .duts
                 .iter()
-                .find(|d| d.id == alert.dut_id)
-                .map(|d| d.name.clone())
-                .unwrap_or_else(|| alert.dut_id.clone());
+                .find(|d| d.id == alert.dut_id).map_or_else(|| alert.dut_id.clone(), |d| d.name.clone());
             let (title, detail) = crate::alerts::heartbeat_alert_texts(&label, &alert.message);
             self.alerts.lock().unwrap().report_for(
                 &alert.dut_id,

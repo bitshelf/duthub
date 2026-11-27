@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Palette, Window, Context, IntoElement, Styled, div, px, ParentElement, SharedString, StatefulInteractiveElement, InteractiveElement, FluentBuilder, Switch, AppContext, icon_btn, btn, BtnVariant, field, In, chip, settings_panel, Div, setting_row, toggle};
 
 // ---------------------------------------------------------------------------
 // 串口终端设置（设置浮层导航，与「控制设备」同级）
@@ -228,7 +228,7 @@ pub(super) fn prompt_rules_panel(
             w.text_field(
                 In::SerialRuleRegex,
                 &regex,
-                r#"(?i)(error|fail|panic)"#,
+                r"(?i)(error|fail|panic)",
                 false,
                 p,
                 window,

@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, store, i18n, In, configured_terminal_font_size, FluentBuilder, serial_backspace_byte, serial_enter_bytes, DEFAULT_TERMINAL_FONT_SIZE, Window, SharedString, Pixels, Styled, theme, px, Context, IntoElement, SearchableVec, AppContext, SelectState, SelectEvent, FontPicker, ParentElement, div, Select, KeyDownEvent, MAX_TERMINAL_FONT_SIZE, MIN_TERMINAL_FONT_SIZE, Duration, InteractiveElement, DutAction, DutGrant, HashMap, boot_reference_path, LinkState, GarbleLevel, Lang, DutsState};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -132,18 +132,12 @@ impl Workbench {
         let trimmed = raw.trim();
         let idle = if trimmed.is_empty() {
             None
-        } else {
-            match trimmed
-                .parse::<u32>()
-                .ok()
-                .and_then(duthub_desktop::capture_backend::validate_idle_secs)
-            {
-                Some(secs) => Some(secs),
-                None => {
-                    self.notify_toast(crate::i18n::label("invalidCaptureIdle"));
-                    return;
-                }
-            }
+        } else if let Some(secs) = trimmed
+            .parse::<u32>()
+            .ok()
+            .and_then(duthub_desktop::capture_backend::validate_idle_secs) { Some(secs) } else {
+            self.notify_toast(crate::i18n::label("invalidCaptureIdle"));
+            return;
         };
         let mut candidate = self.settings.clone();
         candidate.tools.capture.idle_secs = idle;
@@ -253,7 +247,7 @@ impl Workbench {
             .unwrap_or(&default);
         if state.read(cx).selected_value() != Some(selected) {
             state.update(cx, |state, cx| {
-                state.set_selected_value(selected, window, cx)
+                state.set_selected_value(selected, window, cx);
             });
         }
         div().flex_none().w(px(214.)).child(
@@ -320,7 +314,7 @@ impl Workbench {
     }
 
     /// 设置页「Agent 接入」保存：提交端口/TTL 草稿（解析失败保留原值）并同步。
-    /// 监听端口重启生效（mcp_runtime 启动时绑定）。
+    /// `监听端口重启生效（mcp_runtime` 启动时绑定）。
     pub fn save_agent_access(&mut self) {
         let Ok(port @ 1..=u16::MAX) = self.input_value(In::AgentAccessPort).trim().parse::<u16>()
         else {
@@ -668,7 +662,7 @@ impl Workbench {
         Some((listener.port, token))
     }
 
-    /// 主 MCP 端点实际监听地址（W4a：启动后由 mcp_runtime 填充；绑定失败
+    /// 主 MCP 端点实际监听地址（W4a：启动后由 `mcp_runtime` 填充；绑定失败
     /// 时为 None，失败原因在 [`McpRuntimeHandles::failures`]）。
     pub(crate) fn mcp_actual_endpoint(&self) -> Option<String> {
         self.mcp_bound_endpoint
@@ -930,12 +924,9 @@ impl Workbench {
         let requested = self.input_value(In::DutA2aPort);
         let port = match requested.trim() {
             "" => self.allocate_port_from(8790, None),
-            raw => match raw.parse::<u16>() {
-                Ok(port) => Some(port),
-                _ => {
-                    self.notify_toast(crate::i18n::label("mcpListenerInvalidPort"));
-                    return;
-                }
+            raw => if let Ok(port) = raw.parse::<u16>() { Some(port) } else {
+                self.notify_toast(crate::i18n::label("mcpListenerInvalidPort"));
+                return;
             },
         };
         let Some(port) = port else {
@@ -977,7 +968,7 @@ impl Workbench {
             let _ = duthub_core::delete_a2a_token(dut_id);
             self.notify_toast(i18n::message(
                 "a2aConfigSaveFailed",
-                &[("error", &error.to_string())],
+                &[("error", &error.clone())],
             ));
             return;
         }
@@ -998,7 +989,7 @@ impl Workbench {
         if let Err(error) = self.edit_dut_a2a(dut_id, |config| config.enabled = false) {
             self.notify_toast(i18n::message(
                 "a2aConfigSaveFailed",
-                &[("error", &error.to_string())],
+                &[("error", &error.clone())],
             ));
             return;
         }
@@ -1030,12 +1021,9 @@ impl Workbench {
         let requested = self.input_value(In::DutA2aPort);
         let port = match requested.trim() {
             "" => self.allocate_port_from(8790, None),
-            raw => match raw.parse::<u16>() {
-                Ok(port) => Some(port),
-                _ => {
-                    self.notify_toast(crate::i18n::label("mcpListenerInvalidPort"));
-                    return;
-                }
+            raw => if let Ok(port) = raw.parse::<u16>() { Some(port) } else {
+                self.notify_toast(crate::i18n::label("mcpListenerInvalidPort"));
+                return;
             },
         };
         let Some(port) = port else {
@@ -1064,7 +1052,7 @@ impl Workbench {
         }) {
             self.notify_toast(i18n::message(
                 "a2aConfigSaveFailed",
-                &[("error", &error.to_string())],
+                &[("error", &error.clone())],
             ));
             return;
         }
@@ -1113,7 +1101,7 @@ impl Workbench {
         match rotation {
             Ok(()) => self.notify_toast(i18n::label("a2aTokenRegenerated")),
             Err(error) => {
-                self.notify_toast(i18n::message("a2aTokenHotSwapFailed", &[("error", &error)]))
+                self.notify_toast(i18n::message("a2aTokenHotSwapFailed", &[("error", &error)]));
             }
         }
     }
@@ -1165,7 +1153,7 @@ impl Workbench {
     }
 
     /// DUT 控制权面板「强制接管」：撤销旧租约（generation+1）并授予 GUI；
-    /// Protected/待检查期拒绝（err.message() 带原因）。
+    /// `Protected/待检查期拒绝（err.message()` 带原因）。
     pub fn gui_force_takeover(&mut self, dut_id: &str) {
         if let Some(lease) = self.device.lease_manager() {
             match lease.force_takeover(dut_id) {
@@ -1357,7 +1345,7 @@ impl Workbench {
                         ));
                     }
                     Err(error) => {
-                        w.notify_toast(i18n::message("bootLearningFailed", &[("error", &error)]))
+                        w.notify_toast(i18n::message("bootLearningFailed", &[("error", &error)]));
                     }
                 }
                 cx.notify();
@@ -1825,7 +1813,7 @@ impl Workbench {
     }
 
     /// 导出 MCP 使用技能文档（需求⑥）：`<工作目录>/skill/duthub/SKILL.md`。
-    /// 与 MCP 工具 skill_export 同一生成器（duthub_mcp::skill）。
+    /// 与 MCP 工具 `skill_export` `同一生成器（duthub_mcp::skill`）。
     pub fn export_skill_md(&mut self) {
         match duthub_mcp::skill::export_skill_for_endpoint(
             &self.work_dir,

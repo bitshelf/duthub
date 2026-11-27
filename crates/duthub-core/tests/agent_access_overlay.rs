@@ -2,10 +2,10 @@
 //!
 //! - internal 认证只查 overlay（持久 auth 关闭也能用会话 token）；
 //! - http 认证只查持久表（会话 token 永远打不开主监听器）；
-//! - authorize / grants_for / lease_credential_enabled 合并两表；
+//! - `authorize` / `grants_for` / `lease_credential_enabled` 合并两表；
 //! - `update(settings)` 保留 overlay，`settings()`/`enabled()` 只看持久表；
-//! - set_runtime_listener 的 4 条拒绝规则、remove 幂等与吊销；
-//! - AgentCredential Debug 打码（F25）与“会话 token 永不落 settings.json”。
+//! - `set_runtime_listener` 的 4 条拒绝规则、remove 幂等与吊销；
+//! - `AgentCredential` Debug 打码（F25）与“会话 token 永不落 settings.json”。
 
 use std::path::{Path, PathBuf};
 
@@ -369,7 +369,7 @@ fn persistent_listener_added_after_overlay_wins_the_auth_path() {
     );
 }
 
-/// set_runtime_listener 的 4 条拒绝规则。
+/// `set_runtime_listener` 的 4 条拒绝规则。
 #[test]
 fn runtime_listener_registration_rejects_four_invalid_shapes() {
     let token = generate_token();

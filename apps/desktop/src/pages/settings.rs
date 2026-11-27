@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Palette, Window, Context, IntoElement, Styled, div, px, ParentElement, SharedString, StatefulInteractiveElement, FluentBuilder, In, btn, BtnVariant, AppContext, field, InteractiveElement, switch_panel_header, toggle, collapsible_panel, Div, panel_head, subtle, IpAddr, SocketAddr, Ipv4Addr, icon_btn, Stateful, DutAction, chip, copy_text, LeasePhase, A2aStatus, icon};
 
 // ---------------------------------------------------------------------------
 // 设置
@@ -118,25 +118,22 @@ pub(super) fn tools_download_panel(
         let status = if busy_here {
             status_color = p.accent;
             let downloading = purpose_here != Some(ToolPurpose::Update);
-            match progress.and_then(|pr| progress_percent(pr.bytes, pr.total)) {
-                Some(pct) => {
-                    let pct = pct.to_string();
-                    let key = if downloading {
-                        "toolDownloading"
-                    } else {
-                        "toolUpdating"
-                    };
-                    i18n::message(key, &[("pct", pct.as_str())])
-                }
-                None => {
-                    let bytes = format_bytes(progress.map(|pr| pr.bytes).unwrap_or(0));
-                    let key = if downloading {
-                        "toolDownloadingBytes"
-                    } else {
-                        "toolUpdatingBytes"
-                    };
-                    i18n::message(key, &[("bytes", bytes.as_str())])
-                }
+            if let Some(pct) = progress.and_then(|pr| progress_percent(pr.bytes, pr.total)) {
+                let pct = pct.to_string();
+                let key = if downloading {
+                    "toolDownloading"
+                } else {
+                    "toolUpdating"
+                };
+                i18n::message(key, &[("pct", pct.as_str())])
+            } else {
+                let bytes = format_bytes(progress.map_or(0, |pr| pr.bytes));
+                let key = if downloading {
+                    "toolDownloadingBytes"
+                } else {
+                    "toolUpdatingBytes"
+                };
+                i18n::message(key, &[("bytes", bytes.as_str())])
             }
         } else if let Some(last) = w.tool_last_results.get(spec_id) {
             match &last.outcome {
@@ -1438,7 +1435,7 @@ pub(crate) fn a2a_panel(
             )
         })
         .collect();
-    let a2a_running = if w.a2a.as_ref().is_some_and(|a2a| a2a.any_running()) {
+    let a2a_running = if w.a2a.as_ref().is_some_and(super::super::a2a_runtime::A2aRuntime::any_running) {
         a2a_rows
             .iter()
             .filter(|(_, view)| view.card_url.is_some())
@@ -1814,8 +1811,7 @@ pub(super) fn config_files_panel(
 
 #[cfg(test)]
 mod usb_discovery_tests {
-    #[allow(unused_imports)]
-    use super::*;
+    use super::super::usb_debug_display;
 
     #[test]
     fn absent_saved_adb_binding_is_not_a_discovery_candidate() {

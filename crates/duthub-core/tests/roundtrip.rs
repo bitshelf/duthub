@@ -7,8 +7,7 @@ fn manifest_dir() -> PathBuf {
     // 运行时读取（cargo 注入）：env!() 在编译期烘焙绝对路径，
     // 项目目录改名后旧二进制仍指向旧路径（cargo 指纹不含绝对路径）。
     std::env::var("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+        .map_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
 }
 
 fn examples_dir() -> PathBuf {
@@ -70,7 +69,9 @@ fn mcp_stdio_variant_parse() {
             assert_eq!(command, "duthub-mcp");
             assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("warn"));
         }
-        other => panic!("期望 Stdio，得到 {other:?}"),
+        other @ duthub_core::model::McpConfig::StreamableHttp { .. } => {
+            panic!("期望 Stdio，得到 {other:?}")
+        }
     }
 }
 

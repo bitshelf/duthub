@@ -30,6 +30,7 @@ pub const MIN_WINDOW_BYTES: u32 = 512;
 /// Whether a byte counts as an "unexpected control byte": C0 controls except
 /// the text/format controls a healthy terminal stream legitimately carries,
 /// plus DEL (0x7F).
+#[must_use]
 pub fn is_control_byte(b: u8) -> bool {
     match b {
         // BEL, BS, HT, LF, CR and ESC are normal in text/terminal output.
@@ -60,6 +61,7 @@ impl GarbleMeter {
         }
     }
 
+    #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -77,11 +79,14 @@ impl GarbleMeter {
         } else {
             bytes
         };
-        let control = sample.iter().filter(|b| is_control_byte(**b)).count() as u32;
-        self.chunks.push_back((sample.len() as u32, control));
-        self.bytes += sample.len() as u32;
+        let sample_len = u32::try_from(sample.len()).unwrap_or(u32::MAX);
+        let control =
+            u32::try_from(sample.iter().filter(|b| is_control_byte(**b)).count()).unwrap_or(u32::MAX);
+        self.chunks.push_back((sample_len, control));
+        self.bytes += sample_len;
         self.control += control;
-        while self.bytes > WINDOW_BYTES as u32 {
+        let max_window = u32::try_from(WINDOW_BYTES).unwrap_or(u32::MAX);
+        while self.bytes > max_window {
             let Some((len, ctrl)) = self.chunks.pop_front() else {
                 break;
             };
@@ -92,6 +97,7 @@ impl GarbleMeter {
     }
 
     /// Current statistics. A disabled meter reports the default (`Clean`).
+    #[must_use]
     pub fn stats(&self) -> GarbledStats {
         if !self.enabled {
             return GarbledStats::default();
@@ -117,7 +123,7 @@ impl GarbleMeter {
         }
         // u64 intermediates keep the arithmetic overflow-free even if the
         // window size grows later.
-        ((u64::from(self.control) * 1000) / u64::from(self.bytes)) as u16
+        u16::try_from((u64::from(self.control) * 1000) / u64::from(self.bytes)).unwrap_or(1000)
     }
 
     fn update_level(&mut self) {
@@ -126,25 +132,20 @@ impl GarbleMeter {
             return;
         }
         let p = self.permille();
-        self.level = if p >= GARBLED_ENTER_PERMILLE {
-            GarbleLevel::Garbled
-        } else if self.level == GarbleLevel::Garbled && p >= GARBLED_EXIT_PERMILLE {
+        self.level = match (self.level, p) {
+            (_, p) if p >= GARBLED_ENTER_PERMILLE => GarbleLevel::Garbled,
             // Hysteresis: a Garbled stream only leaves the level once the
             // share drops below `GARBLED_EXIT_PERMILLE` (30‰), so a share
             // hovering in the 30–60‰ band does not flap back to Watch (and
             // re-trigger the entry alert) on every observation.
-            GarbleLevel::Garbled
-        } else if p >= WATCH_ENTER_PERMILLE {
-            GarbleLevel::Watch
-        } else if self.level == GarbleLevel::Garbled {
+            (GarbleLevel::Garbled, p) if p >= GARBLED_EXIT_PERMILLE => GarbleLevel::Garbled,
             // p < GARBLED_EXIT_PERMILLE: one step down to Watch first;
             // `Watch -> Clean` needs another observation below
             // `WATCH_EXIT_PERMILLE` (hysteresis around 30‰/15‰).
-            GarbleLevel::Watch
-        } else if self.level == GarbleLevel::Watch && p < WATCH_EXIT_PERMILLE {
-            GarbleLevel::Clean
-        } else {
-            self.level
+            (GarbleLevel::Garbled, _) => GarbleLevel::Watch,
+            (_, p) if p >= WATCH_ENTER_PERMILLE => GarbleLevel::Watch,
+            (GarbleLevel::Watch, p) if p < WATCH_EXIT_PERMILLE => GarbleLevel::Clean,
+            (current, _) => current,
         };
     }
 }
@@ -256,7 +257,7 @@ mod tests {
         // Window turnover to a clean 4 KiB block: one step down to Watch even
         // though the share is already 0‰.
         meter.observe(&chunk(WINDOW_BYTES, 0));
-        assert_eq!(meter.stats().window_bytes, WINDOW_BYTES as u32);
+        assert_eq!(meter.stats().window_bytes, u32::try_from(WINDOW_BYTES).unwrap());
         assert_eq!(meter.stats().control_permille, 0);
         assert_eq!(meter.stats().level, GarbleLevel::Watch);
 
@@ -329,7 +330,7 @@ mod tests {
         meter.observe(&chunk(2048, 0));
         meter.observe(&chunk(2048, 0));
         let stats = meter.stats();
-        assert_eq!(stats.window_bytes, WINDOW_BYTES as u32);
+        assert_eq!(stats.window_bytes, u32::try_from(WINDOW_BYTES).unwrap());
         assert_eq!(stats.control_permille, 0, "旧的高占比块必须被淘汰");
         assert_eq!(stats.level, GarbleLevel::Watch);
     }
@@ -355,7 +356,7 @@ mod tests {
         payload.extend_from_slice(&vec![b'A'; WINDOW_BYTES]);
         meter.observe(&payload);
         let stats = meter.stats();
-        assert_eq!(stats.window_bytes, WINDOW_BYTES as u32);
+        assert_eq!(stats.window_bytes, u32::try_from(WINDOW_BYTES).unwrap());
         assert_eq!(stats.control_permille, 0);
         assert_eq!(stats.level, GarbleLevel::Clean);
     }

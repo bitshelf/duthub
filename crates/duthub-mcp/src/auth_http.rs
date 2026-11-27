@@ -13,7 +13,7 @@
 //! - Principal 不从工具参数取（SPEC §7）：全部来自本服务注入。
 //!
 //! 实现注：auth 层是手写 tower `Service` 包装（而非 `axum::middleware::from_fn`）——
-//! from_fn 的提取器元组推断在本工作区 rmcp+axum 组合下不收敛（tokio/axum 0.8.9
+//! `from_fn` 的提取器元组推断在本工作区 rmcp+axum 组合下不收敛（tokio/axum 0.8.9
 //! 最小复现通过、接入 rmcp 路由后 Service 绑定不满足），手写实现完全确定且
 //! 不引入额外依赖形态。
 
@@ -45,6 +45,12 @@ pub struct AccessContext {
     pub auth: Arc<AgentAccessRuntime>,
     pub lease: Arc<ControlLeaseManager>,
     pub audit: Arc<AuditSink>,
+}
+
+impl std::fmt::Debug for AccessContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessContext").finish_non_exhaustive()
+    }
 }
 
 impl AccessContext {
@@ -96,6 +102,17 @@ pub struct AuthFailureLimiter {
     sources: Mutex<HashMap<String, AuthFailureWindow>>,
 }
 
+impl std::fmt::Debug for AuthFailureLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthFailureLimiter")
+            .field("limit", &self.limit)
+            .field("window", &self.window)
+            .field("max_sources", &self.max_sources)
+            .field("tracked_sources", &self.tracked_sources())
+            .finish()
+    }
+}
+
 impl Default for AuthFailureLimiter {
     fn default() -> Self {
         Self::new()
@@ -103,16 +120,19 @@ impl Default for AuthFailureLimiter {
 }
 
 impl AuthFailureLimiter {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_limits(AUTH_FAILURE_LIMIT, AUTH_FAILURE_WINDOW)
     }
 
     /// Test/host override for the failure budget.
+    #[must_use]
     pub fn with_limits(limit: usize, window: Duration) -> Self {
         Self::with_limits_and_capacity(limit, window, MAX_TRACKED_AUTH_SOURCES)
     }
 
     /// Test override for both the failure budget and tracked source capacity.
+    #[must_use]
     pub fn with_limits_and_capacity(limit: usize, window: Duration, max_sources: usize) -> Self {
         Self {
             limit,
@@ -228,7 +248,7 @@ impl AuthFailureLimiter {
 }
 
 /// Bearer 认证服务包装：包住 axum Route（/mcp 端点），认证通过时把
-/// [`Principal`] 注入 request extensions——rmcp StreamableHttpService 会把整个
+/// [`Principal`] 注入 request extensions——rmcp `StreamableHttpService` 会把整个
 /// `http::request::Parts`（含 extensions）透传进工具调用上下文
 /// （tower.rs 注入，方案 §1.2 已验证），工具经 [`CurrentPrincipal`] 取回。
 #[derive(Clone)]
@@ -239,6 +259,16 @@ pub struct AuthSvc<S> {
     /// Per-listener failed-auth budget (an attack on one listener cannot lock
     /// out the other listeners sharing the same access context).
     failures: Arc<AuthFailureLimiter>,
+}
+
+impl<S> std::fmt::Debug for AuthSvc<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSvc")
+            .field("ctx", &self.ctx)
+            .field("listener_id", &self.listener_id)
+            .field("failures", &self.failures)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> AuthSvc<S> {
@@ -284,9 +314,7 @@ where
         let mut inner = self.inner.clone();
         let source_key = req
             .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| addr.ip().to_string())
-            .unwrap_or_else(|| DEFAULT_AUTH_SOURCE.to_owned());
+            .get::<ConnectInfo<SocketAddr>>().map_or_else(|| DEFAULT_AUTH_SOURCE.to_owned(), |ConnectInfo(addr)| addr.ip().to_string());
         Box::pin(async move {
             // Reject before touching credentials while this source's window is
             // exhausted: brute-force traffic from one peer cannot keep probing
@@ -317,7 +345,7 @@ where
                         );
                     }
                     req.extensions_mut().insert(principal);
-                    inner.call(req).await.map(|resp| resp.into_response())
+                    inner.call(req).await.map(axum::response::IntoResponse::into_response)
                 }
                 Err(err) => {
                     // 失败细节只进审计（脱敏），响应统一 401 不区分原因（SPEC §5.1.6）。
@@ -402,8 +430,9 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-/// 工具调用上下文中的当前主体：HTTP 请求经 AuthSvc 注入；stdio（无 HTTP parts）
+/// 工具调用上下文中的当前主体：HTTP 请求经 `AuthSvc` 注入；stdio（无 HTTP parts）
 /// 回退 LocalAdmin（偏差 5）。rmcp `#[tool]` 参数提取器。
+#[derive(Debug)]
 pub struct CurrentPrincipal(pub Principal);
 
 /// Resolve the tool-call principal from injected HTTP parts.
@@ -411,7 +440,7 @@ pub struct CurrentPrincipal(pub Principal);
 /// `has_access = true` means this server has an auth context (HTTP listener):
 /// a missing `Parts` must fail closed instead of silently degrading to
 /// [`Principal::LocalAdmin`]. Only access-less servers (stdio/in-process) fall
-/// back to LocalAdmin.
+/// back to `LocalAdmin`.
 pub fn principal_from_parts(
     parts: Option<&http::request::Parts>,
     has_access: bool,
@@ -441,6 +470,7 @@ impl FromContextPart<ToolCallContext<'_, McpServerCore>> for CurrentPrincipal {
 
 /// 服务端确认的租约持有者（SPEC §7：不接受客户端自报身份）。
 /// LocalAdmin（auth 关/stdio）以稳定占位凭据持有租约——句柄即权限（SPEC §6.3）。
+#[must_use]
 pub fn holder_for(principal: &Principal) -> LeaseHolder {
     match principal {
         Principal::LocalAdmin => LeaseHolder::Agent {
@@ -459,12 +489,14 @@ pub fn holder_for(principal: &Principal) -> LeaseHolder {
 
 /// 租约错误 → MCP 错误码（`LeaseRequired/{code}` 前缀约定，方案 §6.2；
 /// 与既有 `ApprovalRequired/{code}` 同型）。
+#[must_use]
 pub fn lease_error_code(err: &LeaseError) -> &'static str {
     match err {
-        LeaseError::Busy { .. } => "DUT_BUSY",
-        // P2-019：等待超时/排队拒均为忙族的等待侧结果，码面与工具描述
-        // 「超时返回 LeaseRequired/DUT_BUSY」一致，语义由 message 承载
-        LeaseError::WaitTimeout { .. } | LeaseError::QueuedAhead { .. } => "DUT_BUSY",
+        // P2-019: WaitTimeout and QueuedAhead are busy-family wait outcomes;
+        // they share the DUT_BUSY code while the message carries the detail.
+        LeaseError::Busy { .. }
+        | LeaseError::WaitTimeout { .. }
+        | LeaseError::QueuedAhead { .. } => "DUT_BUSY",
         LeaseError::Expired => "LEASE_EXPIRED",
         LeaseError::UnknownLease => "LEASE_UNKNOWN",
         LeaseError::NotHolder => "NOT_HOLDER",
@@ -476,6 +508,7 @@ pub fn lease_error_code(err: &LeaseError) -> &'static str {
 }
 
 /// 租约错误 → isError 工具结果（客户端可按前缀+码解析）。
+#[must_use]
 pub fn lease_error(err: &LeaseError) -> rmcp::ErrorData {
     rmcp::ErrorData::new(
         rmcp::model::ErrorCode(-32000),
@@ -485,6 +518,7 @@ pub fn lease_error(err: &LeaseError) -> rmcp::ErrorData {
 }
 
 /// 授权拒绝 → `LeaseRequired/UNAUTHORIZED`（SPEC §6.4：业务互斥不伪装 401）。
+#[must_use]
 pub fn unauthorized_error(dut_id: &str, action: &str) -> rmcp::ErrorData {
     rmcp::ErrorData::new(
         rmcp::model::ErrorCode(-32000),

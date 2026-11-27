@@ -110,8 +110,7 @@ async fn post_initialize(endpoint: SocketAddr, bearer: Option<&str>) -> Option<u
     .ok()?
     .ok()?;
     let auth_line = bearer
-        .map(|token| format!("Authorization: Bearer {token}\r\n"))
-        .unwrap_or_default();
+        .map_or_default(|token| format!("Authorization: Bearer {token}\r\n"));
     let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: {endpoint}\r\n{auth_line}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()

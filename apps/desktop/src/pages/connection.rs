@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Palette, Window, Context, IntoElement, Styled, div, px, InteractiveElement, ParentElement, FluentBuilder, StatefulInteractiveElement, SharedString, icon_btn, icon, relay_panel, connection_agent_panel, alerts_panel, Div, panel_head, toggle, In, field, setting_row, Disableable, btn, BtnVariant, WindowExt, subtle, Switch, BAUD_OPTIONS, AppContext, copy_text, detected_lan_ip, A2aStatus, chip, connection_lease_action};
 
 // ---------------------------------------------------------------------------
 // 连接管理
@@ -296,7 +296,7 @@ pub(super) fn serial_logs_panel(
                                                 .on_click(move |_, window, cx| {
                                                     window.close_dialog(cx);
                                                     view.update(cx, |w, cx| {
-                                                        w.start_boot_learning(&target, cx)
+                                                        w.start_boot_learning(&target, cx);
                                                     });
                                                 }),
                                         ),
@@ -461,7 +461,7 @@ pub(crate) fn collapsible_panel(header: Div, body: Option<Div>, p: &'static Pale
         .min_w_0()
         .border_b_1()
         .border_color(p.line)
-        .child(header.when(body.is_none(), |header| header.border_b_0()))
+        .child(header.when(body.is_none(), gpui_kit::Styled::border_b_0))
         .children(body.map(|body| div().px(px(18.)).py(px(18.)).max_w(px(780.)).child(body)))
 }
 
@@ -1164,7 +1164,7 @@ pub(super) fn a2a_dut_panel(
     // full state (including read errors) separately.
     let a2a_token = token_state
         .as_ref()
-        .and_then(|state| state.as_ref().ok().and_then(|token| token.clone()));
+        .and_then(|state| state.as_ref().ok().and_then(std::clone::Clone::clone));
     let mut body = div();
     // W4a：运行时状态行（Running/Starting/失败原因），替代旧的
     // 「运行时尚未接入」静态提示。W4c：self-test 下运行时为 None → Disabled。

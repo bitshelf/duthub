@@ -67,6 +67,16 @@ pub struct SessionLogWriter {
     enabled: bool,
 }
 
+impl std::fmt::Debug for SessionLogWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionLogWriter")
+            .field("dir", &self.dir)
+            .field("session_id", &self.session_id)
+            .field("enabled", &self.enabled)
+            .finish_non_exhaustive()
+    }
+}
+
 struct PortableArchive {
     root: PathBuf,
     dut_id: String,
@@ -277,6 +287,7 @@ impl SessionLogWriter {
         self.enabled = enabled;
     }
 
+    #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -564,9 +575,12 @@ impl SessionLogWriter {
             return Ok(());
         }
         {
-            let raw = self.raw.as_mut().expect("raw 日志已初始化");
+            let raw = self
+                .raw
+                .as_mut()
+                .expect("ensure_writing initialized raw log writer");
             raw.write_all(raw_bytes)
-                .and_then(|_| raw.flush())
+                .and_then(|()| raw.flush())
                 .map_err(|e| DeviceError::Invalid(format!("写原始日志失败: {e}")))?;
             self.raw_bytes += raw_bytes.len() as u64;
             if self.split_logs && self.raw_bytes >= self.raw_rotate_bytes {
@@ -607,10 +621,13 @@ impl SessionLogWriter {
     }
 
     fn write_text(&mut self, text_line: &str) -> DeviceResult<()> {
-        let text = self.text.as_mut().expect("text 日志已初始化");
+        let text = self
+            .text
+            .as_mut()
+            .expect("ensure_writing initialized text log writer");
         text.write_all(text_line.as_bytes())
-            .and_then(|_| text.write_all(b"\n"))
-            .and_then(|_| text.flush())
+            .and_then(|()| text.write_all(b"\n"))
+            .and_then(|()| text.flush())
             .map_err(|e| DeviceError::Invalid(format!("写文本日志失败: {e}")))?;
         self.text_bytes += text_line.len() as u64 + 1;
         if self.split_logs && self.text_bytes >= self.text_rotate_bytes {
@@ -637,9 +654,12 @@ impl SessionLogWriter {
         if !self.ensure_writing()? {
             return Ok(());
         }
-        let raw = self.raw.as_mut().expect("raw 日志已初始化");
+        let raw = self
+            .raw
+            .as_mut()
+            .expect("ensure_writing initialized raw log writer");
         raw.write_all(raw_bytes)
-            .and_then(|_| raw.flush())
+            .and_then(|()| raw.flush())
             .map_err(|e| DeviceError::Invalid(format!("写原始日志失败: {e}")))?;
         self.raw_bytes += raw_bytes.len() as u64;
         if self.split_logs && self.raw_bytes >= self.raw_rotate_bytes {
@@ -671,6 +691,7 @@ impl SessionLogWriter {
 /// Only the `.log`/`.bin` stream families: the `.rec` structured stream has
 /// its own listing (`rec::list_rec_segments`) and must not leak into this
 /// result (existing callers/tests assert the exact log/bin pair set).
+#[must_use]
 pub fn list_segments(dir: &Path, session_id: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -730,7 +751,11 @@ mod tests {
                     .id
                     .starts_with(&format!("dut/RK3576/logs/RK3576-{number:03}_"))
             );
-            assert!(segment.id.ends_with(".txt"));
+            assert!(
+                Path::new(&segment.id)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -890,9 +915,9 @@ mod tests {
     }
 
     /// LOG-1 逐条实时落盘（AGENTS.md 坑 #47「逐条 flush 语义不变、实时落盘、
-    /// 零丢失」红线）：append/append_raw/note/mark 都是 write_all + flush 后才
+    /// `零丢失」红线）：append/append_raw/note/mark` 都是 `write_all` + flush 后才
     /// 返回（BufWriter 只作缓冲不攒批），任一时刻读盘文件必已含此前所有已确认
-    /// 消息，不缓冲到会话结束。每步写完立即 std::fs::read 断言，全程不手动
+    /// 消息，不缓冲到会话结束。每步写完立即 `std::fs::read` 断言，全程不手动
     /// flush/drop——攒批实现必炸。末尾用宽松时限上界锁机制（200 条 0 间隔
     /// append 远低于 10s），只防攒批/逐条卡死，不写窄时序断言。
     #[test]
@@ -948,7 +973,7 @@ mod tests {
     }
 
     /// LOG-8：`.rec` 结构化记录流逐条 flush 与 .log/.bin 同语义——每次
-    /// append_rec 返回后读盘必须能零拷贝解析出此前全部记录（不攒批），
+    /// `append_rec` 返回后读盘必须能零拷贝解析出此前全部记录（不攒批），
     /// 载荷逐字节一致且含多字节 UTF-8。
     #[test]
     fn rec_records_are_visible_on_disk_immediately() {
@@ -1026,7 +1051,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-10：`.rec` 跟随会话日志开关——停写后 append_rec 不产生任何字节，
+    /// LOG-10：`.rec` 跟随会话日志开关——停写后 `append_rec` 不产生任何字节，
     /// 恢复后继续追加（普通模式句柄保留，内容接续不重开）。
     #[test]
     fn rec_toggle_follows_session_logging() {
@@ -1049,10 +1074,10 @@ mod tests {
     }
 
     /// LOG-2 双流语义分离：.log 记文本行（逐行 \n 结尾），.bin 记真实线上字节
-    /// 不转码不重组（含非法 UTF-8/NUL/\r\n 原样保真）；append_raw（键入字节
+    /// 不转码不重组（含非法 UTF-8/NUL/\r\n `原样保真）；append_raw（键入字节`
     /// 审计）只进 .bin，.log 不动。[TX] 注记换行转义为字面 \r/\n 属 demo.rs
-    /// single_line_tx（P2-034），由既有测试 tx_annotation_is_single_line_for_
-    /// multiline_text 锁定——本测试锁 logs.rs 侧的双流分离与字节保真。
+    /// single_line_tx（P2-034），由既有测试 `tx_annotation_is_single_line_for`_
+    /// `multiline_text` 锁定——本测试锁 logs.rs 侧的双流分离与字节保真。
     #[test]
     fn append_raw_is_bin_only_and_bin_keeps_verbatim_bytes() {
         let dir = test_dir("pair-split");
@@ -1088,7 +1113,7 @@ mod tests {
     }
 
     /// LOG-3 普通模式按会话分文件互不混入：同一目录下 <session>.log/.bin 只装
-    /// 本会话内容，list_segments 只列本会话前缀（`{session_id}.` 开头）的段，
+    /// `本会话内容，list_segments` 只列本会话前缀（`{session_id}.` 开头）的段，
     /// 相近前缀（sess-alicia）与他会话文件一律不进列表。
     #[test]
     fn sessions_in_shared_dir_stay_separate_and_list_filters_prefix() {
@@ -1127,7 +1152,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-3 大小阈值轮换（产品默认文本 2MB/原始 8MB，测试用 with_limits 配
+    /// LOG-3 大小阈值轮换（产品默认文本 2MB/原始 8MB，测试用 `with_limits` 配
     /// 小阈值走真实轮换路径）：文本流与原始流各自独立轮换；旧段内容原样保留
     /// 且在前——按主段 → .1 → .2 时间序拼接必须等于完整流（不丢不乱，边界
     /// 位置不锁死，将来改轮换策略测试仍成立）。
@@ -1165,9 +1190,9 @@ mod tests {
     }
 
     /// LOG-3 归档（portable）模式按 DUT 名称目录 + 递增序号命名，并按配额阈值
-    /// 自动分段（ensure_segment_space：段内累计超过 limit/8 即切新段）：全部
+    /// `自动分段（ensure_segment_space：段内累计超过` limit/8 即切新段）：全部
     /// 行按写入顺序分布在各段中不丢不乱。跨重启续号由既有测试
-    /// portable_log_numbers_continue_across_splits_and_reopen 锁定。
+    /// `portable_log_numbers_continue_across_splits_and_reopen` 锁定。
     #[test]
     fn portable_archive_splits_on_size_threshold_and_keeps_order() {
         let root = test_dir("portable-size");
@@ -1209,8 +1234,8 @@ mod tests {
     /// LOG-4 会话日志开关即时生效且语义明确（串口设置页，普通模式）：
     /// 默认开（实时落盘是产品红线，关闭是用户显式选择）；关 = .log/.bin 停写
     /// 且文件内容逐字节不变；开 = 同文件续写（不开新段）。
-    /// 「总线事件/MCP serial_read 不受影响」属 SessionCtx/驱动层
-    /// （demo.rs emit_raw 总线发布、lib.rs set_session_logging），不在本文件
+    /// 「总线事件/MCP `serial_read` 不受影响」属 SessionCtx/驱动层
+    /// （demo.rs `emit_raw` 总线发布、lib.rs `set_session_logging），不在本文件`
     /// 可测范围；新会话按构造值初始化的接线在 lib.rs 会话创建处。
     #[test]
     fn session_toggle_stops_file_writes_and_resumes_same_file() {
@@ -1261,7 +1286,7 @@ mod tests {
     }
 
     /// LOG-4 归档模式 saving 开关：关 = 当前段 finish 收尾、停写且已确认内容
-    /// 原样保留；开 = 开新段续写（portable 走 next_segment 递增序号），已确认
+    /// 原样保留；开 = 开新段续写（portable 走 `next_segment` 递增序号），已确认
     /// 内容不因开关切换丢失。关闭期间入队的消息被拒写（开关后的输出才落盘）
     /// ——写线程队列的「先入队消息不丢」由 demo.rs 写线程测试锁。
     #[test]
@@ -1430,9 +1455,9 @@ mod tests {
     /// LOG-5 mark 分段标记切文件：标记行本身落当前（旧）段并实时可见，随后
     /// 输出落新段（.log.1/.bin.1），旧段内容原样保留——「分段必须发生在控制
     /// 指令前：供电操作先落段再派发」（红线）。mark 同步返回成败；供电边界经
-    /// 写线程 MarkSync ack 同步执行（排空此前队列后才 mark）的部分在
+    /// 写线程 `MarkSync` ack 同步执行（排空此前队列后才 mark）的部分在
     /// demo.rs/lib.rs，不在本文件可测范围。bare split 的段落保留由既有测试
-    /// explicit_split_keeps_previous_pair_and_writes_to_new_pair 锁定。
+    /// `explicit_split_keeps_previous_pair_and_writes_to_new_pair` 锁定。
     #[test]
     fn mark_splits_pair_and_preserves_previous_segment() {
         let dir = test_dir("mark-split");
@@ -1463,7 +1488,7 @@ mod tests {
     }
 
     /// LOG-5 分段失败同步返回错误：段数达到上限后 split 返回 Err 而非无限增长
-    /// ——该 Err 是写线程 MarkSync ack 携带值，log_control_boundary（lib.rs）
+    /// ——该 Err 是写线程 `MarkSync` ack `携带值，log_control_boundary（lib.rs`）
     /// 据此拦截控制派发并广播错误注记（那半段在 lib.rs/demo.rs）。本测试锁
     /// Err 的产生与同步返回。
     #[test]

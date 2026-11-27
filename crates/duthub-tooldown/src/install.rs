@@ -1,8 +1,8 @@
 //! Download -> verify -> extract -> atomic install pipeline.
 //!
 //! Everything stages inside `<install_root>/.tooldown-<random>/` so the final move is a
-//! same-volume rename (fs::rename cannot cross volumes — a %TEMP% staging dir would break
-//! the atomic move). The staging TempDir cleans the archive and any partial extraction on
+//! same-volume rename (`fs::rename` cannot cross volumes — a %TEMP% staging dir would break
+//! the atomic move). The staging `TempDir` cleans the archive and any partial extraction on
 //! every early return: error, checksum mismatch or cancellation. The previous install is
 //! left untouched until the new one is complete.
 
@@ -55,6 +55,18 @@ pub struct InstallOptions<'a> {
     pub proxy: &'a ProxyConfig,
     /// Optional progress sink (see [`DownloadProgress`]). `None` = silent.
     pub progress: Option<&'a ProgressCallback<'a>>,
+}
+
+impl std::fmt::Debug for InstallOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallOptions")
+            .field("install_root", &self.install_root)
+            .field("force", &self.force)
+            .field("cancel", &self.cancel.is_some())
+            .field("proxy", &self.proxy)
+            .field("progress", &self.progress.is_some())
+            .finish()
+    }
 }
 
 /// Result of an [`install_tool`] call.
@@ -308,7 +320,7 @@ fn sha256_file_streaming(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buf)?;
         if read == 0 {
@@ -451,6 +463,10 @@ mod tests {
     }
 
     impl ChunkSource for MockSource {
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "test mock satisfies async ChunkSource trait without awaiting"
+        )]
         async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ToolInstallError> {
             self.calls += 1;
             match self.chunks.pop_front() {
@@ -544,7 +560,7 @@ mod tests {
             "manifest 必须记录可执行文件自身的摘要，启动门才能校验真实运行的文件"
         );
         assert!(manifest.pinned && manifest.checksum_verified);
-        assert!(!manifest.installed_at.is_empty());
+        assert_ne!(manifest.installed_at, "");
 
         // Files on disk, extras skipped, staging cleaned up.
         let tool_dir = root.path().join("testtool");

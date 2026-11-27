@@ -159,7 +159,7 @@ fn audit_file_rotates_instead_of_growing_without_bound() {
         .collect();
     assert!(files.len() >= 2, "expected a rotated file: {files:?}");
     assert!(
-        files.len() as u32 <= MAX_AUDIT_ROTATIONS + 1,
+        u32::try_from(files.len()).unwrap() <= MAX_AUDIT_ROTATIONS + 1,
         "rotation must stay bounded: {files:?}"
     );
     for path in &files {

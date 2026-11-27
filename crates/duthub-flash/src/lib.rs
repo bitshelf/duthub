@@ -1,7 +1,9 @@
 //! duthub-flash：烧录工具的只读测试执行（`--help` / `--version` 白名单）。
 //!
-//! 规则沿用原 `local_runner.py` 的 SAFE_ARGS 白名单；真实刷写不在此 crate 暴露
+//! 规则沿用原 `local_runner.py` 的 `SAFE_ARGS` 白名单；真实刷写不在此 crate 暴露
 //! （M3.4 后续实现带审批 token 的 Job 状态机，H4 永不自动）。
+
+#![forbid(unsafe_code)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +22,7 @@ const ALLOWED_IMAGE_EXTENSIONS: [&str; 2] = ["img", "bin"];
 /// 只读检查参数白名单（docs/SECURITY.md #4：`--help` 也不可尽信，参数必须显式白名单）。
 pub const SAFE_ARGS: [&str; 5] = ["--help", "-h", "--version", "-V", "-?"];
 
+#[must_use]
 pub fn is_safe_args(args: &[String]) -> bool {
     !args.is_empty() && args.iter().all(|a| SAFE_ARGS.contains(&a.as_str()))
 }
@@ -28,11 +31,19 @@ pub struct FlashTester {
     runner: Arc<dyn ProcessRunner>,
 }
 
+impl std::fmt::Debug for FlashTester {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlashTester").finish_non_exhaustive()
+    }
+}
+
 impl FlashTester {
+    #[must_use]
     pub fn new(runner: Arc<dyn ProcessRunner>) -> Self {
         Self { runner }
     }
 
+    #[must_use]
     pub fn real() -> Self {
         Self::new(Arc::new(RealProcessRunner))
     }
@@ -51,12 +62,11 @@ impl FlashTester {
         self.run_test(executable, &args)
     }
 
-    /// 运行只读测试（仅白名单参数）。返回真实 ProcessResult 供 UI 展示。
+    /// 运行只读测试（仅白名单参数）。返回真实 `ProcessResult` 供 UI 展示。
     pub fn run_test(&self, executable_spec: &str, args: &[String]) -> DeviceResult<ProcessResult> {
         if !is_safe_args(args) {
             return Err(DeviceError::Invalid(format!(
-                "测试参数仅允许 {:?}（烧录类参数需要独立审批流程）",
-                SAFE_ARGS
+                "测试参数仅允许 {SAFE_ARGS:?}（烧录类参数需要独立审批流程）"
             )));
         }
         let exe = resolve_executable(executable_spec)?;
@@ -85,7 +95,7 @@ impl FlashTester {
         let ext = verified_image
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
         if !ext
             .as_deref()
             .is_some_and(|e| ALLOWED_IMAGE_EXTENSIONS.contains(&e))

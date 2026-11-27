@@ -1,5 +1,5 @@
 //! M4.5 stdio 端到端：client 子进程方式启动 `duthub-mcp` bin（快照模式，空态），
-//! 验证 initialize / list_tools / 只读行为 / stdout 纯协议。
+//! 验证 initialize / `list_tools` / 只读行为 / stdout 纯协议。
 
 use rmcp::{
     RoleClient,
@@ -13,7 +13,7 @@ async fn connect(bin: &str) -> RunningService<RoleClient, ClientConfig> {
         TokioChildProcess::new(tokio::process::Command::new(bin)).expect("spawn duthub-mcp");
     serve_client(
         ClientConfig::new(
-            Default::default(),
+            rmcp::model::ClientCapabilities::default(),
             Implementation::new("test-client", "0.1"),
         ),
         process,
@@ -158,8 +158,8 @@ async fn stdio_end_to_end() {
     client.cancel().await.ok();
 }
 
-/// 需求⑥：skill_export 工具已注册（只断言 list_tools，**不调用**——
-/// bin 的 discover_data_dir 在测试 cwd 下可能退化成仓库内 duthub-data/，
+/// `需求⑥：skill_export` 工具已注册（只断言 `list_tools`，**不调用**——
+/// bin 的 `discover_data_dir` 在测试 cwd 下可能退化成仓库内 duthub-data/，
 /// 落盘副作用由 snapshot.rs/skill.rs 单测覆盖，用显式 temp 目录）。
 #[tokio::test]
 async fn skill_export_tool_is_listed() {
@@ -174,8 +174,7 @@ async fn skill_export_tool_is_listed() {
         skill
             .description
             .as_ref()
-            .map(|d| d.contains("SKILL.md"))
-            .unwrap_or(false),
+            .is_some_and(|d| d.contains("SKILL.md")),
         "skill_export 描述应说明导出 SKILL.md"
     );
     client.cancel().await.ok();

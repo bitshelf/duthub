@@ -52,6 +52,7 @@ pub struct RelayChannelsBrief {
 
 impl RelayChannelsBrief {
     /// Human/machine-readable list of bound relay capabilities for this DUT.
+    #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
         let mut caps = Vec::new();
         if self.power.is_some() {
@@ -109,7 +110,7 @@ pub struct LogReadResult {
     pub lines: Vec<LogLineDto>,
 }
 
-/// ADB 设备（adb.list_devices）
+/// ADB `设备（adb.list_devices`）
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdbDeviceDto {
     pub serial: String,
@@ -127,11 +128,13 @@ pub struct ProcessResultDto {
 }
 
 /// 审批校验错误（code 供 MCP 错误信息展示）
+#[derive(Debug)]
 pub struct ApprovalErr {
     pub kind: duthub_core::ApprovalError,
 }
 
 impl ApprovalErr {
+    #[must_use]
     pub fn code(&self) -> &'static str {
         match self.kind {
             duthub_core::ApprovalError::Missing => "Missing",
@@ -140,6 +143,7 @@ impl ApprovalErr {
         }
     }
 
+    #[must_use]
     pub fn message(&self) -> &'static str {
         self.kind.message()
     }
@@ -190,7 +194,7 @@ pub struct SysInfoDto {
     pub hostname: Option<String>,
 }
 
-/// 心跳状态 DTO（last_ok=null 表示尚未探测）。
+/// 心跳状态 `DTO（last_ok=null` 表示尚未探测）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HeartbeatStateDto {
     pub last_ok: Option<bool>,
@@ -212,6 +216,7 @@ pub struct HeartbeatViewDto {
 
 impl HeartbeatViewDto {
     /// 从 core 心跳类型映射（配置 + 最近状态）。
+    #[must_use]
     pub fn new(
         dut_id: &str,
         config: duthub_core::heartbeat::HeartbeatConfig,
@@ -248,7 +253,7 @@ impl HeartbeatViewDto {
 
 // ── 控制租约（dut_acquire/renew/release_control / dut_control_status，方案 §6.2）──
 
-/// 成功授予的租约凭证（dut_acquire_control / dut_renew_control 返回）。
+/// `成功授予的租约凭证（dut_acquire_control` / `dut_renew_control` 返回）。
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LeaseGrantDto {
     pub lease_id: String,
@@ -258,11 +263,11 @@ pub struct LeaseGrantDto {
     pub holder: String,
 }
 
-/// DUT 控制权状态快照（dut_control_status 返回；GUI 面板同源）。
+/// DUT `控制权状态快照（dut_control_status` 返回；GUI 面板同源）。
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ControlStatusDto {
     pub dut_id: String,
-    /// free | held | protected | needs_inspection
+    /// free | held | protected | `needs_inspection`
     pub state: String,
     pub holder: Option<String>,
     pub remaining_secs: Option<u64>,
@@ -274,7 +279,7 @@ pub struct ControlStatusDto {
 /// MCP 状态源。实现方负责把工具调用桥接到设备服务 / 快照文件。
 pub trait McpState: Send + Sync + 'static {
     fn media_streams(&self, _dut_id: &str) -> std::collections::BTreeMap<String, String> {
-        Default::default()
+        std::collections::BTreeMap::new()
     }
 
     fn has_media_binding(&self, _dut_id: &str) -> Option<bool> {
@@ -306,7 +311,7 @@ pub trait McpState: Send + Sync + 'static {
     // ── 控制租约四件套（方案 §6.2；快照模式默认拒绝——仅桌面 HTTP 运行时支持）──
 
     /// 获取独占控制租约（INV-01：每 DUT 至多 1 个）。`wait_ms > 0` 时进入 FIFO
-    /// 等待队列（超时 → Busy）。授权（写类 Grant）由 ServerHandler 校验。
+    /// 等待队列（超时 → Busy）。授权（写类 Grant）由 `ServerHandler` 校验。
     fn dut_acquire_control(
         &self,
         _dut_id: &str,
@@ -316,12 +321,12 @@ pub trait McpState: Send + Sync + 'static {
         Err("控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 续租（TTL 重置；generation 不变）。过期/撤销 → LeaseRequired/LEASE_EXPIRED。
+    /// 续租（TTL 重置；generation 不变）。过期/撤销 → `LeaseRequired/LEASE_EXPIRED`。
     fn dut_renew_control(&self, _dut_id: &str, _lease_id: &str) -> Result<LeaseGrantDto, String> {
         Err("控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 释放租约（持有者本人；Protected 期拒 → DUT_PROTECTED）。
+    /// 释放租约（持有者本人；Protected 期拒 → `DUT_PROTECTED`）。
     fn dut_release_control(&self, _dut_id: &str, _lease_id: &str) -> Result<(), String> {
         Err("控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
@@ -331,7 +336,7 @@ pub trait McpState: Send + Sync + 'static {
         Err("控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 读取会话日志（seq > since_seq，最多 limit 条）
+    /// 读取会话日志（seq > `since_seq，最多` limit 条）
     fn serial_read(&self, dut_id: &str, since_seq: u64, limit: usize) -> Option<LogReadResult>;
     fn log_archive_dir(&self) -> Option<std::path::PathBuf> {
         None
@@ -339,7 +344,7 @@ pub trait McpState: Send + Sync + 'static {
     fn dut_artifact_root(&self) -> Option<std::path::PathBuf> {
         None
     }
-    /// 向会话写入一行（租约复核在 ServerHandler 完成，identity 透传给
+    /// 向会话写入一行（租约复核在 `ServerHandler` 完成，identity 透传给
     /// device 写入通道做 [D]/[E] 双点复核）
     fn serial_write(
         &self,
@@ -365,7 +370,7 @@ pub trait McpState: Send + Sync + 'static {
 
     /// 控制动作（Power/Reset/PowerKey）：审批令牌（高危动作二次确认）+ 租约身份
     /// 都**透传**给共用设备操作入口
-    /// （duthub-device::control::ControlService）统一校验授权、绑定与动作能力；
+    /// （`duthub-device::control::ControlService）统一校验授权、绑定与动作能力`；
     /// 驱动只接收已解析的设备地址与动作，不在 MCP 层或驱动层重复授权。
     fn control_power(
         &self,
@@ -400,7 +405,7 @@ pub trait McpState: Send + Sync + 'static {
         Err("control.power_cycle is unavailable on this state source".into())
     }
 
-    /// Atomic MaskROM entry (`maskrom ON → reset/power_cycle → hold → maskrom OFF`).
+    /// Atomic `MaskROM` entry (`maskrom ON → reset/power_cycle → hold → maskrom OFF`).
     fn control_enter_maskrom(
         &self,
         _dut_id: &str,
@@ -469,7 +474,7 @@ pub trait McpState: Send + Sync + 'static {
         self.skill_export()
     }
 
-    /// 烧录工具只读测试（白名单参数；preset_id = settings.flashTools[].id 稳定预设 id）
+    /// `烧录工具只读测试（白名单参数；preset_id` = settings.flashTools[].id 稳定预设 id）
     fn flash_test(&self, preset_id: &str) -> Result<ProcessResultDto, String>;
 
     /// List connected Rockusb/MaskROM/Loader devices using a host-configured flash preset.
@@ -501,7 +506,10 @@ pub trait McpState: Send + Sync + 'static {
 
     /// Bound-DUT ADB debugging action (`shell` | `reboot` | `reboot_loader` | `logcat` | `push` | `pull`).
     /// File transfer paths are strictly confined to the DUT's owned directory.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors MCP adb_exec tool schema parameters directly"
+    )]
     fn adb_exec(
         &self,
         _dut_id: &str,

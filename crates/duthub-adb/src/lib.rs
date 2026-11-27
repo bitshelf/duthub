@@ -3,6 +3,8 @@
 //! 契约（docs/SECURITY.md #6）：可执行路径来自 `settings.tools.adbExecutable`；
 //! 校验 `state == device` 才可进入后续写操作（M3 后续任务）。
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +53,7 @@ pub fn choose_target<'a>(
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AndroidPreview {
     executable: std::path::PathBuf,
     serial: String,
@@ -100,18 +102,26 @@ pub struct AdbClient {
     runner: Arc<dyn ProcessRunner>,
 }
 
+impl std::fmt::Debug for AdbClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdbClient").finish_non_exhaustive()
+    }
+}
+
 impl AdbClient {
     pub fn new(runner: Arc<dyn ProcessRunner>) -> Self {
         Self { runner }
     }
 
     /// 默认真实执行器。
+    #[must_use]
     pub fn real() -> Self {
         Self::new(Arc::new(RealProcessRunner))
     }
 
     /// Discover Android capabilities independently from opening an ADB shell. Older
     /// adbd builds and Debian boards may provide shell without Android properties.
+    #[must_use]
     pub fn android_preview(&self, adb_spec: &str, serial: &str) -> Option<AndroidPreview> {
         let executable = resolve_executable(adb_spec).ok()?;
         let sdk = self
@@ -205,6 +215,7 @@ pub fn list_local_server_devices() -> DeviceResult<Vec<AdbDevice>> {
 }
 
 /// 解析 `adb devices -l` 输出：跳过表头、空行与 daemon 提示；取 serial/state/model。
+#[must_use]
 pub fn parse_devices_l(output: &str) -> Vec<AdbDevice> {
     output
         .lines()
@@ -347,8 +358,8 @@ mod tests {
 
     #[test]
     fn empty_and_header_only() {
-        assert!(parse_devices_l("").is_empty());
-        assert!(parse_devices_l("List of devices attached\n\n").is_empty());
+        assert_eq!(parse_devices_l(""), [] as [duthub_core::AdbDevice; 0]);
+        assert_eq!(parse_devices_l("List of devices attached\n\n"), [] as [duthub_core::AdbDevice; 0]);
     }
 
     #[test]
@@ -380,7 +391,7 @@ mod tests {
     }
 }
 
-/// OpenHarmony HDC（HarmonyOS Device Connector）目标设备。
+/// `OpenHarmony` HDC（HarmonyOS Device Connector）目标设备。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HdcTarget {
     /// 连接键（如 `COM5` / `127.0.0.1:5555`）
@@ -389,9 +400,15 @@ pub struct HdcTarget {
     pub state: String,
 }
 
-/// OpenHarmony `hdc` CLI 客户端（发现阶段只读：`hdc list targets`）。
+/// `OpenHarmony` `hdc` CLI 客户端（发现阶段只读：`hdc list targets`）。
 pub struct HdcClient {
     runner: Arc<dyn ProcessRunner>,
+}
+
+impl std::fmt::Debug for HdcClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HdcClient").finish_non_exhaustive()
+    }
 }
 
 impl HdcClient {
@@ -399,6 +416,7 @@ impl HdcClient {
         Self { runner }
     }
 
+    #[must_use]
     pub fn real() -> Self {
         Self::new(Arc::new(RealProcessRunner))
     }
@@ -421,6 +439,7 @@ impl HdcClient {
 }
 
 /// 解析 `hdc list targets` 输出：`<connectKey> <state>`，忽略 `[Empty]` 与空行。
+#[must_use]
 pub fn parse_targets(output: &str) -> Vec<HdcTarget> {
     let mut targets = Vec::new();
     for line in output.lines() {
@@ -457,7 +476,7 @@ mod hdc_tests {
 
     #[test]
     fn parse_targets_empty_output() {
-        assert!(parse_targets("").is_empty());
-        assert!(parse_targets("[Empty]").is_empty());
+        assert_eq!(parse_targets(""), [] as [HdcTarget; 0]);
+        assert_eq!(parse_targets("[Empty]"), [] as [HdcTarget; 0]);
     }
 }

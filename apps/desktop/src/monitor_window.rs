@@ -214,14 +214,14 @@ impl FloatMonitor {
     /// first so the close observer treats it as a programmatic close.
     fn redock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(workbench) = self.workbench.upgrade() {
-            workbench.update(cx, |workbench, cx| workbench.prepare_redock(cx));
+            workbench.update(cx, super::workspace::Workbench::prepare_redock);
         }
         window.remove_window();
     }
 
     /// The toolbar X behaves exactly like the platform close button: the
     /// window goes away and `on_window_closed` drives `UserClosedWindow`.
-    fn close(&mut self, window: &mut Window) {
+    fn close(window: &mut Window) {
         window.remove_window();
     }
 }
@@ -288,7 +288,7 @@ impl Render for FloatMonitor {
             )
             .child(
                 float_icon_button("float-close", "x", p)
-                    .on_click(cx.listener(|this, _, window, _cx| this.close(window))),
+                    .on_click(cx.listener(|_this, _, window, _cx| Self::close(window))),
             );
         let viewport = if let Some(frame) = &self.frame {
             div().relative().flex_1().min_h_0().bg(p.term).child(

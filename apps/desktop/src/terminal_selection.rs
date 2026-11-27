@@ -207,6 +207,11 @@ pub fn hit_test_row(rel_y: f32, row_height: f32, item_count: usize) -> Option<Ro
     if rel_y < 0.0 {
         return Some(RowHit::Above);
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rel_y >= 0.0 and row_height > 0.0 are guarded above; saturating cast is bounds-checked against item_count"
+    )]
     let row = (rel_y / row_height).floor() as usize;
     if row >= item_count {
         Some(RowHit::Below)

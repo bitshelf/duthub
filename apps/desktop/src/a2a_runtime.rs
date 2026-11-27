@@ -34,7 +34,7 @@ fn start_configs(duts: &DutsState) -> Vec<A2aDutConfig> {
         .collect()
 }
 
-/// MCP 侧端口（交给 A2aRuntime 预登记为 External：A2A 不绑定这些端口）。
+/// MCP 侧端口（交给 `A2aRuntime` 预登记为 External：A2A 不绑定这些端口）。
 /// 注意：已启用 DUT 自身的 a2a 端口不在此列——PortRegistry 会对任何已有
 /// 持有者拒绝 reserve，预登记会让运行时拒绝绑定自己的端口。
 fn reserved_mcp_ports(settings: &SettingsFile) -> Vec<u16> {

@@ -26,6 +26,7 @@ pub enum CloseDisposition {
 /// the close degrades to a real exit. `quitting` wins over everything: once the
 /// user picked "quit" from the tray menu, further close requests must destroy
 /// the window instead of hiding it again.
+#[must_use]
 pub fn close_disposition(tray_ready: bool, quitting: bool) -> CloseDisposition {
     if quitting || !tray_ready {
         CloseDisposition::Quit
@@ -65,6 +66,7 @@ const QUIT_PLAN: [CloseStep; 3] = [
 /// channel energised (`docs/design/TRAY_ALERT_DESIGN.md` §3.1). `CloseFloat` always
 /// runs before the main window disappears, because a leftover float window
 /// keeps `windows` non-empty and the process alive with no main window.
+#[must_use]
 pub fn close_plan(disposition: CloseDisposition) -> &'static [CloseStep] {
     match disposition {
         CloseDisposition::HideToTray => &HIDE_PLAN,
@@ -111,6 +113,7 @@ pub const FLASH_MAX_MS: u64 = 30_000;
 /// never produces a balloon; quiet time only lets critical alerts through.
 /// Disabling animations never suppresses a balloon, it only removes the blink,
 /// because the balloon is the only channel the OS guarantees for a hidden icon.
+#[must_use]
 pub fn alert_presentation(
     window_visible: bool,
     animations_enabled: bool,
@@ -152,6 +155,7 @@ pub enum AlertRoute {
 }
 
 /// Collapses a presentation into the routing summary.
+#[must_use]
 pub fn alert_route(presentation: AlertPresentation) -> AlertRoute {
     match presentation {
         AlertPresentation::InAppDialog => AlertRoute::Dialog,
@@ -180,6 +184,7 @@ pub enum FlashStop {
 ///
 /// Any explicit reason stops immediately; without one, the episode stops once
 /// it has run for [`FLASH_MAX_MS`].
+#[must_use]
 pub fn flash_should_stop(started_ms: u64, now_ms: u64, reason: Option<FlashStop>) -> bool {
     if reason.is_some() {
         return true;
@@ -193,6 +198,7 @@ pub fn flash_should_stop(started_ms: u64, now_ms: u64, reason: Option<FlashStop>
 /// The tray thread reacts to `WM_SETTINGCHANGE` with this; the 50 ms tick
 /// cannot see the preference change because it only re-evaluates on a new
 /// alert generation or a flash timeout.
+#[must_use]
 pub fn flash_stops_for_animation_change(flash_active: bool, animations_enabled: bool) -> bool {
     flash_active && !animations_enabled
 }
@@ -212,6 +218,7 @@ pub enum FlashFrame {
 ///
 /// The first half-period is `Lit` so the alert icon appears immediately after
 /// the balloon.
+#[must_use]
 pub fn flash_frame(started_ms: u64, now_ms: u64) -> FlashFrame {
     let elapsed = now_ms.saturating_sub(started_ms);
     if elapsed >= FLASH_MAX_MS {
@@ -246,22 +253,26 @@ impl FlashPlan {
     }
 
     /// When the current episode started, if any.
+    #[must_use]
     pub fn started(&self) -> Option<u64> {
         self.started_ms
     }
 
     /// Whether an episode is running.
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.started_ms.is_some()
     }
 
     /// Whether the episode must end now (only an active episode can expire).
+    #[must_use]
     pub fn should_stop(&self, now_ms: u64) -> bool {
         self.started_ms
             .is_some_and(|started| flash_should_stop(started, now_ms, None))
     }
 
     /// The frame to paint now; `Stop` when no episode is running.
+    #[must_use]
     pub fn frame(&self, now_ms: u64) -> FlashFrame {
         match self.started_ms {
             Some(started) => flash_frame(started, now_ms),
@@ -272,6 +283,10 @@ impl FlashPlan {
 
 /// Everything the router needs for one evaluation, gathered by the tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "tick snapshot of independent UI and OS state flags"
+)]
 pub struct HiddenAlertEnv {
     /// The main window is currently visible.
     pub visible: bool,
@@ -314,6 +329,7 @@ pub struct HiddenAlertRouter {
 }
 
 impl HiddenAlertRouter {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -385,11 +401,13 @@ impl HiddenAlertRouter {
     }
 
     /// When the current blinking episode started, if one is running.
+    #[must_use]
     pub fn flash_started(&self) -> Option<u64> {
         self.flash.started()
     }
 
     /// The blinking plan (pure state, used by the tick's flash decisions).
+    #[must_use]
     pub fn flash_plan(&self) -> FlashPlan {
         self.flash
     }
@@ -404,6 +422,7 @@ impl HiddenAlertRouter {
 /// restarts of the same executable. Two copies of the app in different
 /// directories get different GUIDs and therefore never delete each other's
 /// icons — which is why this must not be a compile-time constant.
+#[must_use]
 pub fn identity_guid_bytes(exe_path: &str) -> [u8; 16] {
     let normalized = exe_path.to_lowercase();
     // Two independent FNV-1a 64 accumulators give the 128 bits. The second one
@@ -439,9 +458,18 @@ const NIN_KEYSELECT_EVENT: u32 = 1025;
 
 /// Splits the point packed into `wParam` of a `NOTIFYICON_VERSION_4` callback
 /// (`GET_X_LPARAM`/`GET_Y_LPARAM`: signed 16-bit halves, little-endian order).
+#[must_use]
 pub fn callback_point(wparam: usize) -> (i32, i32) {
-    let x = (wparam & 0xffff) as u16 as i16 as i32;
-    let y = ((wparam >> 16) & 0xffff) as u16 as i16 as i32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "masked to 16 bits before converting to u16"
+    )]
+    let x = i32::from(((wparam & 0xffff) as u16).cast_signed());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "masked to 16 bits before converting to u16"
+    )]
+    let y = i32::from((((wparam >> 16) & 0xffff) as u16).cast_signed());
     (x, y)
 }
 
@@ -451,6 +479,7 @@ pub fn callback_point(wparam: usize) -> (i32, i32) {
 /// Icon selection and mouse events do. A popup menu invoked from the keyboard
 /// reports the icon's anchor, which is why the menu must not be placed at the
 /// cursor for those events.
+#[must_use]
 pub fn callback_carries_anchor(event: u32) -> bool {
     matches!(
         event,
@@ -468,6 +497,7 @@ pub fn callback_carries_anchor(event: u32) -> bool {
 /// `(0, 0)` — that is what an undefined `wParam` looks like, and trusting it
 /// would open the menu in the screen corner. Callers then fall back to the icon
 /// rectangle (keyboard invocation) or the cursor.
+#[must_use]
 pub fn callback_anchor(event: u32, wparam: usize) -> Option<(i32, i32)> {
     if !callback_carries_anchor(event) {
         return None;

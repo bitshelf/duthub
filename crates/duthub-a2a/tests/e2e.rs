@@ -1,8 +1,8 @@
 //! End-to-end tests for the duthub-a2a loopback surface (W3 acceptance).
 //!
 //! Covers: Agent Card minimalism, Bearer fail-closed, A2A-Version negotiation
-//! with `Vary`, the 3-method strict gate, task lifecycle (SendMessage →
-//! GetTask Completed, CancelTask), messageId dedup, cross-DUT / evidence
+//! with `Vary`, the 3-method strict gate, task lifecycle (`SendMessage` →
+//! `GetTask` Completed, `CancelTask`), messageId dedup, cross-DUT / evidence
 //! scope rejections, the 256 KiB body limit, port gates and live token swap.
 
 use std::net::TcpListener as StdTcpListener;
@@ -57,7 +57,7 @@ impl McpState for StubState {
             name: DUT_NAME.to_owned(),
             source: "device".to_owned(),
             port: "COM8".to_owned(),
-            baud: 115200,
+            baud: 115_200,
         }]
     }
 
@@ -72,7 +72,7 @@ impl McpState for StubState {
             serial: duthub_mcp::state::SerialBindInfo {
                 host: "local".to_owned(),
                 port: "COM8".to_owned(),
-                baud: 115200,
+                baud: 115_200,
                 format: "8N1".to_owned(),
             },
             adb_serial: None,
@@ -248,11 +248,11 @@ async fn body_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("valid JSON body")
 }
 
-fn rpc_request(method: &str, params: Value) -> String {
+fn rpc_request(method: &str, params: &Value) -> String {
     json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string()
 }
 
-fn send_message_params(message_id: &str, data_part: Value) -> Value {
+fn send_message_params(message_id: &str, data_part: &Value) -> Value {
     json!({
         "message": {
             "messageId": message_id,
@@ -350,7 +350,7 @@ async fn agent_card_is_minimal_public_discovery() {
 #[tokio::test]
 async fn jsonrpc_requires_bearer_and_rejects_wrong_token() {
     let TestApp { app, .. } = test_app();
-    let body = rpc_request("ListTasks", json!({}));
+    let body = rpc_request("ListTasks", &json!({}));
 
     let missing = post_json(app.clone(), &body, None, Some("1.0")).await;
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
@@ -386,7 +386,7 @@ async fn empty_bearer_never_matches() {
         let mut guard = token.write().unwrap();
         *guard = Arc::from("");
     }
-    let body = rpc_request("ListTasks", json!({}));
+    let body = rpc_request("ListTasks", &json!({}));
     let response = post_json(app, &body, Some("Bearer "), Some("1.0")).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
@@ -396,7 +396,7 @@ async fn empty_bearer_never_matches() {
 #[tokio::test]
 async fn a2a_version_missing_or_unsupported_rejected_with_vary() {
     let TestApp { app, .. } = test_app();
-    let body = rpc_request("ListTasks", json!({}));
+    let body = rpc_request("ListTasks", &json!({}));
 
     for version in [None, Some("99.0"), Some("0.3")] {
         let response = post_json(
@@ -490,13 +490,13 @@ async fn gated_methods_answer_method_not_found() {
         ),
         (
             "SendStreamingMessage",
-            send_message_params("m-g", skill_part("dut_list", None, json!({}))),
+            send_message_params("m-g", &skill_part("dut_list", None, json!({}))),
         ),
     ];
     for (method, params) in cases {
         let response = post_json(
             app.clone(),
-            &rpc_request(method, params),
+            &rpc_request(method, &params),
             Some(&auth),
             Some("1.0"),
         )
@@ -518,7 +518,7 @@ async fn send_message_runs_dut_list_and_get_task_returns_completed() {
         app.clone(),
         &rpc_request(
             "SendMessage",
-            send_message_params("m-1", skill_part("dut_list", None, json!({}))),
+            &send_message_params("m-1", &skill_part("dut_list", None, json!({}))),
         ),
         Some(&auth),
         Some("1.0"),
@@ -537,7 +537,7 @@ async fn send_message_runs_dut_list_and_get_task_returns_completed() {
     // GetTask round-trips the same task through the authorizer ownership gate.
     let response = post_json(
         app.clone(),
-        &rpc_request("GetTask", json!({ "id": task_id })),
+        &rpc_request("GetTask", &json!({ "id": task_id })),
         Some(&auth),
         Some("1.0"),
     )
@@ -561,14 +561,14 @@ async fn cancel_task_transitions_working_task_to_canceled() {
     let auth = format!("Bearer {TOKEN}");
 
     // returnImmediately: response returns on the first status event (Working).
-    let params = send_message_params("m-cancel", skill_part("dut_list", None, json!({})));
+    let params = send_message_params("m-cancel", &skill_part("dut_list", None, json!({})));
     let with_config = json!({
         "message": params["message"],
         "configuration": { "returnImmediately": true }
     });
     let response = post_json(
         app.clone(),
-        &rpc_request("SendMessage", with_config),
+        &rpc_request("SendMessage", &with_config),
         Some(&auth),
         Some("1.0"),
     )
@@ -581,7 +581,7 @@ async fn cancel_task_transitions_working_task_to_canceled() {
 
     let response = post_json(
         app.clone(),
-        &rpc_request("CancelTask", json!({ "id": task_id })),
+        &rpc_request("CancelTask", &json!({ "id": task_id })),
         Some(&auth),
         Some("1.0"),
     )
@@ -596,7 +596,7 @@ async fn cancel_task_transitions_working_task_to_canceled() {
 
     let response = post_json(
         app,
-        &rpc_request("GetTask", json!({ "id": task_id })),
+        &rpc_request("GetTask", &json!({ "id": task_id })),
         Some(&auth),
         Some("1.0"),
     )
@@ -612,11 +612,11 @@ async fn cancel_task_transitions_working_task_to_canceled() {
 async fn duplicate_message_id_replays_recorded_result_without_execution() {
     let TestApp { app, state, .. } = test_app();
     let auth = format!("Bearer {TOKEN}");
-    let params = send_message_params("m-dup", skill_part("dut_list", None, json!({})));
+    let params = send_message_params("m-dup", &skill_part("dut_list", None, json!({})));
 
     let first = post_json(
         app.clone(),
-        &rpc_request("SendMessage", params.clone()),
+        &rpc_request("SendMessage", &params),
         Some(&auth),
         Some("1.0"),
     )
@@ -632,7 +632,7 @@ async fn duplicate_message_id_replays_recorded_result_without_execution() {
     // fresh task id (ADR-9: no promise of identical task id).
     let replay = post_json(
         app.clone(),
-        &rpc_request("SendMessage", params),
+        &rpc_request("SendMessage", &params),
         Some(&auth),
         Some("1.0"),
     )
@@ -655,7 +655,7 @@ async fn duplicate_message_id_replays_recorded_result_without_execution() {
         app,
         &rpc_request(
             "SendMessage",
-            send_message_params("m-fresh", skill_part("dut_list", None, json!({}))),
+            &send_message_params("m-fresh", &skill_part("dut_list", None, json!({}))),
         ),
         Some(&auth),
         Some("1.0"),
@@ -671,12 +671,12 @@ async fn duplicate_message_id_replays_recorded_result_without_execution() {
 
 // ── Policy rejections land in TASK_STATE_FAILED ──────────────────────────────
 
-async fn expect_policy_failure(app: axum::Router, data_part: Value, kind: &str) {
+async fn expect_policy_failure(app: axum::Router, data_part: &Value, kind: &str) {
     let auth = format!("Bearer {TOKEN}");
     let message_id = format!("m-policy-{kind}");
     let response = post_json(
         app,
-        &rpc_request("SendMessage", send_message_params(&message_id, data_part)),
+        &rpc_request("SendMessage", &send_message_params(&message_id, data_part)),
         Some(&auth),
         Some("1.0"),
     )
@@ -701,7 +701,7 @@ async fn cross_dut_request_is_rejected() {
     let TestApp { app, .. } = test_app();
     expect_policy_failure(
         app,
-        skill_part("dut_status", Some("dut-b"), json!({})),
+        &skill_part("dut_status", Some("dut-b"), json!({})),
         "cross-dut",
     )
     .await;
@@ -712,7 +712,7 @@ async fn smuggled_dut_in_args_is_rejected() {
     let TestApp { app, .. } = test_app();
     expect_policy_failure(
         app,
-        json!({ "skill": "dut_status", "args": { "dutId": "dut-b" } }),
+        &json!({ "skill": "dut_status", "args": { "dutId": "dut-b" } }),
         "args-dut",
     )
     .await;
@@ -723,17 +723,17 @@ async fn non_evidence_skills_are_rejected() {
     let TestApp { app, .. } = test_app();
     expect_policy_failure(
         app.clone(),
-        skill_part("dut_files", None, json!({})),
+        &skill_part("dut_files", None, json!({})),
         "dut_files",
     )
     .await;
     expect_policy_failure(
         app.clone(),
-        skill_part("media_streams", None, json!({})),
+        &skill_part("media_streams", None, json!({})),
         "media",
     )
     .await;
-    expect_policy_failure(app, skill_part("flash_now", None, json!({})), "unknown").await;
+    expect_policy_failure(app, &skill_part("flash_now", None, json!({})), "unknown").await;
 }
 
 #[tokio::test]
@@ -744,7 +744,7 @@ async fn text_part_only_message_is_rejected() {
         app,
         &rpc_request(
             "SendMessage",
-            json!({
+            &json!({
                 "message": {
                     "messageId": "m-text",
                     "role": "ROLE_USER",
@@ -797,7 +797,7 @@ async fn unknown_task_id_is_task_not_found() {
     let auth = format!("Bearer {TOKEN}");
     let response = post_json(
         app,
-        &rpc_request("GetTask", json!({ "id": "no-such-task" })),
+        &rpc_request("GetTask", &json!({ "id": "no-such-task" })),
         Some(&auth),
         Some("1.0"),
     )
@@ -811,7 +811,7 @@ async fn unknown_method_is_method_not_found() {
     let TestApp { app, .. } = test_app();
     let response = post_json(
         app,
-        &rpc_request("FlashNow", json!({})),
+        &rpc_request("FlashNow", &json!({})),
         Some(&format!("Bearer {TOKEN}")),
         Some("1.0"),
     )
@@ -947,6 +947,7 @@ async fn http_post(
     headers: &[(&str, &str)],
     body: &str,
 ) -> (StatusCode, Vec<(String, String)>, Value) {
+    use std::fmt::Write as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
@@ -956,7 +957,7 @@ async fn http_post(
         body.len()
     );
     for (name, value) in headers {
-        request.push_str(&format!("{name}: {value}\r\n"));
+        let _ = write!(request, "{name}: {value}\r\n");
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
@@ -1002,7 +1003,7 @@ async fn set_token_swaps_credential_without_rebind() {
         .await;
     assert!(matches!(outcomes[0].1, A2aStatus::Running { .. }));
 
-    let body = rpc_request("ListTasks", json!({}));
+    let body = rpc_request("ListTasks", &json!({}));
     let (status, _, value) = http_post(
         port,
         "/",

@@ -104,6 +104,7 @@ impl std::fmt::Debug for AgentLaunchSpec {
 }
 
 impl AgentLaunchSpec {
+    #[must_use]
     pub fn display(&self) -> String {
         let source = if self.embedded {
             "内嵌".to_owned()
@@ -154,6 +155,7 @@ pub fn resolve(
 
 /// External programs must be local absolute paths (UNC / SMB network paths are
 /// rejected to prevent NTLM credential leaks and remote binary TOCTOU).
+#[must_use]
 pub fn is_absolute_program(raw: &str) -> bool {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -244,6 +246,7 @@ pub enum GooseInstallState {
 
 impl GooseInstallState {
     /// The program a session would launch, when there is one.
+    #[must_use]
     pub fn program(&self) -> Option<&Path> {
         match self {
             GooseInstallState::Downloaded { path, .. } | GooseInstallState::Path { path } => {
@@ -254,6 +257,7 @@ impl GooseInstallState {
     }
 
     /// Whether the Agent page should show the "go to tool downloads" guidance.
+    #[must_use]
     pub fn needs_install(&self) -> bool {
         matches!(self, GooseInstallState::NotInstalled)
     }
@@ -279,6 +283,7 @@ impl std::fmt::Display for GooseInstallState {
 /// Cheap by design: it only classifies the candidates (no hashing, no version
 /// probe), so the Agent page may call it on every render. The launch path
 /// re-verifies the bytes it picks ([`resolve_builtin_from`]).
+#[must_use]
 pub fn goose_install_state() -> GooseInstallState {
     goose_install_state_from(
         downloaded_goose(),
@@ -288,6 +293,7 @@ pub fn goose_install_state() -> GooseInstallState {
 
 /// [`goose_install_state`] with an explicit downloaded-tools root
 /// (`<config dir>/tools`). Tests and embedders point this at a scratch dir.
+#[must_use]
 pub fn goose_install_state_in(tools_root: &Path) -> GooseInstallState {
     goose_install_state_from(
         downloaded_goose_in(tools_root),
@@ -296,6 +302,7 @@ pub fn goose_install_state_in(tools_root: &Path) -> GooseInstallState {
 }
 
 /// Priority rule, written once: a downloaded install shadows PATH.
+#[must_use]
 pub fn goose_install_state_from(
     downloaded: Option<(PathBuf, String)>,
     path_program: Option<PathBuf>,
@@ -309,12 +316,14 @@ pub fn goose_install_state_from(
 
 /// Downloaded goose under `<config>/tools/goose/`, with the digest recorded by
 /// the install kernel. `None` = not installed / corrupt manifest / missing exe.
+#[must_use]
 pub fn downloaded_goose() -> Option<(PathBuf, String)> {
     let tools_root = crate::tool_resolver::config_tools_root()?;
     downloaded_goose_in(&tools_root)
 }
 
 /// [`downloaded_goose`] anchored at an explicit tools root.
+#[must_use]
 pub fn downloaded_goose_in(tools_root: &Path) -> Option<(PathBuf, String)> {
     crate::tool_resolver::downloaded_install_in(tools_root, GOOSE_TOOL_ID)
 }
@@ -331,7 +340,7 @@ pub fn downloaded_goose_in(tools_root: &Path) -> Option<(PathBuf, String)> {
 pub fn resolve_builtin_from(
     definition: &AgentDefinition,
     env: Vec<(String, String)>,
-    downloaded: Option<(PathBuf, String)>,
+    downloaded: Option<&(PathBuf, String)>,
     path_program: Option<PathBuf>,
 ) -> Result<AgentLaunchSpec, RegistryError> {
     if !definition.is_goose() {
@@ -343,7 +352,7 @@ pub fn resolve_builtin_from(
     // 1. Downloaded install: re-verify the current bytes against the digest the
     //    install kernel recorded, then apply the version gate. duthub never
     //    downloads or pins goose itself — tooldown owns that.
-    if let Some((path, recorded)) = downloaded.as_ref() {
+    if let Some((path, recorded)) = downloaded {
         match verify_downloaded_goose(path, recorded)? {
             Some((program, sha256, line)) => {
                 let args = goose_acp_args(&program, &definition.args);
@@ -443,7 +452,7 @@ fn resolve_builtin_goose(
     resolve_builtin_from(
         definition,
         env,
-        downloaded_goose(),
+        downloaded_goose().as_ref(),
         duthub_core::process::resolve_executable(GOOSE_TOOL_ID).ok(),
     )
 }
@@ -518,6 +527,7 @@ pub fn ensure_goose_version(line: &str) -> Result<(), RegistryError> {
 }
 
 /// 比较版本：解析文本中第一个 `major.minor.patch`，按数值比较。
+#[must_use]
 pub fn version_at_least(actual: &str, minimum: &str) -> bool {
     match (parse_version(actual), parse_version(minimum)) {
         (Some(actual), Some(minimum)) => actual >= minimum,
@@ -526,6 +536,7 @@ pub fn version_at_least(actual: &str, minimum: &str) -> bool {
 }
 
 /// 解析 `goose-acp 1.60.2` / `goose-acp v1.61.0-rc.1` 中的三段版本号。
+#[must_use]
 pub fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
     for token in text.split(|character: char| {
         !(character.is_ascii_alphanumeric() || character == '.' || character == '-')
@@ -667,7 +678,10 @@ mod tests {
     #[test]
     fn goose_launch_arguments_select_the_acp_subcommand() {
         let args = |program: &str, configured: &[&str]| {
-            let configured: Vec<String> = configured.iter().map(|arg| arg.to_string()).collect();
+            let configured: Vec<String> = configured
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             goose_acp_args(Path::new(program), &configured)
         };
         assert_eq!(args("C:/tools/goose/goose.exe", &[]), ["acp"]);
@@ -774,7 +788,7 @@ mod tests {
         let error = resolve_builtin_from(
             &AgentDefinition::goose(),
             Vec::new(),
-            Some((downloaded.clone(), recorded)),
+            Some(&(downloaded.clone(), recorded)),
             Some(path_candidate.clone()),
         )
         .expect_err("同哈希但非 goose 的程序必须 fail closed");
@@ -797,7 +811,7 @@ mod tests {
         let error = resolve_builtin_from(
             &AgentDefinition::goose(),
             Vec::new(),
-            Some((downloaded, recorded)),
+            Some(&(downloaded, recorded)),
             Some(path_candidate.clone()),
         )
         .expect_err("hash mismatch on downloaded goose must fail closed");

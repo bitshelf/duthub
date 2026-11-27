@@ -1653,6 +1653,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "subtle",
+ "thiserror 2.0.21",
  "tokio",
  "tower",
  "tower-http 0.6.11",
@@ -1675,6 +1676,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -1705,6 +1707,7 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uuid",
@@ -1715,6 +1718,7 @@ name = "duthub-desktop"
 version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
+ "anyhow",
  "axum",
  "chrono",
  "duthub-a2a",
@@ -1760,6 +1764,7 @@ dependencies = [
  "serde_json",
  "strsim",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-serial",
  "tracing",
@@ -1777,6 +1782,7 @@ dependencies = [
 name = "duthub-mcp"
 version = "0.1.1"
 dependencies = [
+ "anyhow",
  "axum",
  "base64 0.22.1",
  "duthub-core",
@@ -1789,6 +1795,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tower-service",
 ]
@@ -1800,6 +1807,7 @@ dependencies = [
  "base64 0.22.1",
  "mxc-sdk",
  "tempfile",
+ "thiserror 2.0.21",
  "uuid",
 ]
 
@@ -1813,6 +1821,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "zip",
@@ -1836,6 +1845,7 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]

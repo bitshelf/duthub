@@ -283,7 +283,7 @@ fn remove_plan_runs_strip_before_persist_and_stops_before_dir_delete() {
     assert!(position("stop_and_join") < position("delete_agent_dir"));
     assert_eq!(outcome.dut_id, "dut-1");
     assert!(outcome.complete, "无失败时不得有 warning");
-    assert!(outcome.warnings.is_empty());
+    assert_eq!(outcome.warnings, [] as [std::string::String; 0]);
     assert_eq!(
         outcome.steps,
         vec![
@@ -568,7 +568,7 @@ fn pending_cleanup_journal_roundtrip_and_retry() {
     let (completed, failures) = duthub_desktop::agent_ui::retry_pending_cleanup(&work);
     assert_eq!(completed, 2, "重试成功条目应清零: {failures:?}");
     assert!(failures.is_empty(), "{failures:?}");
-    assert!(load_pending_cleanup(&work).is_empty());
+    assert_eq!(load_pending_cleanup(&work), [] as [duthub_desktop::agent_ui::PendingCleanupEntry; 0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -775,10 +775,9 @@ fn delete_agent_removes_keyring_entries_and_reports_failures() {
     );
     assert_eq!(pending, ["ACME_BROKEN"], "失败键必须进待清理列表");
     // All-success path and the invalid-id guard.
-    assert!(
+    assert_eq!(
         delete_agent_env_entries_with("acme", &["ACME_OK".to_owned()], |_| Ok(()))
-            .unwrap()
-            .is_empty()
+            .unwrap(), [] as [std::string::String; 0]
     );
     assert!(delete_agent_env_entries_with("  ", &[], |_| Ok(())).is_err());
     // Real entry naming goes through core (`acp/<id>/env/<KEY>`); the
@@ -790,7 +789,7 @@ fn delete_agent_removes_keyring_entries_and_reports_failures() {
         env_keys: Vec::new(),
         ..AgentDefinition::goose()
     };
-    assert!(delete_agent_env_entries(&empty).unwrap().is_empty());
+    assert_eq!(delete_agent_env_entries(&empty).unwrap(), [] as [std::string::String; 0]);
     // Failed keys are journalled per agent (merged, never duplicated rows)
     // for the next-startup retry.
     let work = temp_dir("agent-env-cleanup");
@@ -1243,8 +1242,8 @@ fn inspector_filters_audit_by_credential() {
         |event| event.credential_id.as_deref() == Some("cred-1") && event.action == "tool.call"
     ));
     // A session without a credential never inherits unattributed events.
-    assert!(inspector_audit_events(&recent, None).is_empty());
-    assert!(inspector_audit_events(&[], Some("cred-1")).is_empty());
+    assert_eq!(inspector_audit_events(&recent, None), [] as [duthub_core::AuditEvent; 0]);
+    assert_eq!(inspector_audit_events(&[], Some("cred-1")), [] as [duthub_core::AuditEvent; 0]);
 
     // Permission-denial evidence comes from the transcript System entries the
     // worker writes for AcpEvent::PermissionDenied.

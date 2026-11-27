@@ -121,7 +121,7 @@ pub fn chip(id: impl Into<SharedString>, label: &str, p: &Palette) -> Stateful<D
         .child(SharedString::from(label.to_string()))
 }
 
-/// 开关（kit Switch）：受控组件，on 为当前态，on_click 收到请求值。
+/// 开关（kit Switch）：受控组件，on `为当前态，on_click` 收到请求值。
 pub fn toggle(id: &'static str, on: bool, p: &Palette) -> Switch {
     Switch::new(id)
         .checked(on)

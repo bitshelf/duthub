@@ -159,7 +159,7 @@ mod tests {
             rows: vec![ScreenRow {
                 text: "abc".into(),
                 fg: None,
-                bg: Some(0x00ff00),
+                bg: Some(0x00_ff_00),
             }],
             cursor_row: Some(0),
             cursor_char: Some(3),

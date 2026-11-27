@@ -88,23 +88,17 @@ impl MediaField {
             Self::Ffplay => &settings.ffplay,
             Self::Listen => &settings.listen_ip,
             Self::Name(source) => dut
-                .map(|dut| binding(dut, source).name.as_str())
-                .unwrap_or_default(),
+                .map_or_default(|dut| binding(dut, source).name.as_str()),
             Self::Video(source) => dut
-                .map(|dut| binding(dut, source).video.as_str())
-                .unwrap_or_default(),
+                .map_or_default(|dut| binding(dut, source).video.as_str()),
             Self::Audio(source) => dut
-                .map(|dut| binding(dut, source).audio.as_str())
-                .unwrap_or_default(),
+                .map_or_default(|dut| binding(dut, source).audio.as_str()),
             Self::Size(source) => dut
-                .map(|dut| binding(dut, source).video_size.as_str())
-                .unwrap_or_default(),
+                .map_or_default(|dut| binding(dut, source).video_size.as_str()),
             Self::Rate(source) => dut
-                .map(|dut| binding(dut, source).frame_rate.as_str())
-                .unwrap_or_default(),
+                .map_or_default(|dut| binding(dut, source).frame_rate.as_str()),
             Self::Port(source) => dut
-                .map(|dut| binding(dut, source).port.as_str())
-                .unwrap_or_default(),
+                .map_or_default(|dut| binding(dut, source).port.as_str()),
         }
     }
 
@@ -264,7 +258,7 @@ struct InFlight {
     kind: InFlightKind,
     queued_at: Instant,
     started_at: Option<Instant>,
-    /// AgentOp lease acquired for this op; `None` for `recordStop`, whose lease
+    /// `AgentOp` lease acquired for this op; `None` for `recordStop`, whose lease
     /// belongs to the recording registration.
     lease: Option<LeaseId>,
     job_deadline: Option<Instant>,
@@ -549,7 +543,6 @@ impl MediaView {
     }
 
     fn start_bound_capture(
-        &self,
         duts: &DutsState,
         key: &(String, Source),
         input: &CaptureInput,
@@ -575,7 +568,7 @@ impl MediaView {
             }
         }
         let mut resolved = input.clone();
-        resolved.video = endpoint.to_owned();
+        endpoint.clone_into(&mut resolved.video);
         let mut capture = Capture::start(settings, &resolved)?;
         capture.input = input.clone();
         Ok(capture)
@@ -607,7 +600,7 @@ impl MediaView {
         settings.listen_ip = "127.0.0.1".into();
         let mut input = input.clone();
         input.port.clear();
-        let capture = self.start_bound_capture(duts, &key, &input, &settings)?;
+        let capture = Self::start_bound_capture(duts, &key, &input, &settings)?;
         self.draft_preview = Some(DraftPreview {
             capture,
             title,
@@ -671,7 +664,7 @@ impl MediaView {
         }
         self.draft_preview = None;
         self.stop_capture(&key);
-        let capture = self.start_bound_capture(duts, &key, input, settings)?;
+        let capture = Self::start_bound_capture(duts, &key, input, settings)?;
         let preview = capture.inline_preview()?;
         self.sessions.insert(key.clone(), capture);
         self.acquire_monitor_lease(&key);
@@ -709,7 +702,7 @@ impl MediaView {
         let (sender, messages) = mpsc::channel();
         let (devices_tx, devices_rx) = mpsc::channel();
         Self {
-            urls: Default::default(),
+            urls: Arc::default(),
             dir,
             capture: CaptureSettings::default(),
             quota: None,
@@ -910,7 +903,7 @@ impl MediaView {
         // Collect first, then route: an Agent recording's final segment belongs
         // to its `recordStop` reply, never to the panel message (§5.6).
         let mut finished = Vec::new();
-        for (key, session) in self.sessions.iter_mut() {
+        for (key, session) in &mut self.sessions {
             if let Some(result) = session.poll_recording() {
                 finished.push((key.clone(), result));
             }
@@ -992,14 +985,14 @@ impl MediaView {
             } = request;
             match op {
                 MediaOp::RecordStop { recording_id } => {
-                    self.begin_record_stop(id, dut_id, recording_id, reply);
+                    self.begin_record_stop(id, &dut_id, recording_id, reply);
                 }
                 MediaOp::Snapshot { note } => {
                     self.begin_capture_op(
                         duts,
                         id,
                         dut_id,
-                        source,
+                        source.as_deref(),
                         note,
                         InFlightKind::Snapshot,
                         reply,
@@ -1010,7 +1003,7 @@ impl MediaView {
                         duts,
                         id,
                         dut_id,
-                        source,
+                        source.as_deref(),
                         note,
                         InFlightKind::RecordStart,
                         reply,
@@ -1029,12 +1022,12 @@ impl MediaView {
         duts: &DutsState,
         id: OpId,
         dut_id: String,
-        source: Option<String>,
+        source: Option<&str>,
         note: Option<String>,
         kind: InFlightKind,
         reply: tokio::sync::oneshot::Sender<MediaOpReply>,
     ) {
-        let source = match Self::pick_source(duts, &dut_id, source.as_deref()) {
+        let source = match Self::pick_source(duts, &dut_id, source) {
             Ok(source) => source,
             Err(failure) => {
                 reply_error(reply, failure.code, failure.message);
@@ -1123,8 +1116,7 @@ impl MediaView {
         let input = saved_capture(duts, &key.0, key.1)
             .map_err(|error| OpFailure::new(MEDIA_NOT_BOUND, error))?;
         let settings = self.capture.clone();
-        let capture = self
-            .start_bound_capture(duts, key, input, &settings)
+        let capture = Self::start_bound_capture(duts, key, input, &settings)
             .map_err(|error| OpFailure::new(MEDIA_START_FAILED, error))?;
         self.sessions.insert(key.clone(), capture);
         Ok(true)
@@ -1202,7 +1194,7 @@ impl MediaView {
     /// Mirror "this capture is recording" into the ledger; a recording is a
     /// state of the `Capture`, not a lease (§4.2).
     fn mirror_recording_state(&mut self) {
-        for (key, entry) in self.demand.iter_mut() {
+        for (key, entry) in &mut self.demand {
             entry.recording = self.sessions.get(key).is_some_and(Capture::is_recording);
         }
     }
@@ -1275,7 +1267,7 @@ impl MediaView {
         changed
     }
 
-    /// Fail one in-flight op and release the AgentOp lease it still owns.
+    /// Fail one in-flight op and release the `AgentOp` lease it still owns.
     fn fail_op(&mut self, id: OpId, code: &'static str, message: impl Into<String>) {
         if let Some(entry) = self.ops.fail(id, code, message)
             && let Some(lease) = entry.lease
@@ -1333,7 +1325,7 @@ impl MediaView {
 
     /// Start the Agent recording: `record()` returns the first segment
     /// immediately, so the reply and the registry entry happen in this tick.
-    /// The AgentOp lease moves from the op to the recording.
+    /// The `AgentOp` lease moves from the op to the recording.
     fn start_recording_op(&mut self, id: OpId, duts: &DutsState, now: Instant) -> bool {
         let Some(entry) = self.ops.in_flight.get(&id) else {
             return false;
@@ -1426,7 +1418,7 @@ impl MediaView {
     fn begin_record_stop(
         &mut self,
         id: OpId,
-        dut_id: String,
+        dut_id: &str,
         recording_id: RecordingId,
         reply: tokio::sync::oneshot::Sender<MediaOpReply>,
     ) {
@@ -1909,6 +1901,10 @@ pub(crate) fn render_bindings(
 
 fn add_capture_device(media: &mut duthub_core::model::DutMediaConfig) {
     let id = loop {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "random 32-bit device id derived from low bits of UUIDv4"
+        )]
         let id = uuid::Uuid::new_v4().as_u128() as u32;
         if id != 0 && !media.devices.iter().any(|device| device.id == id) {
             break id;
@@ -2442,7 +2438,7 @@ fn source_panel(
                         if let Some(dut) = w.duts.connection_mut(&delete_id) {
                             match source {
                                 Source::Device(id) => {
-                                    dut.media.devices.retain(|device| device.id != id)
+                                    dut.media.devices.retain(|device| device.id != id);
                                 }
                                 Source::Hdmi | Source::Camera => {
                                     if let Some(input) = source.input_mut(&mut dut.media) {
@@ -2470,9 +2466,7 @@ fn source_panel(
     } else if let Err(error) = &readiness {
         error.clone()
     } else {
-        capture
-            .map(Capture::status)
-            .unwrap_or_else(|| crate::i18n::label("notStarted").into())
+        capture.map_or_else(|| crate::i18n::label("notStarted").into(), Capture::status)
     };
     let url = capture
         .filter(|capture| !pending && capture.ready())
@@ -2655,14 +2649,12 @@ fn run_action(
                 capture.screenshot(&w.media.dir, &dut.id, saved_name, w.artifact_quota.clone());
             let sender = w.media.sender.clone();
             std::thread::spawn(move || {
-                let status = screenshot()
-                    .map(|path| {
+                let status = screenshot().map_or_else(|e| e, |path| {
                         crate::i18n::message(
                             "mediaScreenshotSaved",
                             &[("path", &path.display().to_string())],
                         )
-                    })
-                    .unwrap_or_else(|e| e);
+                    });
                 let _ = sender.send(status);
             });
         }
@@ -2927,8 +2919,8 @@ mod tests {
             media::video_modes(&settings, &name)
         }
         .unwrap();
-        assert!(!modes.rates.is_empty());
-        assert!(!modes.sizes.is_empty());
+        assert_ne!(modes.rates, Vec::<String>::new());
+        assert_ne!(modes.sizes, Vec::<(u32, u32)>::new());
         println!(
             "{} resolutions, frame rates: {}",
             modes.sizes.len(),
@@ -2994,7 +2986,7 @@ mod tests {
         assert!(saved_capture(&state, "a", Source::Hdmi).is_err());
         assert!(saved_capture(&state, "b", Source::Camera).is_ok());
         let mut duplicate = state.file.duts[1].clone();
-        duplicate.media = Default::default();
+        duplicate.media = duthub_core::model::DutMediaConfig::default();
         state.file.duts.push(duplicate);
         state.sync_saved_media();
         assert!(saved_capture(&state, "b", Source::Camera).is_err());

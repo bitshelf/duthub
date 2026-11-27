@@ -174,7 +174,7 @@ mod tests {
 
     // 真实密钥库读写集成（Windows Credential Manager；手动运行）
     #[test]
-    #[ignore]
+    #[ignore = "requires live OS credential store; run manually"]
     fn credential_roundtrip() {
         set_key("test-model", "sk-test-123").unwrap();
         assert_eq!(

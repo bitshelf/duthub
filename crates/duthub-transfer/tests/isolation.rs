@@ -68,9 +68,8 @@ async fn for_dut_refuses_a_directory_owned_by_another_dut() {
     let root = tempfile::tempdir().unwrap();
     let dut = root.path().join("shared");
     assert!(TransferServer::for_dut("dut-a", &dut, config(), Some(authorizer())).is_ok());
-    let error = match TransferServer::for_dut("dut-b", &dut, config(), Some(authorizer())) {
-        Ok(_) => panic!("a second DUT must not adopt an owned directory"),
-        Err(error) => error,
+    let Err(error) = TransferServer::for_dut("dut-b", &dut, config(), Some(authorizer())) else {
+        panic!("a second DUT must not adopt an owned directory");
     };
     assert!(matches!(error, TransferError::Config(_)), "{error:?}");
 }
@@ -237,9 +236,8 @@ async fn transfer_root_is_refused_outside_the_work_root() {
         transfer_dir: Some(outside.path().to_string_lossy().to_string()),
         ..config()
     };
-    let error = match TransferServer::new_in(root.path(), config, Some(authorizer())) {
-        Ok(_) => panic!("an absolute root outside the work directory must be refused"),
-        Err(error) => error,
+    let Err(error) = TransferServer::new_in(root.path(), config, Some(authorizer())) else {
+        panic!("an absolute root outside the work directory must be refused");
     };
     assert!(matches!(error, TransferError::Config(_)), "{error:?}");
 }

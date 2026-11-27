@@ -219,8 +219,8 @@ impl McpState for FixtureState {
     fn heartbeat_get(&self, dut_id: &str) -> Result<HeartbeatViewDto, String> {
         Ok(HeartbeatViewDto::new(
             dut_id,
-            Default::default(),
-            Default::default(),
+            duthub_core::heartbeat::HeartbeatConfig::default(),
+            duthub_core::heartbeat::HeartbeatState::default(),
         ))
     }
 

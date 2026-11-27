@@ -152,7 +152,10 @@ fn silent_board_alerts_once_after_confirmations() {
 
     // First failure: below the threshold, nothing is reported yet.
     assert!(watch.tick_at(0));
-    assert!(watch.drain_events().is_empty());
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
     // Second consecutive failure: confirmed offline.
     assert!(watch.tick_at(1_000));
     let events = watch.drain_events();
@@ -168,7 +171,10 @@ fn silent_board_alerts_once_after_confirmations() {
     );
     // Still offline, but the reminder interval has not elapsed: no repeat.
     assert!(watch.tick_at(2_000));
-    assert!(watch.drain_events().is_empty());
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
     assert_eq!(
         watch.states(),
         vec![("board-1".to_string(), RelayBoardState::Offline)]
@@ -186,7 +192,10 @@ fn missing_port_alerts_after_confirmations() {
     let watch = watch(probe);
     watch.sync_boards(&[board("board-1", "COM25")]);
     watch.tick_at(0);
-    assert!(watch.drain_events().is_empty());
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
     watch.tick_at(1_000);
     let events = watch.drain_events();
     assert_eq!(events.len(), 1);
@@ -353,7 +362,10 @@ fn re_confirmed_outage_after_a_hold_waits_for_the_reminder_interval() {
         .unwrap()
         .set("board-1", RelayProbeSample::Gated("按住测试中".into()));
     watch.tick_at(2_000); // silent, streak cleared
-    assert!(watch.drain_events().is_empty());
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
 
     script
         .lock()
@@ -425,7 +437,10 @@ fn answered_probe_recovers_an_offline_board_once() {
     // Staying online emits nothing more.
     watch.tick_at(3_000);
     watch.tick_at(4_000);
-    assert!(watch.drain_events().is_empty());
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
 }
 
 /// While offline, the alert is repeated at most every `remind_interval_ms`.
@@ -454,7 +469,10 @@ fn offline_reminders_respect_the_remind_interval() {
     assert_eq!(events[0].state, RelayBoardState::Offline);
     // Immediately after the repeat: quiet again.
     watch.tick_at(62_000);
-    assert!(watch.drain_events().is_empty());
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
 }
 
 /// Boards are monitored independently: one broken board must not mask another.
@@ -532,9 +550,12 @@ fn unconfigured_boards_are_not_watched() {
         !watch.tick_at(0),
         "nothing is due because nothing is watched"
     );
-    assert!(script.lock().unwrap().calls().is_empty());
-    assert!(watch.drain_events().is_empty());
-    assert!(watch.states().is_empty());
+    assert_eq!(script.lock().unwrap().calls(), [] as [String; 0]);
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
+    assert_eq!(watch.states(), [] as [(String, RelayBoardState); 0]);
 }
 
 /// A board whose port is reconfigured starts over; a rename keeps the state.
@@ -612,7 +633,10 @@ fn sync_boards_returns_immediately_while_a_probe_is_running() {
     assert!(worker.join().unwrap(), "the worker did probe");
     // The set changed mid-probe, so that sample was discarded; the new set is
     // due immediately and produces no stale event.
-    assert!(watch.drain_events().is_empty());
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
     assert!(watch.tick_at(1_000));
     assert_eq!(
         script.lock().unwrap().calls(),
@@ -696,7 +720,7 @@ fn dut_with_serial_relay(id: &str) -> DutConfig {
             reference_similarity: None,
             split_logs: false,
         },
-        adb: Default::default(),
+        adb: duthub_core::model::AdbConfig::default(),
         relay: RelayConfig::UsbSerial {
             host: "local".into(),
             node: "COM25".into(),
@@ -712,10 +736,10 @@ fn dut_with_serial_relay(id: &str) -> DutConfig {
         mcp: McpConfig::StreamableHttp {
             url: "http://127.0.0.1:8787/mcp".into(),
         },
-        a2a: Default::default(),
+        a2a: duthub_core::model::DutA2aConfig::default(),
         flash: FlashConfig::default(),
-        media: Default::default(),
-        heartbeat: Default::default(),
+        media: duthub_core::model::DutMediaConfig::default(),
+        heartbeat: duthub_core::model::HeartbeatConfig::default(),
     }
 }
 
@@ -800,7 +824,7 @@ fn probe_has_no_control_side_effects() {
         control.set_log_sink(Arc::new(move |dut, label| {
             sink.lock()
                 .unwrap()
-                .push((dut.to_string(), label.to_string()))
+                .push((dut.to_string(), label.to_string()));
         })),
         "first sink registration must succeed"
     );
@@ -891,7 +915,7 @@ fn probe_refuses_unconfigured_nodes_and_missing_backends() {
         without_backend.probe_board_status("COM25", 1),
         RelayProbeSample::Unsupported(_)
     ));
-    assert!(backend.probe_calls().is_empty());
+    assert_eq!(backend.probe_calls(), [] as [(String, u8); 0]);
 }
 
 // ── ControlRelayProbe: board → channel mapping ─────────────────────────────
@@ -949,7 +973,10 @@ fn adapter_and_mock_backend_drive_the_full_transition() {
     watch.sync_boards(&[board("board-1", "COM25")]);
 
     watch.tick_at(0);
-    assert!(watch.drain_events().is_empty());
+    assert_eq!(
+        watch.drain_events(),
+        [] as [duthub_device::relay_watch::RelayBoardEvent; 0]
+    );
     watch.tick_at(1_000);
     let events = watch.drain_events();
     assert_eq!(events.len(), 1);

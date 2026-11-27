@@ -6,6 +6,7 @@ use serde::Serialize;
 
 pub const CONTINUOUS_SERIAL_LOG: &str = "serial.txt";
 
+#[must_use]
 pub fn dut_folder(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -40,16 +41,13 @@ pub fn dut_folder(name: &str) -> String {
     }
 }
 
+#[must_use]
 pub fn archive_prefix(dut_id: &str) -> String {
-    let hex: String = dut_id
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let hex = crate::util::hex_lower(dut_id.as_bytes());
     format!("dut-{hex}-")
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
     pub id: String,
@@ -80,7 +78,10 @@ fn matching_files(dir: &Path, dut_id: &str, archived: bool) -> Vec<PathBuf> {
             let name = entry.file_name();
             let name = name.to_str()?;
             let belongs = if archived {
-                name.starts_with(&prefix) && name.ends_with(".log")
+                name.starts_with(&prefix)
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
             } else {
                 name.strip_prefix(&legacy).is_some_and(numbered_suffix)
             };
@@ -212,6 +213,7 @@ fn open_segment(work_dir: &Path, dut_id: &str, id: &str, path: &Path) -> std::io
     dir.open(relative).map(cap_std::fs::File::into_std)
 }
 
+#[must_use]
 pub fn list(work_dir: &Path, dut_id: &str, offset: usize, limit: usize) -> Vec<Segment> {
     segment_files(work_dir, dut_id)
         .into_iter()
@@ -271,7 +273,7 @@ mod tests {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentRead {
     pub text: String,

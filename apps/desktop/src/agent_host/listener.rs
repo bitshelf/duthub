@@ -34,7 +34,7 @@ impl fmt::Debug for SessionListener {
             .field("port", &self.port)
             .field("token", &"[REDACTED]")
             .field("credential_id", &self.credential_id)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

@@ -45,12 +45,14 @@ pub struct SnapshotLine {
     pub text: String,
 }
 
+#[derive(Debug)]
 pub struct SnapshotState {
     snapshot: StateSnapshot,
 }
 
 impl SnapshotState {
     /// 从 JSON 文件加载；文件缺失 → 空快照（dut.list 返回空列表）
+    #[must_use]
     pub fn load(path: &Path) -> Self {
         let snapshot = match std::fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
@@ -72,6 +74,7 @@ impl SnapshotState {
         Self { snapshot }
     }
 
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             snapshot: StateSnapshot::default(),
@@ -107,7 +110,7 @@ impl McpState for SnapshotState {
                 adb_serial: d.adb_serial.clone(),
                 relay: d.relay.clone(),
                 mcp_label: d.mcp_label.clone(),
-                session_lines: Some(d.lines.last().map(|l| l.seq).unwrap_or(0)),
+                session_lines: Some(d.lines.last().map_or(0, |l| l.seq)),
             })
     }
 
@@ -223,6 +226,7 @@ impl McpState for SnapshotState {
 }
 
 /// 构造共享 Arc（bin 使用）
+#[must_use]
 pub fn snapshot_state(path: &Path) -> Arc<dyn McpState> {
     Arc::new(SnapshotState::load(path))
 }
@@ -230,13 +234,15 @@ pub fn snapshot_state(path: &Path) -> Arc<dyn McpState> {
 /// 常驻 stdio 进程的动态快照：每次工具调用前重读 `mcp-state.json`。
 ///
 /// MCP stdio 客户端会把子进程当常驻进程用（启动一次、整个会话复用）；
-/// desktop 每 2s 落盘新快照（mcp_runtime），固定快照会让数据永久停留在
+/// desktop 每 2s `落盘新快照（mcp_runtime），固定快照会让数据永久停留在`
 /// 进程启动时刻。每请求重读保证工具返回当前状态。
+#[derive(Debug)]
 pub struct ReloadingSnapshotState {
     path: std::path::PathBuf,
 }
 
 impl ReloadingSnapshotState {
+    #[must_use]
     pub fn new(path: std::path::PathBuf) -> Self {
         Self { path }
     }
@@ -251,7 +257,7 @@ impl ReloadingSnapshotState {
         self.path
             .parent()
             .and_then(|runtime| runtime.parent())
-            .map(|dir| dir.to_path_buf())
+            .map(std::path::Path::to_path_buf)
     }
 }
 
@@ -354,6 +360,7 @@ impl McpState for ReloadingSnapshotState {
 }
 
 /// 构造动态重读快照（stdio bin 使用：常驻进程数据不冻结）
+#[must_use]
 pub fn reloading_snapshot_state(path: &Path) -> Arc<dyn McpState> {
     Arc::new(ReloadingSnapshotState::new(path.to_path_buf()))
 }
@@ -375,8 +382,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
+                .map_or_default(|d| d.as_nanos())
         ));
         let snapshot = work.join("runtime").join("mcp-state.json");
         std::fs::create_dir_all(snapshot.parent().unwrap()).expect("runtime 目录");

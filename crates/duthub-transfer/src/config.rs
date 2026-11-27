@@ -12,12 +12,15 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_BASE_PATH: &str = "/transfer";
+const DEFAULT_ALLOWED_EXTENSIONS: [&str; 2] = ["img", "iso"];
+
 fn default_base_path() -> String {
-    "/transfer".to_string()
+    DEFAULT_BASE_PATH.to_string()
 }
 
-fn base_path_is_default(value: &String) -> bool {
-    *value == default_base_path()
+fn base_path_is_default(value: &str) -> bool {
+    value == DEFAULT_BASE_PATH
 }
 
 /// 30 GiB — matches the planned image size envelope (REVIEW:83).
@@ -25,6 +28,10 @@ const fn default_max_upload_bytes() -> u64 {
     32_212_254_720
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn max_upload_bytes_is_default(value: &u64) -> bool {
     *value == default_max_upload_bytes()
 }
@@ -33,6 +40,10 @@ const fn default_upload_expires_secs() -> u64 {
     86_400
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn upload_expires_secs_is_default(value: &u64) -> bool {
     *value == default_upload_expires_secs()
 }
@@ -41,6 +52,10 @@ const fn default_lock_timeout_secs() -> u64 {
     10
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn lock_timeout_secs_is_default(value: &u64) -> bool {
     *value == default_lock_timeout_secs()
 }
@@ -49,6 +64,10 @@ const fn default_reserved_disk_bytes() -> u64 {
     1_073_741_824
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn reserved_disk_bytes_is_default(value: &u64) -> bool {
     *value == default_reserved_disk_bytes()
 }
@@ -57,26 +76,45 @@ const fn default_gc_interval_secs() -> u64 {
     300
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn gc_interval_secs_is_default(value: &u64) -> bool {
     *value == default_gc_interval_secs()
 }
 
 fn default_allowed_extensions() -> Vec<String> {
-    vec!["img".to_string(), "iso".to_string()]
+    DEFAULT_ALLOWED_EXTENSIONS
+        .iter()
+        .map(|ext| (*ext).to_string())
+        .collect()
 }
 
-fn allowed_extensions_is_default(value: &Vec<String>) -> bool {
-    *value == default_allowed_extensions()
+fn allowed_extensions_is_default(value: &[String]) -> bool {
+    value.len() == DEFAULT_ALLOWED_EXTENSIONS.len()
+        && value
+            .iter()
+            .zip(DEFAULT_ALLOWED_EXTENSIONS)
+            .all(|(actual, expected)| actual == expected)
 }
 
 const fn default_verify_concurrency() -> u64 {
     2
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn verify_concurrency_is_default(value: &u64) -> bool {
     *value == default_verify_concurrency()
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
 fn allow_zero_length_uploads_is_default(value: &bool) -> bool {
     !*value
 }
@@ -179,17 +217,20 @@ impl Default for TransferConfig {
 }
 
 /// Default-value predicate for the whole section (workspace pit #19 shape).
+#[must_use]
 pub fn transfer_is_default(config: &TransferConfig) -> bool {
     config == &TransferConfig::default()
 }
 
 impl TransferConfig {
     /// Lock wait as a [`Duration`] for the tus handlers and the sweep.
+    #[must_use]
     pub fn lock_timeout(&self) -> Duration {
         Duration::from_secs(self.lock_timeout_secs.max(1))
     }
 
     /// TTL of an unfinished upload, as fed to the tus `expiration` extension.
+    #[must_use]
     pub fn upload_ttl(&self) -> Duration {
         Duration::from_secs(self.upload_expires_secs.max(1))
     }
@@ -216,26 +257,18 @@ pub fn normalize_base_path(raw: &str) -> Result<String, TransferConfigError> {
 }
 
 /// Configuration resolution failures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransferConfigError {
     /// `base_path` could not be normalized.
+    #[error("invalid base path: {0}")]
     BasePath(String),
     /// `transferDir` was rejected (escape, drive-relative, UNC) or is not writable.
+    #[error("invalid transfer dir: {0}")]
     TransferDir(String),
 }
 
-impl std::fmt::Display for TransferConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BasePath(msg) => write!(f, "invalid base path: {msg}"),
-            Self::TransferDir(msg) => write!(f, "invalid transfer dir: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for TransferConfigError {}
-
 /// `<work_root>/duthub-data/images` — the default staging + publish root.
+#[must_use]
 pub fn default_transfer_dir_in(work_root: &Path) -> PathBuf {
     work_root.join("duthub-data").join("images")
 }
@@ -257,8 +290,7 @@ pub fn resolve_transfer_dir(
     })?;
     let raw = configured.map(str::trim).filter(|value| !value.is_empty());
     let candidate = match raw {
-        None => default_transfer_dir_in(&root),
-        Some("images") => default_transfer_dir_in(&root),
+        None | Some("images") => default_transfer_dir_in(&root),
         Some(raw) => {
             if raw.starts_with("\\\\") || raw.starts_with("//") {
                 return Err(TransferConfigError::TransferDir(

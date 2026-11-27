@@ -40,7 +40,7 @@ impl std::fmt::Debug for TranscriptWriter {
         formatter
             .debug_struct("TranscriptWriter")
             .field("open", &self.tx.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -55,7 +55,7 @@ impl TranscriptWriter {
         let writer_path = path.to_path_buf();
         let join = std::thread::Builder::new()
             .name("duthub-transcript".into())
-            .spawn(move || write_loop(&writer_path, writer_view, rx))
+            .spawn(move || write_loop(&writer_path, &writer_view, rx))
             .ok();
         Self {
             tx: Some(tx),
@@ -118,11 +118,11 @@ impl Drop for TranscriptWriter {
     }
 }
 
-fn write_loop(path: &Path, view: Arc<SessionView>, rx: Receiver<WriterMessage>) {
+fn write_loop(path: &Path, view: &SessionView, rx: Receiver<WriterMessage>) {
     let mut state = WriterFile::open(path);
     for message in rx {
         match message {
-            WriterMessage::Entry(entry) => state.append(&entry, &view),
+            WriterMessage::Entry(entry) => state.append(&entry, view),
             WriterMessage::Finish => break,
         }
     }

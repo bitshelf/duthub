@@ -1,11 +1,11 @@
-//! RelayDriver trait + CH340 类继电器驱动实现。
+//! `RelayDriver` trait + CH340 类继电器驱动实现。
 //!
 //! - **单 task 独占串口句柄**：每个继电器串口一个专用 tokio task，所有读写都经由
 //!   命令通道派发（与 duthub-device 会话模型一致，docs/ARCHITECTURE.md 线程边界）；
 //! - 错误统一映射 [`DeviceError`]（NotFound/Busy/PermissionDenied/Timeout/
 //!   Disconnected/Invalid）；
 //! - 实现 [`duthub_core::ControlBackend`]：共用入口
-//!   （duthub-device::control::ControlService）完成授权/绑定/能力校验后把已解析的
+//!   （`duthub-device::control::ControlService）完成授权/绑定/能力校验后把已解析的`
 //!   目标直接派发到本驱动，驱动不接触审批令牌（审核 P1-3）；
 //! - 按审核建议不做后端选择层：桌面端启动时直接构造本驱动注入入口（当前唯一实现）。
 //!
@@ -49,9 +49,9 @@ pub type Opener = Arc<dyn Fn(&str, u32) -> DeviceResult<BoxStream> + Send + Sync
 /// 脉冲时长（ms）配置。继电器脉冲 = 吸合 → 保持 → 自动释放。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PulseTiming {
-    /// power_key 短按（默认 300ms）。
+    /// `power_key` 短按（默认 300ms）。
     pub power_key_ms: u64,
-    /// power_key 长按（默认 3000ms）。
+    /// `power_key` 长按（默认 3000ms）。
     pub power_key_long_ms: u64,
     /// reset 脉冲（默认 3000ms，与 sermcp `DUT_CTRL_MIN_RESET_MS` 缺省一致）。
     pub reset_ms: u64,
@@ -125,6 +125,14 @@ pub struct Ch340RelayDriver {
     timing: PulseTiming,
 }
 
+impl std::fmt::Debug for Ch340RelayDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ch340RelayDriver")
+            .field("timing", &self.timing)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 struct PortHandle {
     cmd_tx: mpsc::Sender<QueuedCommand>,
@@ -163,6 +171,7 @@ enum PortCommand {
 impl Ch340RelayDriver {
     /// 生产构造：tokio-serial 直开串口。未启用 `real-hardware` 特性时
     /// 所有端口打开都报 [`DeviceError::Unsupported`]（demo 模式不接硬件）。
+    #[must_use]
     pub fn new() -> Self {
         Self::with_opener(Self::default_opener())
     }
@@ -177,6 +186,7 @@ impl Ch340RelayDriver {
     }
 
     /// 覆盖脉冲时长（短按/长按/复位）。数值为 0 时回落默认值。
+    #[must_use]
     pub fn with_timing(mut self, timing: PulseTiming) -> Self {
         self.timing = timing;
         self
@@ -205,12 +215,12 @@ impl Ch340RelayDriver {
     }
 
     /// 取（或惰性创建）端口独占 task 的句柄。task 随驱动丢弃（命令通道关闭）自然退出。
-    fn ensure_task(&self, port: &str) -> DeviceResult<PortHandle> {
-        let mut ports = self.ports.lock().unwrap();
+    fn ensure_task(&self, port: &str) -> PortHandle {
+        let mut ports = duthub_core::util::lock_unpoisoned(&self.ports);
         if let Some(handle) = ports.get(port)
             && !handle.cmd_tx.is_closed()
         {
-            return Ok(handle.clone());
+            return handle.clone();
         }
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let opener = self.opener.clone();
@@ -223,7 +233,7 @@ impl Ch340RelayDriver {
         ));
         let handle = PortHandle { cmd_tx };
         ports.insert(port.to_string(), handle.clone());
-        Ok(handle)
+        handle
     }
 
     /// 校验通道号：1..=255。
@@ -251,7 +261,7 @@ impl Ch340RelayDriver {
         port: &str,
         make: impl FnOnce(oneshot::Sender<DeviceResult<T>>) -> PortCommand,
     ) -> DeviceResult<T> {
-        let handle = self.ensure_task(port)?;
+        let handle = self.ensure_task(port);
         let (reply_tx, reply_rx) = oneshot::channel();
         let (started, mut start) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + QUEUE_TIMEOUT;
@@ -263,13 +273,10 @@ impl Ch340RelayDriver {
             .await
             .map_err(|_| DeviceError::Timeout)?
             .map_err(|_| DeviceError::Disconnected)?;
-        match tokio::time::timeout_at(deadline, &mut start).await {
-            Ok(result) => result.map_err(|_| DeviceError::Disconnected)?,
-            Err(_) => {
-                // Close admission before checking whether the actor claimed the command.
-                start.close();
-                start.try_recv().map_err(|_| DeviceError::Timeout)?;
-            }
+        if let Ok(result) = tokio::time::timeout_at(deadline, &mut start).await { result.map_err(|_| DeviceError::Disconnected)? } else {
+            // Close admission before checking whether the actor claimed the command.
+            start.close();
+            start.try_recv().map_err(|_| DeviceError::Timeout)?;
         }
         reply_rx.await.map_err(|_| DeviceError::Disconnected)?
     }
@@ -284,7 +291,7 @@ impl Default for Ch340RelayDriver {
 #[async_trait]
 impl RelayDriver for Ch340RelayDriver {
     async fn open(&self, port: &str) -> DeviceResult<RelayInfo> {
-        self.ensure_task(port)?;
+        let _ = self.ensure_task(port);
         // 通道枚举：逐通道 STATUS 查询（只读，不切换）。
         let mut detected = Vec::new();
         for channel in 1..=ch340::MAX_CHANNELS {
@@ -349,7 +356,7 @@ impl ControlBackend for Ch340RelayDriver {
         RelayDriver::pulse(self, &target.address, channel, ms).await
     }
 
-    /// 电源按键：短按 = power_key 通道短脉冲（默认 300ms），
+    /// 电源按键：短按 = `power_key` 通道短脉冲（默认 300ms），
     /// 长按（强制断电）= 更长脉冲（默认 3000ms）。
     async fn power_key(&self, target: &ControlTarget, long_press: bool) -> DeviceResult<()> {
         Self::assert_relay_target(target)?;
@@ -463,7 +470,7 @@ async fn pulse_channel(
 }
 
 /// 确保串口已打开（惰性；错误映射见 [`open_serial`]）。
-async fn ensure_open(
+fn ensure_open(
     stream: &mut Option<BoxStream>,
     opener: &Opener,
     port: &str,
@@ -484,7 +491,7 @@ async fn set_channel(
     channel: u8,
     on: bool,
 ) -> DeviceResult<()> {
-    ensure_open(stream, opener, port, baud).await?;
+    ensure_open(stream, opener, port, baud)?;
     let opcode = if on { ch340::OP_ON } else { ch340::OP_OFF };
     let result = tokio::time::timeout(
         IO_TIMEOUT,
@@ -540,8 +547,7 @@ async fn read_echo(stream: &mut BoxStream, channel: u8, opcode: u8) -> DeviceRes
                 match ch340::classify_echo(&acc, channel, opcode) {
                     EchoCheck::Verified(_) => return Ok(()),
                     EchoCheck::ChecksumBad(_) => return Err(DeviceError::Disconnected),
-                    EchoCheck::Mismatch(_) | EchoCheck::Truncated(_) => continue,
-                    EchoCheck::Absent => continue,
+                    EchoCheck::Mismatch(_) | EchoCheck::Truncated(_) | EchoCheck::Absent => {}
                 }
             }
         }
@@ -556,7 +562,7 @@ async fn query_status(
     baud: u32,
     channel: u8,
 ) -> DeviceResult<Option<bool>> {
-    ensure_open(stream, opener, port, baud).await?;
+    ensure_open(stream, opener, port, baud)?;
     let result = tokio::time::timeout(
         IO_TIMEOUT,
         read_status(
@@ -649,7 +655,7 @@ fn io_err(_err: std::io::Error) -> DeviceError {
 }
 
 #[cfg(feature = "real-hardware")]
-/// tokio-serial 打开真实串口，错误按类别映射 DeviceError。
+/// tokio-serial 打开真实串口，错误按类别映射 `DeviceError`。
 fn open_serial(port: &str, baud: u32) -> DeviceResult<BoxStream> {
     let stream =
         tokio_serial::SerialStream::open(&tokio_serial::new(port, baud)).map_err(map_open_error)?;
@@ -689,12 +695,17 @@ mod tests {
 
     use duthub_core::ApprovalError;
     use duthub_core::model::{
-        DutConfig, FlashConfig, McpConfig, RelayChannels, RelayConfig, SerialConfig,
+        AdbConfig, DutA2aConfig, DutConfig, DutMediaConfig, FlashConfig, HeartbeatConfig,
+        McpConfig, RelayChannels, RelayConfig, SerialConfig,
     };
     use duthub_device::control::{ControlAction, ControlEntryError, ControlService};
 
-    /// 模拟板卡行为开关。
+    /// Simulated relay board fault-injection toggles for unit tests.
     #[derive(Clone)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "test mock fault-injection switches"
+    )]
     struct MockBehavior {
         /// ON/OFF 命令原样回显。
         echo: bool,
@@ -704,7 +715,7 @@ mod tests {
         corrupt_off: bool,
         /// 是否应答 STATUS。
         answer_status: bool,
-        /// 只对 1..=n 的通道应答 STATUS（其余静默）；与 answer_status 组合使用。
+        /// 只对 1..=n 的通道应答 STATUS（其余静默）；与 `answer_status` 组合使用。
         status_channels: u8,
         /// 继电器触点粘连：命令回显正常但 STATUS 恒报释放（ON 断言必须失败）。
         status_stuck_off: bool,
@@ -754,11 +765,7 @@ mod tests {
                 // 通道）。应答帧：[A0, ch, state, A0+ch+state]。
                 if behavior.answer_status && ck_ok && ch >= 1 && ch <= behavior.status_channels {
                     let actual = state.get(&ch).copied().unwrap_or(false);
-                    let st = if behavior.status_stuck_off || !actual {
-                        0
-                    } else {
-                        1
-                    };
+                    let st = u8::from(!behavior.status_stuck_off && actual);
                     let resp = [ch340::HEADER, ch, st, ch340::checksum(ch, st)];
                     let _ = wr.write_all(&resp).await;
                 }
@@ -1276,7 +1283,7 @@ mod tests {
                 reference_similarity: None,
                 split_logs: false,
             },
-            adb: Default::default(),
+            adb: AdbConfig::default(),
             relay: RelayConfig::UsbSerial {
                 host: "local".into(),
                 node: "MOCK0".into(),
@@ -1292,10 +1299,10 @@ mod tests {
             mcp: McpConfig::StreamableHttp {
                 url: "http://127.0.0.1:8787/mcp".into(),
             },
-            a2a: Default::default(),
+            a2a: DutA2aConfig::default(),
             flash: FlashConfig::default(),
-            media: Default::default(),
-            heartbeat: Default::default(),
+            media: DutMediaConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
         }
     }
 
@@ -1310,9 +1317,9 @@ mod tests {
         )
     }
 
-    /// 授权路径测试夹具：ControlService 是同步门面（内部 block_on，见
-    /// duthub-device::control），这些测试必须用普通 `#[test]` 而非
-    /// `#[tokio::test]`——驱动的 task 都在 ControlService 的 runtime 上派生。
+    /// 授权路径测试夹具：`ControlService` 是同步门面（内部 `block_on`，见
+    /// `duthub-device::control`），这些测试必须用普通 `#[test]` 而非
+    /// `#[tokio::test]`——驱动的 task 都在 `ControlService` 的 runtime 上派生。
     /// 脉冲缩短避免测试拖慢。
     fn auth_driver() -> (Ch340RelayDriver, Arc<StdMutex<MockLog>>) {
         let (driver, log) = test_driver(MockBehavior::default());
@@ -1358,7 +1365,7 @@ mod tests {
             err,
             ControlEntryError::Approval(ApprovalError::Mismatch)
         ));
-        assert!(log.lock().unwrap().frames.is_empty());
+        assert_eq!(log.lock().unwrap().frames, [] as [(u8, u8, bool); 0]);
     }
 
     #[test]
@@ -1429,7 +1436,7 @@ mod tests {
                 .validate(&token.token, "dut-b", "control.power", r#"{"on":true}"#)
                 .is_ok()
         );
-        assert!(log.lock().unwrap().frames.is_empty());
+        assert_eq!(log.lock().unwrap().frames, [] as [(u8, u8, bool); 0]);
     }
 
     #[test]
@@ -1450,6 +1457,6 @@ mod tests {
             err,
             ControlEntryError::Device(DeviceError::Invalid(_))
         ));
-        assert!(log.lock().unwrap().frames.is_empty());
+        assert_eq!(log.lock().unwrap().frames, [] as [(u8, u8, bool); 0]);
     }
 }

@@ -63,7 +63,12 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
 }
 
 pub fn hex_digest(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Wire-format `Upload-Metadata` value, built with the same encoder the
@@ -206,9 +211,8 @@ pub async fn create_upload(
     length: u64,
     checksum: Option<&str>,
 ) -> (reqwest::StatusCode, Option<String>) {
-    let extra: Vec<(&str, &str)> = checksum
-        .map(|value| vec![("Upload-Checksum", value)])
-        .unwrap_or_default();
+    let extra: Vec<(&str, &str)> =
+        checksum.map_or_else(Vec::new, |value| vec![("Upload-Checksum", value)]);
     let response = post_upload_with(
         client,
         base,
@@ -248,7 +252,7 @@ pub fn upload_url(base: &str, location: &str) -> String {
     if location.starts_with("http://") || location.starts_with("https://") {
         return location.to_owned();
     }
-    let origin = base.rsplit_once("/").map_or(base, |(origin, _)| origin);
+    let origin = base.rsplit_once('/').map_or(base, |(origin, _)| origin);
     format!("{origin}{location}")
 }
 
@@ -259,5 +263,8 @@ pub fn published_path(dir: &Path, name: &str) -> PathBuf {
 
 /// Deterministic pseudo-random payload (no RNG dependency).
 pub fn payload(len: usize, modulus: u32) -> Vec<u8> {
-    (0..len as u32).map(|i| (i % modulus) as u8).collect()
+    let modulus = usize::try_from(modulus).expect("modulus fits in usize");
+    (0..len)
+        .map(|i| u8::try_from((i % modulus) & 0xff).expect("masked value fits in u8"))
+        .collect()
 }

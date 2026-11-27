@@ -9,7 +9,7 @@ use mxc_sdk::v1::{self, BackendCapability};
 /// Native OS containment backend detected on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxBackendKind {
-    /// Windows 11 native PSEC ProcessContainer.
+    /// Windows 11 native PSEC `ProcessContainer`.
     ProcessContainer,
     /// Linux Bubblewrap (`bwrap`).
     Bubblewrap,
@@ -22,6 +22,7 @@ pub enum SandboxBackendKind {
 
 impl SandboxBackendKind {
     /// Canonical wire/display identifier of the backend.
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProcessContainer => "processcontainer",
@@ -34,9 +35,13 @@ impl SandboxBackendKind {
 
 /// Factual sandbox capability report probed from `mxc-sdk`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "capability matrix probed directly from mxc-sdk"
+)]
 pub struct SandboxStatus {
     pub backend: SandboxBackendKind,
-    /// Isolation tier reported by Windows ProcessContainer (e.g. `"base-container"`).
+    /// Isolation tier reported by Windows `ProcessContainer` (e.g. `"base-container"`).
     pub tier: Option<String>,
     /// True when the host supports the native process containment backend.
     pub supported: bool,
@@ -67,27 +72,32 @@ impl SandboxStatus {
     }
 
     /// Whether the host can enforce OS-level process and filesystem containment.
+    #[must_use]
     pub fn is_enforced(&self) -> bool {
         self.supported && self.backend != SandboxBackendKind::Unsupported
     }
 
     /// Whether kernel-level read isolation (`denied_paths`) is enforced.
+    #[must_use]
     pub fn supports_read_isolation(&self) -> bool {
         self.is_enforced() && self.read_deny
     }
 
     /// Whether untrusted scripts can be contained with read + write + network isolation.
+    #[must_use]
     pub fn supports_script_isolation(&self) -> bool {
         self.is_enforced() && self.read_deny
     }
 
     /// Whether Agent hosts (which require loopback MCP access alongside
     /// read/write containment) are fully supported.
+    #[must_use]
     pub fn supports_agent_isolation(&self) -> bool {
         self.is_enforced() && self.read_deny && self.host_loopback
     }
 
     /// Concise English diagnostic summary for logs and transcripts.
+    #[must_use]
     pub fn summary(&self) -> String {
         if !self.is_enforced() {
             return match self.reason.as_deref() {
@@ -121,6 +131,7 @@ impl SandboxStatus {
 }
 
 /// Probe the current host through `mxc-sdk` without spawning any container.
+#[must_use]
 pub fn status() -> SandboxStatus {
     let support = v1::platform_support();
     let backends = v1::available_backends();

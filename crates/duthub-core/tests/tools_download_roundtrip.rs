@@ -5,7 +5,7 @@
 //! deserializes to the default (env proxy); (2) default-valued keys/sections
 //! are omitted on serialize (pits #19/#24; `adbExecutable` is a pre-existing
 //! exception — no skip, always serialized, docs/examples/settings.json keeps
-//! writing it); (3) keys are camelCase only (pit #15: snake_case keys silently
+//! writing it); (3) keys are camelCase only (pit #15: `snake_case` keys silently
 //! fall back to defaults, so this file uses camelCase exclusively).
 
 use duthub_core::SettingsFile;
@@ -36,7 +36,7 @@ fn missing_section_defaults_to_env_proxy() {
         serde_json::from_str(&settings_json_with_tools(serde_json::json!({}))).unwrap();
     assert_eq!(settings.tools.download, ToolDownloadSettings::default());
     assert_eq!(settings.tools.download.proxy.mode, DownloadProxyMode::Env);
-    assert!(settings.tools.download.proxy.url.is_empty());
+    assert_eq!(settings.tools.download.proxy.url, "");
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn off_mode_roundtrips_losslessly() {
     }));
     let settings: SettingsFile = serde_json::from_str(&raw).unwrap();
     assert_eq!(settings.tools.download.proxy.mode, DownloadProxyMode::Off);
-    assert!(settings.tools.download.proxy.url.is_empty());
+    assert_eq!(settings.tools.download.proxy.url, "");
     let re = serde_json::to_value(&settings).unwrap();
     let original: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(

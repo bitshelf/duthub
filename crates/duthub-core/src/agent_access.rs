@@ -76,6 +76,7 @@ pub struct AgentListener {
 
 impl AgentAccessSettings {
     /// 按 DUT 查专用监听器（每台 DUT 至多一个）。
+    #[must_use]
     pub fn listener_for_dut(&self, dut_id: &str) -> Option<&AgentListener> {
         self.listeners
             .iter()
@@ -83,6 +84,7 @@ impl AgentAccessSettings {
     }
 
     /// 按监听器查绑定凭据（DUT 专用端点每监听器一个）。
+    #[must_use]
     pub fn credential_for_listener(&self, listener_id: &str) -> Option<&AgentCredential> {
         self.agents
             .iter()
@@ -104,6 +106,7 @@ impl Default for AgentAccessSettings {
 }
 
 /// 默认值判定（model.rs `skip_serializing_if` 用）：默认值段整段不序列化。
+#[must_use]
 pub fn agent_access_is_default(settings: &AgentAccessSettings) -> bool {
     settings == &AgentAccessSettings::default()
 }
@@ -157,6 +160,7 @@ pub enum DutAction {
 }
 
 impl DutAction {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             DutAction::Read => "read",
@@ -233,6 +237,7 @@ pub enum Principal {
 
 impl Principal {
     /// 审计用的 agent 标识（GUI 主体返回 None——本地人不进 agent 字段）。
+    #[must_use]
     pub fn audit_identity(&self) -> Option<(&str, &str)> {
         match self {
             Principal::LocalAdmin => None,
@@ -257,6 +262,7 @@ pub enum AuthError {
 }
 
 impl AuthError {
+    #[must_use]
     pub fn message(&self) -> String {
         match self {
             AuthError::Unauthorized => "未认证：缺少或无效的 Bearer Token".into(),
@@ -275,18 +281,24 @@ impl AuthError {
 }
 
 /// token → SHA-256 指纹（运行时索引键；明文不进任何索引/日志）。
+#[must_use]
 pub fn token_fingerprint(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    crate::util::hex_lower(&digest)
 }
 
-/// 生成 Agent token：32 字节 CSPRNG → base64url（43 字符）→ `dth-<43>`，
-/// ≥256 bit 熵（SPEC §5.1.4）。GUI「生成」按钮与测试共用。
+/// Generate an Agent bearer token: 32 CSPRNG bytes -> base64url (43 chars) -> `dth-<43>`
+/// (>=256 bits of entropy, SPEC §5.1.4). Shared by the GUI generate button and tests.
+///
+/// # Panics
+///
+/// Panics if the OS cryptographic RNG (`getrandom`) fails.
+#[must_use]
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("CSPRNG 不可用");
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG is available");
     format!("dth-{}", B64.encode(bytes))
 }
 
@@ -345,7 +357,21 @@ pub struct AgentAccessRuntime {
     runtime: RwLock<RuntimeOverlay>,
 }
 
+impl std::fmt::Debug for AgentAccessRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let snapshot = crate::util::read_unpoisoned(&self.snapshot);
+        let runtime = crate::util::read_unpoisoned(&self.runtime);
+        f.debug_struct("AgentAccessRuntime")
+            .field("enabled", &snapshot.settings.enabled)
+            .field("http_port", &snapshot.settings.http_port)
+            .field("persistent_listeners", &snapshot.settings.listeners.len())
+            .field("runtime_listeners", &runtime.listeners.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl AgentAccessRuntime {
+    #[must_use]
     pub fn from_settings(settings: AgentAccessSettings) -> Arc<Self> {
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(AuthSnapshot::build(settings))),
@@ -355,28 +381,28 @@ impl AgentAccessRuntime {
 
     /// GUI 保存凭据 / 开关后整体热替换持久表；**保留** runtime overlay。
     pub fn update(&self, settings: AgentAccessSettings) {
-        let mut guard = self.snapshot.write().unwrap();
+        let mut guard = crate::util::write_unpoisoned(&self.snapshot);
         *guard = Arc::new(AuthSnapshot::build(settings));
     }
 
     /// 当前持久配置快照（端口 / TTL / 凭据列表；不含 runtime overlay）。
     pub fn settings(&self) -> AgentAccessSettings {
-        self.snapshot.read().unwrap().settings.clone()
+        crate::util::read_unpoisoned(&self.snapshot).settings.clone()
     }
 
     /// GUI 视角的「接入是否生效」：auth 开关或任意**持久**监听器存在。
     /// **不是** HTTP 认证门，也不看 runtime overlay（会话 listener 不改变启用态）。
     pub fn enabled(&self) -> bool {
-        let snapshot = self.snapshot.read().unwrap();
+        let snapshot = crate::util::read_unpoisoned(&self.snapshot);
         snapshot.settings.enabled || !snapshot.settings.listeners.is_empty()
     }
 
     pub fn http_port(&self) -> u16 {
-        self.snapshot.read().unwrap().settings.http_port
+        crate::util::read_unpoisoned(&self.snapshot).settings.http_port
     }
 
     pub fn lease_ttl_secs(&self) -> u32 {
-        self.snapshot.read().unwrap().settings.lease_ttl_secs
+        crate::util::read_unpoisoned(&self.snapshot).settings.lease_ttl_secs
     }
 
     /// 注册每会话监听器（overlay；不写盘）。
@@ -414,7 +440,7 @@ impl AgentAccessRuntime {
         {
             return Err(AuthError::invalid_listener("监听器 id 与持久监听器冲突"));
         }
-        let mut runtime = self.runtime.write().unwrap();
+        let mut runtime = crate::util::write_unpoisoned(&self.runtime);
         if runtime.listeners.contains_key(&listener.id) {
             return Err(AuthError::invalid_listener("监听器 id 已注册"));
         }
@@ -465,7 +491,7 @@ impl AgentAccessRuntime {
 
     /// 吊销每会话监听器（幂等）：删除后该 token 立即无法通过 internal 认证。
     pub fn remove_runtime_listener(&self, listener_id: &str) -> Result<(), AuthError> {
-        let mut runtime = self.runtime.write().unwrap();
+        let mut runtime = crate::util::write_unpoisoned(&self.runtime);
         runtime.listeners.remove(listener_id);
         runtime.rebuild_fingerprints();
         Ok(())
@@ -506,7 +532,7 @@ impl AgentAccessRuntime {
         if listener_id.is_empty() || bearer.is_empty() {
             return Err(AuthError::Unauthorized);
         }
-        let runtime = self.runtime.read().unwrap();
+        let runtime = crate::util::read_unpoisoned(&self.runtime);
         let Some(listener) = runtime.listeners.get(listener_id) else {
             return Err(AuthError::Unauthorized);
         };
@@ -531,7 +557,7 @@ impl AgentAccessRuntime {
         let mut found = false;
         let mut merged: Vec<DutGrant> = Vec::new();
         {
-            let snapshot = self.snapshot.read().unwrap();
+            let snapshot = crate::util::read_unpoisoned(&self.snapshot);
             for credential in &snapshot.settings.agents {
                 if credential.id != credential_id {
                     continue;
@@ -544,7 +570,7 @@ impl AgentAccessRuntime {
             }
         }
         {
-            let runtime = self.runtime.read().unwrap();
+            let runtime = crate::util::read_unpoisoned(&self.runtime);
             for listener in runtime.listeners.values() {
                 let credential = &listener.credential;
                 if credential.id != credential_id {
@@ -572,7 +598,7 @@ impl AgentAccessRuntime {
         }
         let mut found = false;
         {
-            let snapshot = self.snapshot.read().unwrap();
+            let snapshot = crate::util::read_unpoisoned(&self.snapshot);
             for credential in &snapshot.settings.agents {
                 if credential.id != id {
                     continue;
@@ -584,7 +610,7 @@ impl AgentAccessRuntime {
             }
         }
         {
-            let runtime = self.runtime.read().unwrap();
+            let runtime = crate::util::read_unpoisoned(&self.runtime);
             for listener in runtime.listeners.values() {
                 let credential = &listener.credential;
                 if credential.id != id {
@@ -603,7 +629,7 @@ impl AgentAccessRuntime {
     /// [`crate::lease::ControlLeaseManager`] 的归属复核使用。
     pub fn lease_credential_enabled(&self, id: &str) -> bool {
         if id == "local-admin" {
-            let snapshot = self.snapshot.read().unwrap();
+            let snapshot = crate::util::read_unpoisoned(&self.snapshot);
             let settings = &snapshot.settings;
             return !settings.enabled && settings.listeners.is_empty();
         }
@@ -641,7 +667,7 @@ impl AgentAccessRuntime {
         bearer: Option<&str>,
         require_enabled: bool,
     ) -> Result<Principal, AuthError> {
-        let snapshot = self.snapshot.read().unwrap().clone();
+        let snapshot = crate::util::read_unpoisoned(&self.snapshot).clone();
         if require_enabled && !snapshot.settings.enabled {
             return Err(AuthError::Unauthorized);
         }
@@ -691,7 +717,7 @@ impl AgentAccessRuntime {
         let mut found = false;
         let mut allowed = false;
         {
-            let snapshot = self.snapshot.read().unwrap();
+            let snapshot = crate::util::read_unpoisoned(&self.snapshot);
             for cred in &snapshot.settings.agents {
                 if cred.id != *credential_id {
                     continue;
@@ -713,7 +739,7 @@ impl AgentAccessRuntime {
             }
         }
         {
-            let runtime = self.runtime.read().unwrap();
+            let runtime = crate::util::read_unpoisoned(&self.runtime);
             for listener in runtime.listeners.values() {
                 let cred = &listener.credential;
                 if cred.id != *credential_id {

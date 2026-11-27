@@ -1,37 +1,28 @@
-//! 统一设备错误类别（与 `docs/API_CONTRACT.md` 的失败语义对齐）。
+//! Unified device error categories aligned with `docs/API_CONTRACT.md`.
 
-use std::fmt;
+use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Canonical error categories for device, serial, relay, and tool operations.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DeviceError {
+    #[error("not found")]
     NotFound,
+    #[error("resource busy")]
     Busy,
+    #[error("permission denied")]
     PermissionDenied,
+    #[error("device disconnected")]
     Disconnected,
+    #[error("operation timed out")]
     Timeout,
+    #[error("invalid config: {0}")]
     Invalid(String),
+    #[error("unsupported action")]
     Unsupported,
-    /// 控制租约复核拒绝（GUI 优先 / 独占控制，docs/SECURITY.md）；
-    /// 携带面向用户的原因文案。
+    /// Control lease admission denial (GUI priority / exclusive control).
+    #[error("lease denied: {0}")]
     Lease(String),
 }
 
-impl fmt::Display for DeviceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DeviceError::NotFound => write!(f, "not found"),
-            DeviceError::Busy => write!(f, "resource busy"),
-            DeviceError::PermissionDenied => write!(f, "permission denied"),
-            DeviceError::Disconnected => write!(f, "device disconnected"),
-            DeviceError::Timeout => write!(f, "operation timed out"),
-            DeviceError::Invalid(what) => write!(f, "invalid config: {what}"),
-            DeviceError::Unsupported => write!(f, "unsupported action"),
-            DeviceError::Lease(what) => write!(f, "lease denied: {what}"),
-        }
-    }
-}
-
-impl std::error::Error for DeviceError {}
-
-/// 应用内统一 `Result` 别名。
+/// Unified `Result` alias for device operations.
 pub type DeviceResult<T> = Result<T, DeviceError>;

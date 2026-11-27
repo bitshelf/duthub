@@ -12,7 +12,7 @@
 //!
 //! 锁住的不变量（见 AGENTS.md 坑 #46–#51 与回归测试加固报告）：
 //! - real.rs 新事件循环（pending 队列 + TX 合并 + 快照节流）在真实串口上工作；
-//! - 空闲首回显直接发布、洪流按 16ms tick 合并 → SerialScreen 事件成串到达（PERF-3 的实机面）；
+//! - 空闲首回显直接发布、洪流按 16ms tick 合并 → `SerialScreen` 事件成串到达（PERF-3 的实机面）；
 //! - 日志写线程逐条 flush、会话关闭排空 → .bin 原始字节 ≥ 收到的文本量、.log 含内核启动行（LOG-1/LOG-6）；
 //! - TX 写路径真机成功且无「写入失败」注记（IO-3 的实机面）。
 #![cfg(feature = "real-hardware")]
@@ -105,7 +105,7 @@ fn com8_reset_boot_live() {
             reference_similarity: None,
             split_logs: false,
         },
-        adb: Default::default(),
+        adb: duthub_core::model::AdbConfig::default(),
         relay: duthub_core::model::RelayConfig::UsbSerial {
             host: "local".into(),
             node: RELAY_PORT.into(),
@@ -121,10 +121,10 @@ fn com8_reset_boot_live() {
         mcp: duthub_core::model::McpConfig::StreamableHttp {
             url: "http://127.0.0.1:8797/mcp".into(),
         },
-        a2a: Default::default(),
-        flash: Default::default(),
-        media: Default::default(),
-        heartbeat: Default::default(),
+        a2a: duthub_core::model::DutA2aConfig::default(),
+        flash: duthub_core::model::FlashConfig::default(),
+        media: duthub_core::model::DutMediaConfig::default(),
+        heartbeat: duthub_core::model::HeartbeatConfig::default(),
     });
     let channels = control
         .channel_status("dut-live-com25")
@@ -185,7 +185,7 @@ fn com8_reset_boot_live() {
     let mut last_size = 0u64;
     let stable_since = Instant::now();
     loop {
-        let size = std::fs::metadata(&bin_path).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::metadata(&bin_path).map_or(0, |m| m.len());
         if size == last_size && stable_since.elapsed() > Duration::from_millis(800) {
             break;
         }

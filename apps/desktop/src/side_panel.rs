@@ -186,6 +186,11 @@ impl Shell {
         cell_width: Pixels,
         row_height: Pixels,
     ) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to [20, 200] and [8, 200] before casting to u16"
+        )]
         let size = PtySize {
             cols: ((f32::from(width) - 28.) / f32::from(cell_width)).clamp(20., 200.) as u16,
             rows: ((f32::from(height) - 120.) / f32::from(row_height)).clamp(8., 200.) as u16,
@@ -340,7 +345,7 @@ impl Workbench {
 
     fn start_shell(&mut self, dut: &DutConfig, window: &mut Window, cx: &mut Context<Self>) {
         let binding = self.duts.saved_usb(&dut.id).cloned();
-        self.side_panel.shell_binding = binding.clone();
+        self.side_panel.shell_binding.clone_from(&binding);
         self.side_panel.shell = None;
         self.side_panel.shell_selection = None;
         self.side_panel.android_preview = None;
@@ -748,15 +753,13 @@ impl Workbench {
                     icon_btn("monitor-float", "copy", p)
                         .tooltip(crate::i18n::t(lang, "monitorFloat"))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if this.frame_pump.placement()
-                                != duthub_desktop::capture_ui::MonitorPlacement::Floating
-                            {
+                            if this.frame_pump.placement() == duthub_desktop::capture_ui::MonitorPlacement::Floating {
+                                this.focus_float_window(cx);
+                            } else {
                                 this.handle_monitor_event(
                                     duthub_desktop::capture_ui::MonitorEvent::OpenFloat,
                                     cx,
                                 );
-                            } else {
-                                this.focus_float_window(cx);
                             }
                             cx.notify();
                         })),
@@ -913,8 +916,7 @@ impl Workbench {
         let row_text = self
             .shell_visible_rows()
             .get(point.row)
-            .map(|row| row.text.clone())
-            .unwrap_or_default();
+            .map_or_default(|row| row.text.clone());
         self.side_panel.shell_selection = Some(match ev.click_count {
             0 | 1 => TerminalSelection::start_char(point),
             2 => TerminalSelection::start_word(point.row, point.col, &row_text),
@@ -948,8 +950,7 @@ impl Workbench {
         let row_text = self
             .shell_visible_rows()
             .get(point.row)
-            .map(|row| row.text.clone())
-            .unwrap_or_default();
+            .map_or_default(|row| row.text.clone());
         if let Some(selection) = self.side_panel.shell_selection.as_mut()
             && selection.update(point, &row_text)
         {

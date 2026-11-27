@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tower-http = { version = "0.6", features = ["limit"] }
 tracing.workspace = true

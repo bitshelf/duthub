@@ -6,7 +6,7 @@
 //!   两者都走 `duthub_core::store::resolve_work_dir_in` 同源解析）。
 //! - MCP 工具返回正文。桌面设置页支持显式导出到磁盘。
 //!
-//! 工具名与 docs/API_CONTRACT.md、server.rs `#[tool]` 方法名保持同步
+//! 工具名与 `docs/API_CONTRACT.md、server.rs` `#[tool]` 方法名保持同步
 //! （坑 #13：清单三处同步）。
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// skill 目录名（工作目录下）与 frontmatter name（Skill 发现的稳定 key）。
 pub const SKILL_NAME: &str = "duthub";
 
-/// HTTP 端点（与 apps/desktop/src/mcp_runtime.rs `MCP_HTTP_PORT` 和
+/// HTTP 端点（与 `apps/desktop/src/mcp_runtime.rs` `MCP_HTTP_PORT` 和
 /// transport.rs `/mcp` 路由对齐；仅本机回环）。
 pub const HTTP_ENDPOINT: &str = "http://127.0.0.1:8797/mcp";
 
@@ -23,16 +23,19 @@ pub const HTTP_ENDPOINT: &str = "http://127.0.0.1:8797/mcp";
 pub const STDIO_BIN: &str = "duthub-mcp";
 
 /// 生成 SKILL.md 全文（纯函数，单测覆盖内容契约）。
+#[must_use]
 pub fn generate_skill_md() -> String {
     generate_for_endpoint(HTTP_ENDPOINT)
 }
 
+#[must_use]
 pub fn skill_for_listener(port: Option<u16>) -> String {
     let endpoint = port.map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
     skill_for_endpoint(endpoint)
 }
 
 /// 按实际对外地址生成 SKILL.md（局域网模式传入探测到的局域网 IP）。
+#[must_use]
 pub fn skill_for_endpoint(endpoint: Option<SocketAddr>) -> String {
     match endpoint {
         Some(endpoint) => generate_for_endpoint(&format!("http://{endpoint}/mcp")),
@@ -55,7 +58,7 @@ description: 远程或本机 Agent 通过 duthub MCP 调试嵌入式 Linux/Andro
 
 | 传输 | 地址或命令 | 权限 |
 |---|---|---|
-| duthub.exe 内置 Streamable HTTP（推荐远程接入） | `{HTTP_ENDPOINT}` | 请求头须携带 `Authorization: Bearer <TOKEN>`（Streamable HTTP `POST /mcp`） |
+| duthub.exe 内置 Streamable HTTP（推荐远程接入） | `{http_endpoint}` | 请求头须携带 `Authorization: Bearer <TOKEN>`（Streamable HTTP `POST /mcp`） |
 | 开发用本地 stdio | `{STDIO_BIN}` | 通过当前系统账号读取只读快照 `runtime/mcp-state.json` |
 
 远程客户端优先经可信 HTTPS 网关或安全隧道连接（例如从 Windows 主机向远端 Linux 建立 SSH 反向隧道：`ssh -N -R localhost:18799:localhost:<port> user@linux-server`）；局域网直连仅在可信网络开启，并需在 Windows 防火墙放行 `duthub.exe` 入站（明文 HTTP，Token 可能被同网段嗅探）。Token 仅放在认证头或客户端的凭据存储中。
@@ -128,8 +131,6 @@ description: 远程或本机 Agent 通过 duthub MCP 调试嵌入式 Linux/Andro
 - 若写/控/烧录/ADB 返回 `LeaseRequired/DUT_BUSY` 且持有者为 `GUI（人类在场）`（说明桌面端已打开串口但尚未交出控制权），请勿死循环重试——先调用 `notify_user` 提醒桌面用户点击「释放控制权」（无人值守启动可使用 `--release-gui-lease`）。
 - **绝对禁止**尝试遍历路径（`..`）、绝对路径、符号链接/Junction 或读取/写入 duthub 工作目录之外的任何宿主机文件，且绝不存在任何宿主机命令执行接口。
 "#,
-        HTTP_ENDPOINT = http_endpoint,
-        STDIO_BIN = STDIO_BIN,
     )
 }
 
@@ -230,8 +231,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
+                .map_or_default(|d| d.as_nanos())
         ));
         let path = export_skill_in(&work).expect("导出成功");
         assert_eq!(path, work.join("skill").join(SKILL_NAME).join("SKILL.md"));

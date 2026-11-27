@@ -129,7 +129,7 @@ fn redundant_events_are_noops() {
 
 #[test]
 fn action_steps_cover_every_variant() {
-    assert!(A::None.steps().is_empty());
+    assert_eq!(A::None.steps(), []);
     assert_eq!(A::OpenFloatWindow.steps(), [A::OpenFloatWindow].as_slice());
     assert_eq!(
         A::CloseFloatWindow.steps(),

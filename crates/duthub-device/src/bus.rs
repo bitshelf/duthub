@@ -3,7 +3,7 @@
 //! - `publish`：事件写入会话环形缓冲，并广播给所有订阅者。
 //! - 订阅者消费过慢会收到 `Lagged(n)`（tokio broadcast 语义），此时调用
 //!   `read_log(session_id, since_seq, limit)` 从缓冲补齐，不丢内核 panic 数据
-//!   （docs/API_CONTRACT.md 事件节）。
+//!   （`docs/API_CONTRACT.md` 事件节）。
 //! - `seq` 全局单调，由总线分配。
 
 use std::collections::{HashMap, VecDeque};
@@ -83,6 +83,14 @@ pub struct EventBus {
     next_seq: AtomicU64,
 }
 
+impl std::fmt::Debug for EventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventBus")
+            .field("next_seq", &self.next_seq.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for EventBus {
     fn default() -> Self {
         Self::new(1024)
@@ -92,6 +100,7 @@ impl Default for EventBus {
 impl EventBus {
     /// Create a bounded broadcast bus; slow subscribers receive `Lagged(n)` and
     /// recover from the per-session backlog via [`Self::read_log`].
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity.max(1));
         Self {
@@ -112,7 +121,7 @@ impl EventBus {
     /// Mint a monotonically sequenced envelope, retain it in the session backlog,
     /// and broadcast it to live subscribers.
     pub fn publish(&self, session_id: &str, dut_id: &str, event: UiEvent) -> EventEnvelope {
-        let mut buffers = self.buffers.lock().unwrap();
+        let mut buffers = duthub_core::util::lock_unpoisoned(&self.buffers);
         let envelope = EventEnvelope {
             seq: self.next_seq(),
             ts_unix_ms: duthub_core::util::unix_ms(),
@@ -133,12 +142,12 @@ impl EventBus {
 
     /// Drop the backlog for a closed session.
     pub fn drop_session(&self, session_id: &str) {
-        self.buffers.lock().unwrap().remove(session_id);
+        duthub_core::util::lock_unpoisoned(&self.buffers).remove(session_id);
     }
 
     /// Expire a closed buffer only while its final sequence still matches.
     pub(crate) fn expire_closed_session(&self, session_id: &str, final_seq: u64) {
-        let mut buffers = self.buffers.lock().unwrap();
+        let mut buffers = duthub_core::util::lock_unpoisoned(&self.buffers);
         if buffers
             .get(session_id)
             .is_some_and(|buffer| buffer.last_seq == final_seq)
@@ -149,16 +158,15 @@ impl EventBus {
 
     /// Return up to `limit` buffered envelopes with `seq > since_seq`.
     pub fn read_log(&self, session_id: &str, since_seq: u64, limit: usize) -> Vec<EventEnvelope> {
-        let buffers = self.buffers.lock().unwrap();
+        let buffers = duthub_core::util::lock_unpoisoned(&self.buffers);
         buffers
             .get(session_id)
-            .map(|buffer| buffer.read_since(since_seq, limit))
-            .unwrap_or_default()
+            .map_or_default(|buffer| buffer.read_since(since_seq, limit))
     }
 
     /// Clone only the newest envelopes, in ascending sequence order.
     pub(crate) fn read_log_tail(&self, session_id: &str, limit: usize) -> Vec<EventEnvelope> {
-        let buffers = self.buffers.lock().unwrap();
+        let buffers = duthub_core::util::lock_unpoisoned(&self.buffers);
         buffers
             .get(session_id)
             .map_or_else(Vec::new, |buffer| buffer.read_tail(limit))
@@ -170,7 +178,7 @@ impl EventBus {
         since_seq: u64,
         limit: usize,
     ) -> (u64, Vec<EventEnvelope>) {
-        let buffers = self.buffers.lock().unwrap();
+        let buffers = duthub_core::util::lock_unpoisoned(&self.buffers);
         let buffer = buffers.get(session_id);
         let tail = buffer.map_or(0, |buffer| buffer.last_seq);
         let since = if since_seq > tail { 0 } else { since_seq };
@@ -186,7 +194,7 @@ impl EventBus {
 
     /// Latest sequence number seen in the session backlog (`0` if absent).
     pub fn last_seq(&self, session_id: &str) -> u64 {
-        let buffers = self.buffers.lock().unwrap();
+        let buffers = duthub_core::util::lock_unpoisoned(&self.buffers);
         buffers.get(session_id).map_or(0, |buffer| buffer.last_seq)
     }
 }
@@ -226,8 +234,8 @@ mod tests {
         );
 
         let backlog = bus.read_log("s1", 0, 1).pop().unwrap();
-        let received = receiver.try_recv().unwrap();
-        for envelope in [backlog, received] {
+        let live_event = receiver.try_recv().unwrap();
+        for envelope in [backlog, live_event] {
             let UiEvent::SerialScreen { screen: shared } = envelope.event else {
                 panic!("expected a screen event");
             };
@@ -238,7 +246,7 @@ mod tests {
     #[test]
     fn buffer_cap_evicts_oldest() {
         let bus = EventBus::new(4);
-        for i in 0..(SESSION_BUFFER_CAP as u32 + 500) {
+        for i in 0..(SESSION_BUFFER_CAP + 500) {
             bus.publish("s1", "d1", chunk(format!("line-{i}"), ChunkStyle::Normal));
         }
         let log = bus.read_log("s1", 0, usize::MAX);
@@ -277,8 +285,8 @@ mod tests {
             .collect();
         assert_eq!(seqs, [next.seq, last.seq]);
         assert_eq!(bus.read_log_tail("s1", usize::MAX)[0].seq, first.seq);
-        assert!(bus.read_log_tail("s1", 0).is_empty());
-        assert!(bus.read_log_tail("missing", 2).is_empty());
+        assert_eq!(bus.read_log_tail("s1", 0), [] as [duthub_core::EventEnvelope; 0]);
+        assert_eq!(bus.read_log_tail("missing", 2), [] as [duthub_core::EventEnvelope; 0]);
     }
 
     #[test]
@@ -356,7 +364,7 @@ mod tests {
         let bus = EventBus::new(8);
         bus.publish("s1", "d1", chunk("x", ChunkStyle::Normal));
         bus.drop_session("s1");
-        assert!(bus.read_log("s1", 0, usize::MAX).is_empty());
+        assert_eq!(bus.read_log("s1", 0, usize::MAX), [] as [duthub_core::EventEnvelope; 0]);
         assert_eq!(bus.last_seq("s1"), 0);
     }
 }

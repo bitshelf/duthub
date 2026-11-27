@@ -32,7 +32,7 @@ pub const EVENT_QUEUE_CAPACITY: usize = 4096;
 /// duthub 实现的 ACP 协议版本（initialize 必须显式等于该值）。
 pub const ACP_PROTOCOL_VERSION: u64 = 1;
 /// 控制事件队列上限。正常低频；若失控的 agent 持续制造关键事件，
-/// 清空队列并以 `CRITICAL_OVERFLOW_PREFIX` 的 ProtocolError fail closed。
+/// 清空队列并以 `CRITICAL_OVERFLOW_PREFIX` 的 `ProtocolError` fail closed。
 pub const CRITICAL_QUEUE_CAPACITY: usize = 1024;
 /// 关键事件队列溢出标记（host 见到它无条件终止会话）。
 pub const CRITICAL_OVERFLOW_PREFIX: &str = "ACP 关键事件队列溢出";
@@ -41,7 +41,7 @@ const PROTOCOL_BODY_PREVIEW: usize = 200;
 /// A request checks the closed/cancel flags at this cadence even while the
 /// agent is silent, so stop/EOF never waits for the full request timeout.
 const REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// Drop 关闭 Job 句柄后等待主进程退出的上限（KILL_ON_JOB_CLOSE 是异步终止）；
+/// Drop 关闭 Job `句柄后等待主进程退出的上限（KILL_ON_JOB_CLOSE` 是异步终止）；
 /// 超时退回 `kill_process_tree`，避免 Drop 永久阻塞工作线程。
 const JOB_CLOSE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -98,6 +98,17 @@ pub struct McpServerRef<'a> {
     pub name: &'a str,
     pub url: &'a str,
     pub token: &'a str,
+}
+
+impl std::fmt::Debug for McpServerRef<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpServerRef")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +201,7 @@ impl StderrState {
 struct AcpInner {
     stdin: Mutex<Option<Box<dyn Write + Send>>>,
     events: Mutex<VecDeque<AcpEvent>>,
-    /// 控制事件独立通道（F15）：PromptDone / Exited / ProtocolError 不能被
+    /// 控制事件独立通道（F15）：PromptDone / Exited / `ProtocolError` 不能被
     /// 正文事件溢出丢弃；自身有上限，越界即 fail closed。
     critical: Mutex<VecDeque<AcpEvent>>,
     critical_overflowed: Mutex<bool>,
@@ -273,7 +284,7 @@ impl AcpInner {
             .map_err(|error| AcpError::Io(error.to_string()))
     }
 
-    fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, AcpError> {
+    fn request(&self, method: &str, params: &Value, timeout: Duration) -> Result<Value, AcpError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(AcpError::Closed);
         }
@@ -331,19 +342,16 @@ impl AcpInner {
 
     fn handle_stdout_line(&self, line: &str) {
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => {
-                let preview: String = self
-                    .redact(line)
-                    .chars()
-                    .take(PROTOCOL_BODY_PREVIEW)
-                    .collect();
-                self.push_event(AcpEvent::ProtocolError(format!(
-                    "stdout 不是 JSON-RPC: {preview}"
-                )));
-                return;
-            }
+        let value: Value = if let Ok(value) = serde_json::from_str(line) { value } else {
+            let preview: String = self
+                .redact(line)
+                .chars()
+                .take(PROTOCOL_BODY_PREVIEW)
+                .collect();
+            self.push_event(AcpEvent::ProtocolError(format!(
+                "stdout 不是 JSON-RPC: {preview}"
+            )));
+            return;
         };
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             let method = method.to_owned();
@@ -387,7 +395,7 @@ impl AcpInner {
         let _ = sender.send(outcome);
     }
 
-    /// agent → client 请求的响应（拒绝权限，fs/terminal 与未知方法 MethodNotFound）。
+    /// agent → client 请求的响应（拒绝权限，fs/terminal 与未知方法 `MethodNotFound`）。
     fn agent_request_response(&self, id: &Value, method: &str, value: &Value) -> Value {
         match method {
             "session/request_permission" => {
@@ -502,10 +510,13 @@ fn compact_json(value: &Value) -> String {
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Stable, filesystem-safe scope for a cell rooted at `cwd`.
@@ -561,12 +572,21 @@ pub struct AcpClient {
     process: Mutex<SandboxedProcess>,
 }
 
+impl std::fmt::Debug for AcpClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcpClient")
+            .field("closed", &self.inner.closed.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 impl AcpClient {
-    /// 启动 ACP 子进程（stdin/stdout/stderr 全 piped；Windows CREATE_NO_WINDOW）。
+    /// 启动 ACP 子进程（stdin/stdout/stderr 全 piped；Windows `CREATE_NO_WINDOW`）。
     ///
     /// 环境由三部分组成：
     /// 1. [`INHERITED_ENV`] 的系统变量白名单（**不含**用户目录键）；
-    /// 2. 调用方 `env`（模型密钥、GOOSE_PATH_ROOT 等），同名时覆盖白名单；
+    /// 2. 调用方 `env`（`模型密钥、GOOSE_PATH_ROOT` 等），同名时覆盖白名单；
     /// 3. `TEMP`/`TMP` 最后写入，固定指向 `cwd/tmp`（先创建并做普通目录校验，
     ///    调用方 env 不得覆盖）。
     ///
@@ -721,7 +741,7 @@ impl AcpClient {
             let inner = inner.clone();
             std::thread::Builder::new()
                 .name("duthub-acp-stdout".into())
-                .spawn(move || read_stdout(stdout, inner))
+                .spawn(move || read_stdout(stdout, &inner))
         };
         if let Err(error) = stdout_thread {
             // Dropping the process handle terminates the Job tree; there is no
@@ -733,7 +753,7 @@ impl AcpClient {
             let inner = inner.clone();
             std::thread::Builder::new()
                 .name("duthub-acp-stderr".into())
-                .spawn(move || read_stderr(stderr, inner))
+                .spawn(move || read_stderr(stderr, &inner))
         };
         if let Err(error) = stderr_thread {
             drop(process);
@@ -749,7 +769,7 @@ impl AcpClient {
     pub fn initialize(&self, timeout: Duration) -> Result<InitializeInfo, AcpError> {
         let result = self.inner.request(
             "initialize",
-            json!({
+            &json!({
                 "protocolVersion": ACP_PROTOCOL_VERSION,
                 "clientCapabilities": {
                     "fs": { "readTextFile": false, "writeTextFile": false },
@@ -791,9 +811,11 @@ impl AcpClient {
         mcp: &McpServerRef<'_>,
         timeout: Duration,
     ) -> Result<SessionInfo, AcpError> {
-        let result =
-            self.inner
-                .request("session/new", session_params(cwd, Some(mcp), None), timeout)?;
+        let result = self.inner.request(
+            "session/new",
+            &session_params(cwd, Some(mcp), None),
+            timeout,
+        )?;
         let session_id = result
             .get("sessionId")
             .and_then(Value::as_str)
@@ -823,7 +845,7 @@ impl AcpClient {
     ) -> Result<bool, AcpError> {
         let value = self.inner.request(
             "session/load",
-            session_params(cwd, Some(mcp), Some(id)),
+            &session_params(cwd, Some(mcp), Some(id)),
             timeout,
         );
         match value {
@@ -971,7 +993,7 @@ fn session_params(cwd: &Path, mcp: Option<&McpServerRef<'_>>, session_id: Option
     params
 }
 
-fn read_stdout(stdout: impl Read, inner: Arc<AcpInner>) {
+fn read_stdout(stdout: impl Read, inner: &AcpInner) {
     let mut reader = BufReader::new(stdout);
     loop {
         match read_bounded_line(&mut reader, MAX_STDOUT_LINE) {
@@ -999,14 +1021,13 @@ fn read_stdout(stdout: impl Read, inner: Arc<AcpInner>) {
     inner.mark_closed();
 }
 
-fn read_stderr(stderr: impl Read, inner: Arc<AcpInner>) {
+fn read_stderr(stderr: impl Read, inner: &AcpInner) {
     let mut stderr = stderr;
     let mut chunk = [0u8; 4096];
     loop {
         match stderr.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(read) => inner.stderr.lock().unwrap().push(&chunk[..read]),
-            Err(_) => break,
         }
     }
 }

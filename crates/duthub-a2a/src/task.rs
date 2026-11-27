@@ -39,6 +39,7 @@ pub struct TaskOwnership {
 }
 
 impl TaskOwnership {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -97,13 +98,21 @@ impl TaskOwnership {
     }
 }
 
-/// RequestHandler that allows exactly the three supported methods and
+/// `RequestHandler` that allows exactly the three supported methods and
 /// answers every other A2A method with `method_not_found` (-32601).
 pub struct StrictRequestHandler {
     inner: Arc<DefaultRequestHandler>,
 }
 
+impl std::fmt::Debug for StrictRequestHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StrictRequestHandler")
+            .finish_non_exhaustive()
+    }
+}
+
 impl StrictRequestHandler {
+    #[must_use]
     pub fn new(inner: Arc<DefaultRequestHandler>) -> Self {
         Self { inner }
     }

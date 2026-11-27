@@ -50,6 +50,7 @@ pub enum RecKind {
 }
 
 impl RecKind {
+    #[must_use]
     pub fn from_u32(value: u32) -> Option<Self> {
         match value {
             1 => Some(Self::Raw),
@@ -62,6 +63,7 @@ impl RecKind {
     }
 
     /// Short Chinese display tag used by the terminal log view.
+    #[must_use]
     pub fn tag(self) -> &'static str {
         match self {
             Self::Raw => "RX",
@@ -77,7 +79,7 @@ impl RecKind {
 /// created (only when the file is empty, so re-opening an existing segment
 /// never duplicates it). `header_len` lets future versions extend the preamble
 /// without breaking v1 readers.
-#[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
+#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C)]
 pub struct FileHeader {
     pub magic: [u8; 8],
@@ -89,11 +91,12 @@ pub struct FileHeader {
 impl FileHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             magic: FILE_MAGIC,
             version: U32::new(FORMAT_VERSION),
-            header_len: U32::new(Self::SIZE as u32),
+            header_len: U32::new(u32::try_from(Self::SIZE).expect("FileHeader size fits in u32")),
             created_unix_ns: U64::new(now_unix_ns()),
         }
     }
@@ -108,7 +111,7 @@ impl Default for FileHeader {
 /// Per-record fixed header (24 bytes, unaligned, little-endian). The CRC
 /// covers the payload only; the header is guarded by its magic and the
 /// `payload_len` sanity bound.
-#[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
+#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C)]
 pub struct RecordHeader {
     pub magic: [u8; 4],
@@ -126,24 +129,31 @@ impl RecordHeader {
             magic: RECORD_MAGIC,
             kind: U32::new(kind as u32),
             ts_unix_ns: U64::new(ts_unix_ns),
-            payload_len: U32::new(payload_len as u32),
+            payload_len: U32::new(
+                u32::try_from(payload_len).expect("payload_len bounded by MAX_RECORD_PAYLOAD"),
+            ),
             crc32: U32::new(crc32),
         }
     }
 }
 
 /// Wall-clock nanoseconds since the Unix epoch (0 on clock failure).
+#[must_use]
 pub fn now_unix_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 const fn build_crc_table() -> [u32; 256] {
     let mut table = [0u32; 256];
     let mut i = 0usize;
     while i < 256 {
+        #[expect(clippy::cast_possible_truncation, reason = "loop index is in 0..256")]
         let mut crc = i as u32;
         let mut bit = 0;
         while bit < 8 {
@@ -164,10 +174,11 @@ static CRC_TABLE: [u32; 256] = build_crc_table();
 
 /// Standard CRC-32 (IEEE 802.3, reflected poly 0xEDB88320; matches zlib /
 /// crc32fast). Guard against torn or corrupt record tails on parse.
+#[must_use]
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
-        crc = CRC_TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+        crc = CRC_TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
 }
@@ -217,6 +228,7 @@ impl From<&RecRecord<'_>> for OwnedRecRecord {
 /// Parse result: valid records cover the first `valid_bytes` of `bytes`.
 /// A torn or corrupt tail stops parsing there — earlier records are kept,
 /// later bytes are ignored (never a panic on truncated input).
+#[derive(Debug)]
 pub struct RecBatch<'a> {
     pub records: Vec<RecRecord<'a>>,
     pub valid_bytes: usize,
@@ -225,6 +237,7 @@ pub struct RecBatch<'a> {
 /// Parse a buffer of `.rec` bytes. Accepts buffers with or without the file
 /// preamble: if the preamble magic matches it is skipped, otherwise parsing
 /// starts at byte 0 (a continuation buffer or a preamble-less segment file).
+#[must_use]
 pub fn parse_records(bytes: &[u8]) -> RecBatch<'_> {
     let mut pos = 0usize;
     if bytes.len() >= FileHeader::SIZE
@@ -285,6 +298,7 @@ pub fn write_preamble(file: &mut File) -> std::io::Result<()> {
 /// Incremental reader over one `.rec` segment file. `poll` returns every
 /// record completed since the last call; an in-progress (torn) record stays
 /// buffered until its remaining bytes arrive on a later poll.
+#[derive(Debug)]
 pub struct RecTailReader {
     path: PathBuf,
     /// Bytes consumed so far (complete records + preamble).
@@ -303,6 +317,7 @@ impl RecTailReader {
         }
     }
 
+    #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
     }
@@ -327,6 +342,7 @@ impl RecTailReader {
 /// first, then rotation `.1`, `.2`, … by numeric suffix). Mirrors
 /// `logs::list_segments` but filters strictly on the `.rec` family so the
 /// log/bin listing and its tests are untouched.
+#[must_use]
 pub fn list_rec_segments(dir: &Path, session_id: &str) -> Vec<PathBuf> {
     let prefix = format!("{session_id}.rec");
     let mut found: Vec<(u32, PathBuf)> = Vec::new();

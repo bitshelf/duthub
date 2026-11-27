@@ -102,17 +102,20 @@ pub fn manifest() -> Result<Value, BundleError> {
 
 /// goose licence statement: not bundled, licence ships with the upstream
 /// package (Apache-2.0). Replaces the former embedded `LICENSE` full text.
+#[must_use]
 pub fn license_text() -> &'static str {
     LICENSE_TEXT
 }
 
 /// goose attribution statement: not bundled, NOTICE ships with the upstream
 /// package. Replaces the former embedded `NOTICE` file.
+#[must_use]
 pub fn notice_text() -> &'static str {
     NOTICE_TEXT
 }
 
 /// The distribution record as raw JSON (`embedded: false`, upstream source).
+#[must_use]
 pub fn manifest_json() -> &'static str {
     MANIFEST_JSON
 }
@@ -120,8 +123,9 @@ pub fn manifest_json() -> &'static str {
 /// Authenticode fact for a goose binary duthub did not verify.
 ///
 /// Nothing is embedded any more, so this cannot report a manifest-recorded
-/// signature status; it must not claim "NotSigned" either, which would assert
+/// signature status; it must not claim "`NotSigned`" either, which would assert
 /// the absence of a signature that nobody checked.
+#[must_use]
 pub fn authenticode_status() -> &'static str {
     NOT_EMBEDDED_STATUS
 }

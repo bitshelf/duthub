@@ -42,7 +42,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// the IPv4 loopback; every other value needs product sign-off and is refused.
 fn resolve_loopback(bind_addr: Option<&str>) -> Result<IpAddr, String> {
     match bind_addr.map(str::trim) {
-        None | Some("") | Some("127.0.0.1") => Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        None | Some("" | "127.0.0.1") => Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         Some(other) => Err(format!(
             "bind_addr {other:?} is not 127.0.0.1: non-loopback bind requires product sign-off (ADR-2)"
         )),
@@ -85,6 +85,16 @@ pub struct A2aListener {
     pub executor: DuthubExecutor,
     pub ownership: Arc<TaskOwnership>,
     pub token: SharedToken,
+}
+
+impl std::fmt::Debug for A2aListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("A2aListener")
+            .field("executor", &self.executor)
+            .field("ownership", &self.ownership)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Assemble the A2A HTTP stack for one DUT. Used by [`A2aRuntime::start`]
@@ -187,6 +197,24 @@ pub struct A2aRuntime {
     failures: Mutex<HashMap<String, A2aStatus>>,
 }
 
+impl std::fmt::Debug for A2aRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let active_duts: Vec<String> = self
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        f.debug_struct("A2aRuntime")
+            .field("registry", &self.registry)
+            .field("active_duts", &active_duts)
+            .field("pending", &self.pending)
+            .field("failures", &self.failures)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for A2aRuntime {
     fn default() -> Self {
         Self::new()
@@ -196,6 +224,7 @@ impl Default for A2aRuntime {
 impl A2aRuntime {
     /// Runtime with the production keyring token source
     /// (`duthub_core::keys`, service `duthub`, entry `a2a/<dut_id>`).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_token_source(Arc::new(auth::KeyringTokenSource))
     }

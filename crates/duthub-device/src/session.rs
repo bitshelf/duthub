@@ -27,7 +27,7 @@ pub enum SessionKind {
 
 /// 发送路径的行尾策略（H1.2 会话级设置）：无 / \n / \r\n。
 ///
-/// 默认 `Lf`（历史行为：write_line 自动补 \n）。
+/// 默认 `Lf`（`历史行为：write_line` 自动补 \n）。
 /// 已以 \n 或 \r 结尾的文本按原文发送，不重复追加。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LineEnding {
@@ -42,6 +42,7 @@ pub enum LineEnding {
 
 impl LineEnding {
     /// UI 展示用短标签。
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             LineEnding::Off => "无",
@@ -51,6 +52,7 @@ impl LineEnding {
     }
 
     /// 发送路径生效：按策略为不带行尾的文本追加行尾符。
+    #[must_use]
     pub fn apply(self, text: &str) -> String {
         if text.ends_with('\n') || text.ends_with('\r') {
             return text.to_string();
@@ -65,7 +67,7 @@ impl LineEnding {
 
 pub struct SessionHandle {
     pub(crate) logs: Arc<Mutex<crate::logs::SessionLogWriter>>,
-    /// 会话日志写通道克隆：供电分段（log_control_boundary）同步落盘时用。
+    /// `会话日志写通道克隆：供电分段（log_control_boundary）同步落盘时用`。
     /// None = 写线程未启动（无日志/构建降级），走直写兜底。
     pub(crate) log_tx: Option<std::sync::mpsc::Sender<crate::demo::LogMsg>>,
     pub dut_id: String,
@@ -79,13 +81,26 @@ pub struct SessionHandle {
     pub join: Option<tokio::task::JoinHandle<()>>,
     /// 成功打开串口后置 true；task 结束时仍为 false = 首开失败，需要回收注册表
     pub opened_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 手动重连唤醒：退避等待期间收到通知则提前重试。notify_one 在无等待者时
+    /// `手动重连唤醒：退避等待期间收到通知则提前重试。notify_one` 在无等待者时
     /// 存一个许可（上限 1）——连接正常时点击"重连"也不丢，下一次断线退避会
     /// 立即返回，语义即"手动请求一次立即重连"。
     pub reconnect_notify: Arc<Notify>,
 }
 
+impl std::fmt::Debug for SessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionHandle")
+            .field("dut_id", &self.dut_id)
+            .field("session_id", &self.session_id)
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
 /// 断线重连退避：base * 2^(attempt-1)，封顶 `max`；attempt 从 1 计。
+#[must_use]
 pub fn reconnect_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
     let exp = attempt.saturating_sub(1).min(16);
     let scaled = base.saturating_mul(1u32 << exp);
@@ -93,7 +108,7 @@ pub fn reconnect_backoff(attempt: u32, base: Duration, max: Duration) -> Duratio
 }
 
 /// 会话注册表 + 端口锁（独立结构便于测试）。
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Registry {
     sessions: HashMap<String, SessionHandle>,
     locked_ports: HashSet<(String, String)>,
@@ -101,6 +116,7 @@ pub struct Registry {
 }
 
 impl Registry {
+    #[must_use]
     pub fn get(&self, dut_id: &str) -> Option<&SessionHandle> {
         self.sessions.get(dut_id)
     }
@@ -150,6 +166,7 @@ impl Registry {
         self.sessions.remove(dut_id)
     }
 
+    #[must_use]
     pub fn session_ids(&self) -> Vec<String> {
         self.sessions.keys().cloned().collect()
     }
@@ -176,6 +193,18 @@ pub struct SessionSpec<'a> {
     pub audit: Option<Arc<AuditSink>>,
     /// 每 DUT 乱码检测开关（与 `DeviceService` 共享；空 map = 全关）。
     pub garble_enabled: Arc<Mutex<HashMap<String, bool>>>,
+}
+
+impl std::fmt::Debug for SessionSpec<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSpec")
+            .field("dut_id", &self.dut_id)
+            .field("session_id", &self.session_id)
+            .field("kind", &self.kind)
+            .field("port", &self.port)
+            .field("baud", &self.baud)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 会话工厂：按 kind 构造驱动 task；返回 (句柄, 命令发送端克隆)。
@@ -301,7 +330,7 @@ mod tests {
 
     /// IO-5（纯函数面）：已带行尾（\n、\r\n、\r）的文本在全部三种策略下一律
     /// 原文直传——不得把 \n 重复追加成 \n\r\n、把 \r\n 补成 \r\n\r\n。
-    /// 与既有 line_ending_apply_adds_configured_suffix 互补：那边只覆盖 3 种
+    /// 与既有 `line_ending_apply_adds_configured_suffix` 互补：那边只覆盖 3 种
     /// 组合，这里锁 3 策略 × 3 已带行尾形态的全矩阵。
     #[test]
     fn line_ending_apply_passthrough_matrix_all_policies() {
@@ -316,8 +345,8 @@ mod tests {
         }
     }
 
-    /// IO-5（会话发送路径）：demo 会话对每条 Write 按当前会话 LineEnding 策略
-    /// 补行尾，以 .bin 线上字节为准：全新会话默认 Lf（无需 SetEnding）、
+    /// IO-5（会话发送路径）：demo 会话对每条 Write 按当前会话 `LineEnding` 策略
+    /// 补行尾，以 .bin 线上字节为准：全新会话默认 Lf（无需 `SetEnding`）、
     /// SetEnding(Crlf/Off) 对后续写生效、已带行尾的文本在任何策略下原文直传。
     /// 轮询只作宽松时限上界（0 延迟会话 5s 内必达），不写会闪断的窄时序断言；
     /// 断言前先经 Flush 屏障排空日志写线程，join 完成即 .bin 完整落盘。
@@ -338,7 +367,7 @@ mod tests {
             session_id: "sess-lio",
             kind: SessionKind::Demo,
             port: "COM3",
-            baud: 115200,
+            baud: 115_200,
             demo_line_delay_ms: 0,
             scrollback_rows: crate::term::SCROLLBACK_HISTORY,
             snapshot_max_rows: crate::term::SNAPSHOT_MAX_ROWS,
@@ -454,7 +483,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let service = crate::DeviceService::custom(64, dir.clone(), 0);
         service
-            .open_session("dut-norm", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-norm", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         // 混合输入一次覆盖归一全序：CRLF 折叠 + 残留 LF 清理 + 裸 CR 直传
         service

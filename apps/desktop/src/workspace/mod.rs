@@ -167,7 +167,7 @@ fn provider_setting(provider: duthub_core::Provider) -> &'static str {
     }
 }
 
-/// GoosePath 输入的显示值：草稿优先，**空串草稿也是有效草稿**——已记录的外部路径
+/// `GoosePath` 输入的显示值：草稿优先，**空串草稿也是有效草稿**——已记录的外部路径
 /// 不得把用户清空后的输入回填成旧值（否则「清空 → 校验并保存」会重新校验旧路径）。
 fn goose_path_field_value(draft: Option<&str>, recorded: Option<&str>) -> String {
     draft.map_or_else(|| recorded.unwrap_or_default().to_owned(), str::to_owned)
@@ -219,7 +219,7 @@ pub enum In {
     Prompt,
     /// Agent 面板「模型名称」（探针/任务调用的模型 id）
     AgentModel,
-    /// Agent 设置页「外部 goose 路径」草稿（坑 #41：input_value/input_set 成对）
+    /// Agent 设置页「外部 goose 路径」草稿（坑 #`41：input_value/input_set` 成对）
     GoosePath,
     /// Agent 页注册表编辑器：名称 / 程序 / 参数 / 环境变量键名
     AgentRegName,
@@ -259,12 +259,12 @@ pub enum In {
     HdcExe,
     WorkDir,
     DutStorageGib,
-    /// 连接页「心跳间隔（秒）」（dut.heartbeat.interval_secs）
+    /// `连接页「心跳间隔（秒）」（dut.heartbeat.interval_secs`）
     HeartbeatInterval,
     /// 连接页「心跳命令」（dut.heartbeat.command；Agent 可经 heartbeat.set 改写）
     HeartbeatCommand,
     HeartbeatExpectedResponse,
-    /// 设置页「工作目录」输入（settings.workspace_dir；保存后重启生效）
+    /// `设置页「工作目录」输入（settings.workspace_dir；保存后重启生效`）
     /// 设置页「Agent 接入」：监听端口 / 租约 TTL（草稿输入，保存按钮提交）
     AgentAccessPort,
     AgentAccessExtraPort,
@@ -448,7 +448,7 @@ pub struct SessionView {
     /// 波特率热切换输入草稿（None = 显示当前值）
     pub baud_draft: Option<String>,
     /// real 会话的终端网格快照（alacritty 仿真；PuTTY 行为的渲染源）。
-    /// device 会话的 SerialChunk 里仅注记行（[serial]/[mark]/错误）进 `lines`，
+    /// device 会话的 `SerialChunk` 里仅注记行（[serial]/[mark]/错误）进 `lines`，
     /// 设备输出一律走这里的网格行。Arc 共享：吸收事件零深拷贝，渲染只读。
     pub screen: Option<std::sync::Arc<duthub_core::ipc::ScreenSnapshot>>,
     history: Option<duthub_device::term::TerminalHistoryPage>,
@@ -517,7 +517,7 @@ impl SessionView {
         }
     }
 
-    /// SerialChunk → lines 的路由判定（device 会话 PuTTY 分层）：设备输出
+    /// `SerialChunk` → lines 的路由判定（device 会话 `PuTTY` 分层）：设备输出
     /// （Normal/Good/Prompt）由仿真器网格渲染，不得重复进注记列表；
     /// "[serial] … @ N 已打开"信令行消费进链路状态后同样不进列表；
     /// demo 会话保持全量行渲染（返回 true = 入队）。
@@ -554,7 +554,7 @@ fn serial_enter_bytes(ending: Option<duthub_core::model::SerialEnterEnding>) -> 
 }
 
 /// 键盘退格字节（「串口」设置段 serial.backspace 驱动；None/Del = DEL 0x7f，
-/// CtrlH = 0x08，部分 BSP shell / 老工具需要）。
+/// `CtrlH` = 0x08，部分 BSP shell / 老工具需要）。
 fn serial_backspace_byte(mode: Option<duthub_core::model::SerialBackspace>) -> u8 {
     match mode {
         Some(duthub_core::model::SerialBackspace::CtrlH) => 0x08,
@@ -1040,13 +1040,13 @@ pub(crate) struct PendingRegistrySave {
 
 /// Agent 宿主工作线程 → GUI 的事件出口（F9）。
 ///
-/// HostEvents 由工作线程调用，不能直接触达 UI：失败进 AlertCenter（渲染层
+/// `HostEvents` 由工作线程调用，不能直接触达 UI：失败进 AlertCenter（渲染层
 /// 统一弹窗），一般退出只进 toast 队列，由 `agent_host_tick` 搬到
 /// `pending_toasts`。
 struct AgentHostEvents {
     alerts: Arc<Mutex<AlertCenter>>,
     toasts: Arc<Mutex<Vec<String>>>,
-    /// 已上报失败的 DUT：随后的 on_exited 不重复 toast。
+    /// 已上报失败的 DUT：随后的 `on_exited` 不重复 toast。
     failed: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -1082,6 +1082,10 @@ impl agent_host::HostEvents for AgentHostEvents {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "top-level GPUI Workbench state holds independent UI flags"
+)]
 pub struct Workbench {
     pub(crate) agent_credential_listener: Option<String>,
     pub(crate) agent_token_input: Option<Entity<InputState>>,
@@ -1099,12 +1103,12 @@ pub struct Workbench {
     pub(crate) agent_access: Option<Arc<duthub_mcp::auth_http::AccessContext>>,
     /// 每 DUT 独立 Agent 输入草稿（F13：切换 DUT 不串文本）。
     pub(crate) agent_prompts: HashMap<String, AgentPromptEditor>,
-    /// Transcript 虚拟列表滚动句柄（按 DUT；uniform_list 专用）。
+    /// Transcript 虚拟列表滚动句柄（按 `DUT；uniform_list` 专用）。
     pub(crate) agent_transcript_scroll: HashMap<String, gpui_kit::UniformListScrollHandle>,
     /// Transcript 已见的单调序号（`SessionView::total_entries()`；内存上限
     /// 2000 条截断后 `transcript.len()` 停涨，只有它能在 2000 条后继续贴底）。
     pub(crate) agent_transcript_seen: HashMap<String, u64>,
-    /// 发送成功后待清空的草稿：dut_id → (已发送文本, 发送 token)。清空延到
+    /// `发送成功后待清空的草稿：dut_id` → (已发送文本, 发送 token)。清空延到
     /// 渲染帧（`set_value` 需要 Window），且仅当输入仍等于已发送文本才清——
     /// 用户在等待帧里继续输入的草稿必须保留；跨 DUT 互不影响。
     agent_prompt_clear: HashMap<String, (String, u64)>,
@@ -1237,13 +1241,13 @@ pub struct Workbench {
     /// download never runs against a half-applied policy (custom mode without
     /// its saved URL would fail closed on every run).
     pub(crate) tool_proxy_mode_draft: Option<duthub_core::model::DownloadProxyMode>,
-    /// 烧录测试结果按 DUT 归属：dut_id → 结果视图
+    /// 烧录测试结果按 DUT `归属：dut_id` → 结果视图
     usb_discovery: [UsbDiscovery; 2],
     usb_debug_view: Option<bool>,
 
     pub settings: duthub_core::SettingsFile,
     /// Agent 接入认证运行时（凭据/Grant/auth 开关）：MCP HTTP 中间件、租约管理器
-    /// 与设置页面板共用同一实例；保存后经 update() 整体热替换。
+    /// 与设置页面板共用同一实例；保存后经 `update()` 整体热替换。
     pub access_runtime: Arc<duthub_core::AgentAccessRuntime>,
     pub duts: DutsState,
     /// 配置目录（bootstrap）：settings.json / duts.json 固定 exe 同级 .duthub/。
@@ -1260,7 +1264,7 @@ pub struct Workbench {
     pub active_session: usize,
     pub serial_ports: Vec<SerialPortInfo>,
 
-    /// MCP 快照（每帧刷新，mcp_runtime 落盘）
+    /// MCP `快照（每帧刷新，mcp_runtime` 落盘）
     snapshot_ref: Arc<Mutex<duthub_mcp::snapshot::StateSnapshot>>,
     /// 心跳引擎（需求⑦）：desktop 定时器驱动；Agent 经 heartbeat.set 改写命令。
     pub heartbeat: Arc<duthub_device::heartbeat::HeartbeatService>,
@@ -1312,7 +1316,7 @@ pub struct Workbench {
     text_editors: HashMap<In, BoundEditor<InputState>>,
     textareas: HashMap<In, BoundEditor<TextareaState>>,
     /// 终端视口滚动句柄：新输出到达时自动跟随到底部（原型 nearBottom<65 语义）
-    /// 终端虚拟列表滚动句柄（uniform_list 专用；仅可见行构建元素）。
+    /// `终端虚拟列表滚动句柄（uniform_list` 专用；仅可见行构建元素）。
     terminal_scroll: gpui_kit::UniformListScrollHandle,
     /// 串口设置页：当前编辑的高亮规则下标（规则列表行点击选择）
     pub(crate) serial_rule_selected: usize,
@@ -1351,7 +1355,7 @@ pub struct StartupContext {
     pub notice: Option<String>,
     /// `--self-test`：不构造 Agent 宿主（不安装/探测 goose），其余 UI 照常渲染。
     pub self_test: bool,
-    /// Shared Tokio runtime from `main.rs` (used by DeviceService, ControlService, A2aRuntime).
+    /// Shared Tokio runtime from `main.rs` (used by `DeviceService`, `ControlService`, `A2aRuntime`).
     pub runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -1421,7 +1425,7 @@ fn run_lifecycle_action(
 ) {
     match action {
         LifecycleAction::ReleaseRelay => {
-            let _ = weak.update(cx, |this, cx| this.release_relay_for_close(cx));
+            let _ = weak.update(cx, Workbench::release_relay_for_close);
         }
         LifecycleAction::CloseFloat => {
             // Read the handle under a short lease, then remove the window
@@ -1445,7 +1449,7 @@ fn run_lifecycle_action(
             let _ = weak.update(cx, |this, cx| this.release_monitor(None, cx));
         }
         LifecycleAction::HideToTray => {
-            let _ = weak.update(cx, |this, cx| this.finish_hide_to_tray(cx));
+            let _ = weak.update(cx, Workbench::finish_hide_to_tray);
         }
         LifecycleAction::DestroyMain => {
             let main = weak
@@ -1457,10 +1461,10 @@ fn run_lifecycle_action(
             }
         }
         LifecycleAction::ShowMain => {
-            let _ = weak.update(cx, |this, cx| this.show_from_tray(cx));
+            let _ = weak.update(cx, Workbench::show_from_tray);
         }
         LifecycleAction::RecoverFromIconLoss => {
-            let _ = weak.update(cx, |this, cx| this.recover_from_icon_loss(cx));
+            let _ = weak.update(cx, Workbench::recover_from_icon_loss);
         }
         LifecycleAction::PresentAlert {
             presentation,
@@ -1497,7 +1501,7 @@ fn run_lifecycle_action(
 }
 
 /// W4a：DUT 删除五步清理序的 Workbench 实现。
-/// 顺序契约（strip → persist → stop_and_join → delete token → delete dir）
+/// 顺序契约（strip → persist → `stop_and_join` → delete token → delete dir）
 /// 由 `apps/desktop/tests/agent_ui_logic.rs` 以 mock ops 钉住。
 impl duthub_desktop::agent_ui::DutCleanupOps for Workbench {
     fn strip_mcp(&mut self, dut_id: &str) -> bool {
@@ -1585,7 +1589,7 @@ impl duthub_desktop::agent_ui::DutCleanupOps for Workbench {
         {
             self.notify_toast(i18n::message(
                 "recordPendingCleanupFailed",
-                &[("error", &error.to_string())],
+                &[("error", &error.clone())],
             ));
         }
         // 同步告警弹窗（AlertCenter 与 MCP 线程共享）：清理未完成必须可见。
@@ -1744,8 +1748,7 @@ impl Workbench {
             .active_provider_id
             .as_deref()
             .and_then(|id| settings.agent.providers.iter().find(|p| p.id == id))
-            .map(|p| provider_setting(p.protocol).to_owned())
-            .unwrap_or_default();
+            .map_or_default(|p| provider_setting(p.protocol).to_owned());
         let agent_model_name = settings.agent.active_model_id.clone().unwrap_or_default();
         let wb_work_dir = work_dir.clone();
         let frames = frames_in;
@@ -2263,7 +2266,7 @@ impl Workbench {
                 };
                 cx.background_executor().timer(interval).await;
                 let changed = this
-                    .update(cx, |view, cx| view.tick_frame_pump(cx))
+                    .update(cx, Workbench::tick_frame_pump)
                     .unwrap_or(false);
                 if !changed {
                     continue;
@@ -2281,16 +2284,17 @@ impl Workbench {
         // W4c `--self-test`：纯净自检不启动任何 HTTP 监听（netstat 无 8797/8790）。
         if !self_test {
             wb.ensure_dut_mcp_endpoints();
+            let user_notifier: Arc<dyn duthub_mcp::notify::UserNotifier> = runtime_state;
             wb.mcp_runtime = crate::mcp_runtime::spawn_mcp_runtime(
-                mcp_state,
-                Some(runtime_state as Arc<dyn duthub_mcp::notify::UserNotifier>),
-                access_ctx,
+                &mcp_state,
+                Some(&user_notifier),
+                access_ctx.as_ref(),
                 mcp_port,
                 mcp_lan_access,
                 wb.settings.agent_access.listeners.clone(),
                 snapshot_ref.clone(),
-                wb_work_dir,
-                mcp_bound_endpoint,
+                &wb_work_dir,
+                &mcp_bound_endpoint,
             );
         }
         wb
@@ -2707,7 +2711,7 @@ pub(crate) fn usb_debug_enabled(config: &duthub_core::model::AdbConfig) -> bool 
 }
 
 /// portable 归档的 DUT 文件夹名守卫：`name_component` 拒绝的名字（Windows
-/// 保留名形状如 "COM8"，会映射成 `_COM8` 与名字不一致）换用 dut_id（程序
+/// 保留名形状如 "COM8"，会映射成 `_COM8` 与名字不一致）换用 `dut_id（程序`
 /// 生成的 slug，通常已带 `dut-` 前缀且合法），否则 `open_dut_for_write`
 /// 逐条拒绝、写盘错误被写线程静默吞掉 = 全部日志丢失（验收发现的既有
 /// bug）。合法名原样返回（改名的历史 DUT 保持既有归档目录）。

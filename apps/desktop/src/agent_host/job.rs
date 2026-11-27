@@ -61,6 +61,16 @@ mod imp {
         /// Deliberately omits process/memory caps so desktop child processes
         /// (`ffmpeg`, `ffplay`, Agent hosts, shells) are never throttled.
         pub fn create_containment() -> io::Result<Self> {
+            const INFO_SIZE: u32 = {
+                assert!(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() <= u32::MAX as usize);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() is statically asserted <= u32::MAX"
+                )]
+                {
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32
+                }
+            };
             // SAFETY: Anonymous non-inheritable Job Object; owned by `Job`.
             let handle = unsafe { CreateJobObjectW(None, None) }.map_err(io::Error::other)?;
             let job = Self { handle };
@@ -68,14 +78,16 @@ mod imp {
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
-            // SAFETY: `info` is a valid `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`
-            // matching the passed size; `job.handle` is live.
+            // SAFETY: `info` is a properly aligned, initialized
+            // `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` matching `INFO_SIZE`,
+            // `job.handle` is a live owned Job Object handle, and the kernel
+            // only reads `info` for the duration of the synchronous call.
             unsafe {
                 SetInformationJobObject(
                     job.handle,
                     JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const c_void,
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    std::ptr::from_ref(&info).cast::<c_void>(),
+                    INFO_SIZE,
                 )
             }
             .map_err(io::Error::other)?;
@@ -91,7 +103,7 @@ mod imp {
             })?;
             let mut in_job = BOOL(0);
             // SAFETY: `in_job` is a valid out-parameter; handles remain valid.
-            unsafe { IsProcessInJob(process, Some(self.handle), &mut in_job) }
+            unsafe { IsProcessInJob(process, Some(self.handle), std::ptr::from_mut(&mut in_job)) }
                 .map_err(|error| io::Error::other(format!("IsProcessInJob failed: {error}")))?;
             if !in_job.as_bool() {
                 return Err(io::Error::other("child process did not join job"));
@@ -101,14 +113,26 @@ mod imp {
 
         #[cfg(test)]
         pub fn query_limits(&self) -> io::Result<JobLimits> {
+            const INFO_SIZE: u32 = {
+                assert!(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() <= u32::MAX as usize);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() is statically asserted <= u32::MAX"
+                )]
+                {
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32
+                }
+            };
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            // SAFETY: `info` is writable and sized accurately; handle is valid.
+            // SAFETY: `info` is uniquely borrowed, initialized, and sized
+            // accurately by `INFO_SIZE`; `self.handle` is a live Job Object
+            // handle owned by `&self` for the duration of the call.
             unsafe {
                 QueryInformationJobObject(
                     Some(self.handle),
                     JobObjectExtendedLimitInformation,
-                    &mut info as *mut _ as *mut c_void,
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    std::ptr::from_mut(&mut info).cast::<c_void>(),
+                    INFO_SIZE,
                     None,
                 )
             }

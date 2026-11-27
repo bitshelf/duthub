@@ -96,7 +96,7 @@ impl McpState for InteractiveTestState {
             name: "RK3576-Board".into(),
             source: "device".into(),
             port: "COM8".into(),
-            baud: 1500000,
+            baud: 1_500_000,
         }]
     }
 
@@ -111,7 +111,7 @@ impl McpState for InteractiveTestState {
             serial: SerialBindInfo {
                 host: "local".into(),
                 port: "COM8".into(),
-                baud: 1500000,
+                baud: 1_500_000,
                 format: "8N1".into(),
             },
             adb_serial: Some("RK3576001".into()),
@@ -164,7 +164,7 @@ impl McpState for InteractiveTestState {
     fn dut_release_control(&self, dut_id: &str, lease_id: &str) -> Result<(), String> {
         self.lease
             .release(dut_id, lease_id)
-            .map_err(|e| e.message().to_owned())
+            .map_err(|e| e.message().clone())
     }
 
     fn dut_control_status(&self, dut_id: &str) -> Result<ControlStatusDto, String> {
@@ -349,7 +349,7 @@ impl McpState for InteractiveTestState {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
         if !matches!(ext.as_deref(), Some("img" | "bin")) {
             return Err("firmware image must have .img or .bin extension".into());
         }
@@ -741,8 +741,8 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
         sandbox.path().join("duthub-data"),
         lease.clone(),
     ));
-    let ro_token = generate_token();
-    let rw_token = generate_token();
+    let readonly_token = generate_token();
+    let control_token = generate_token();
     let auth = AgentAccessRuntime::from_settings(AgentAccessSettings {
         enabled: true,
         agents: vec![
@@ -750,7 +750,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
                 id: "cred-ro".into(),
                 listener_id: None,
                 agent_name: "readonly-agent".into(),
-                token: ro_token.clone(),
+                token: readonly_token.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
                     dut_id: "dut-rk3576".into(),
@@ -761,7 +761,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
                 id: "cred-rw".into(),
                 listener_id: None,
                 agent_name: "control-agent".into(),
-                token: rw_token.clone(),
+                token: control_token.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
                     dut_id: "dut-rk3576".into(),
@@ -788,7 +788,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     )
     .unwrap();
 
-    let ro_client = serve_client(
+    let readonly_client = serve_client(
         ClientConfig::default(),
         StreamableHttpClientTransport::with_client(
             reqwest::Client::new(),
@@ -796,7 +796,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
                 "http://{}/mcp",
                 handle.endpoint
             ))
-            .auth_header(ro_token),
+            .auth_header(readonly_token),
         ),
     )
     .await
@@ -804,9 +804,13 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
 
     // 1) `dut_status` exposes the configured `reset` channel and recommends
     //    `serial_exec` with `triggerReset` since `maskrom`/`recovery` are unbound.
-    let status = call_json(&ro_client, "dut_status", json!({"dutId": "dut-rk3576"}))
-        .await
-        .unwrap();
+    let status = call_json(
+        &readonly_client,
+        "dut_status",
+        json!({"dutId": "dut-rk3576"}),
+    )
+    .await
+    .unwrap();
     assert_eq!(status["relay"]["channels"]["reset"], 1);
     assert_eq!(status["relay"]["capabilities"], json!(["reset"]));
     assert_eq!(status["bootModes"]["canEnterMaskrom"], false);
@@ -819,7 +823,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
 
     // 2) Read-only token is denied `dut_control` and `serial_exec`.
     let err = call_json(
-        &ro_client,
+        &readonly_client,
         "dut_control",
         json!({"dutId": "dut-rk3576", "action": "reset"}),
     )
@@ -828,7 +832,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     assert!(err.contains("UNAUTHORIZED"), "{err}");
 
     let err = call_json(
-        &ro_client,
+        &readonly_client,
         "serial_exec",
         json!({"dutId": "dut-rk3576", "text": "reboot loader\r"}),
     )
@@ -838,7 +842,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
 
     // 3) Authorized token runs `serial_exec` with `triggerReset` + U-Boot intercept
     //    + `thenSend` + `markLabel` to enter Loader cleanly in one atomic call.
-    let rw_client = serve_client(
+    let control_client = serve_client(
         ClientConfig::default(),
         StreamableHttpClientTransport::with_client(
             reqwest::Client::new(),
@@ -846,14 +850,14 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
                 "http://{}/mcp",
                 handle.endpoint
             ))
-            .auth_header(rw_token),
+            .auth_header(control_token),
         ),
     )
     .await
     .unwrap();
 
     let res = call_json(
-        &rw_client,
+        &control_client,
         "serial_exec",
         json!({
             "dutId": "dut-rk3576",
@@ -885,7 +889,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
 
     // 4) Calling `enter_maskrom` when only `reset` is bound fails clearly.
     let err = call_json(
-        &rw_client,
+        &control_client,
         "dut_control",
         json!({"dutId": "dut-rk3576", "action": "enter_maskrom"}),
     )
@@ -896,7 +900,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     // 5) Manual takeover immediately blocks agent reset & serial writes.
     lease.set_manual_control(true).unwrap();
     let err = call_json(
-        &rw_client,
+        &control_client,
         "dut_control",
         json!({"dutId": "dut-rk3576", "action": "reset"}),
     )
@@ -908,8 +912,8 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     );
     lease.set_manual_control(false).unwrap();
 
-    ro_client.cancel().await.ok();
-    rw_client.cancel().await.ok();
+    readonly_client.cancel().await.ok();
+    control_client.cancel().await.ok();
     assert!(handle.shutdown_and_join_with_timeout(Duration::from_secs(5)));
 }
 
@@ -1004,7 +1008,7 @@ async fn mcp_http_concurrent_stress_and_oversized_body_defense() {
     }
     let mut latencies_ms = Vec::with_capacity(tasks.len());
     for task in tasks {
-        latencies_ms.push(task.await.unwrap().as_millis() as u64);
+        latencies_ms.push(u64::try_from(task.await.unwrap().as_millis()).unwrap_or(u64::MAX));
     }
     latencies_ms.sort_unstable();
     let p99 = latencies_ms[(latencies_ms.len() * 99 / 100).min(latencies_ms.len() - 1)];

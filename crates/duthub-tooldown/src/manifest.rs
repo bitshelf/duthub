@@ -42,6 +42,7 @@ pub struct InstallManifest {
 }
 
 /// Directory an installed tool lives in: `<install_root>/<spec.id>/`.
+#[must_use]
 pub fn installed_tool_dir(install_root: &Path, spec: &ToolSpec) -> PathBuf {
     install_root.join(spec.id)
 }
@@ -101,6 +102,7 @@ pub(crate) fn validated_manifest(tool_dir: &Path, spec: &ToolSpec) -> Option<Ins
 }
 
 /// Whether `tool_dir` holds a usable install of `spec` (see `validated_manifest`).
+#[must_use]
 pub fn is_installed(tool_dir: &Path, spec: &ToolSpec) -> bool {
     validated_manifest(tool_dir, spec).is_some()
 }
@@ -150,7 +152,7 @@ mod tests {
             "executables": ["C:\\tools\\adb\\adb.exe"]
         }"#;
         let parsed: InstallManifest = serde_json::from_str(legacy).unwrap();
-        assert!(parsed.executable_sha256.is_empty());
+        assert_eq!(parsed.executable_sha256, [] as [std::string::String; 0]);
     }
 
     #[test]

@@ -121,7 +121,7 @@ pub const TOOL_FFMPEG: ToolSpec = ToolSpec {
 ///
 /// Probed 2026-11-23: `https://github.com/block/goose/...` 301-redirects to the moved repo
 /// `aaif-goose/goose` (GitHub org rename), whose latest release at probe time was v1.60.2.
-/// The Windows x86_64 asset is `goose-x86_64-pc-windows-msvc.zip` (200, 54,449,330 bytes);
+/// The Windows `x86_64` asset is `goose-x86_64-pc-windows-msvc.zip` (200, 54,449,330 bytes);
 /// the `-gnu` variant returned 404. The canonical moved-repo URL is used directly to save
 /// a redirect hop; GitHub org redirects keep old URLs working if it moves again.
 /// Audit note (NOT a pin): the v1.60.2 asset measured sha256
@@ -135,11 +135,13 @@ pub const TOOL_GOOSE: ToolSpec = ToolSpec {
 };
 
 /// All built-in tool specs, in table order. New tools append here.
+#[must_use]
 pub fn builtin_specs() -> &'static [&'static ToolSpec] {
     &[&TOOL_ADB, &TOOL_FFMPEG, &TOOL_GOOSE]
 }
 
 /// Look up a built-in spec by id.
+#[must_use]
 pub fn spec_by_id(id: &str) -> Option<&'static ToolSpec> {
     builtin_specs().iter().copied().find(|s| s.id == id)
 }

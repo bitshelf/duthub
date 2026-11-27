@@ -1,4 +1,4 @@
-//! A single FFmpeg capture per source. Independent HTTP readers and the recorder share its output.
+//! A single `FFmpeg` capture per source. Independent HTTP readers and the recorder share its output.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -251,7 +251,7 @@ impl Capture {
                         let _ = stop.await;
                     })
                     .await;
-            })
+            });
         });
 
         let error_tail = Arc::new(Mutex::new(String::new()));
@@ -611,7 +611,7 @@ async fn pull(State(stream): State<Arc<Stream>>) -> Response {
                 match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
                     Ok(Ok(data)) => return Some((Ok::<_, Infallible>(data), (stream, rx, permit))),
                     Ok(Err(_)) => break,
-                    Err(_) => continue,
+                    Err(_) => {}
                 }
             }
             None
@@ -632,7 +632,7 @@ fn command(path: &Path) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW (SDL creates the preview window).
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (SDL creates the preview window).
     }
     command
 }
@@ -1032,16 +1032,18 @@ mod tests {
         assert!(absolute.is_file(), "{absolute:?}");
         // ③ 环境变量：%VAR%/ffmpeg.exe 展开到 ffmpeg 所在目录。
         let dir = Path::new(&plain).parent().unwrap().to_path_buf();
-        // SAFETY: 专用变量名，其余测试不读取它；结束后清理。
+        // SAFETY: This ignored test uses a dedicated environment variable name
+        // not read by any other test and removes it before returning; run with
+        // `--test-threads=1` when invoking ignored tests alongside others.
         unsafe {
             std::env::set_var("DUTHUB_MEDIA_TEST_HOME", &dir);
         }
         let expanded = executable("%DUTHUB_MEDIA_TEST_HOME%/ffmpeg.exe", "ffmpeg").unwrap();
         assert!(expanded.is_file(), "{expanded:?}");
-        // 未设置的环境变量必须报出变量名而不是笼统的“找不到”。
+        // Unset env vars must report the missing variable name, not a generic error.
         let error = executable("%DUTHUB_NO_SUCH_VAR_XYZ%/ffmpeg.exe", "ffmpeg").unwrap_err();
         assert!(error.contains("DUTHUB_NO_SUCH_VAR_XYZ"), "{error}");
-        // SAFETY: 同上，恢复进程环境。
+        // SAFETY: Restores the process environment for the dedicated test variable.
         unsafe {
             std::env::remove_var("DUTHUB_MEDIA_TEST_HOME");
         }
@@ -1096,27 +1098,6 @@ mod tests {
     #[test]
     #[ignore = "requires FFmpeg with lavfi, libx264 and AAC, and localhost TCP"]
     fn capture_shares_audio_and_video_with_two_http_clients_and_recorder() {
-        let args = [
-            "-re",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x90:rate=25[out0];sine=frequency=880:sample_rate=48000[out1]",
-        ]
-        .map(str::to_string);
-        let mut capture = Capture::start_with_args(
-            &CaptureSettings::default(),
-            &CaptureInput::default(),
-            &args,
-            Some("0:a:0"),
-        )
-        .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while !capture.ready() {
-            assert!(Instant::now() < deadline, "{}", capture.status());
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
         fn decode(ffmpeg: &Path, input: &str) {
             let args = [
                 "-hide_banner",
@@ -1139,6 +1120,27 @@ mod tests {
                 .run(ffmpeg, &args, Duration::from_secs(12))
                 .unwrap();
             assert_eq!(result.exit_code, Some(0), "{}", result.stderr);
+        }
+
+        let args = [
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=25[out0];sine=frequency=880:sample_rate=48000[out1]",
+        ]
+        .map(str::to_string);
+        let mut capture = Capture::start_with_args(
+            &CaptureSettings::default(),
+            &CaptureInput::default(),
+            &args,
+            Some("0:a:0"),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !capture.ready() {
+            assert!(Instant::now() < deadline, "{}", capture.status());
+            std::thread::sleep(Duration::from_millis(50));
         }
 
         let dir = std::env::temp_dir().join(format!("duthub-capture-{}", Uuid::new_v4()));

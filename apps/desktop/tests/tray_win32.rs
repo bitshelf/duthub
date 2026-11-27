@@ -14,7 +14,6 @@
 //! unless the shell really accepted the icon.
 
 #![cfg(windows)]
-#![expect(clippy::undocumented_unsafe_blocks, reason = "Win32 tray test harness")]
 
 use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard};
@@ -43,7 +42,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn options() -> TrayOptions {
@@ -61,6 +60,9 @@ struct TestWindow {
 
 impl TestWindow {
     fn create() -> Self {
+        // SAFETY: Registers a test window class with static UTF-16 names and a
+        // matching `system` ABI wndproc, creates an owned top-level window on the
+        // current thread, and shows it.
         let window = unsafe {
             let module = GetModuleHandleW(PCWSTR::null()).expect("GetModuleHandleW");
             let hinst = windows::Win32::Foundation::HINSTANCE(module.0);
@@ -77,7 +79,7 @@ impl TestWindow {
                 lpszMenuName: PCWSTR::null(),
                 lpszClassName: class_name,
             };
-            RegisterClassW(&wnd_class);
+            RegisterClassW(&raw const wnd_class);
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 class_name,
@@ -106,6 +108,7 @@ impl TestWindow {
     }
 
     fn visible(&self) -> bool {
+        // SAFETY: `self.hwnd` is owned by `TestWindow` and live for `&self`.
         unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd).as_bool() }
     }
 
@@ -115,10 +118,11 @@ impl TestWindow {
         let deadline = Instant::now() + duration;
         loop {
             let mut msg = MSG::default();
+            // SAFETY: Pumps queued Win32 messages for windows owned by the current thread.
             unsafe {
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                while PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&raw const msg);
+                    DispatchMessageW(&raw const msg);
                 }
             }
             if Instant::now() >= deadline {
@@ -144,12 +148,19 @@ impl TestWindow {
 
 impl Drop for TestWindow {
     fn drop(&mut self) {
+        // SAFETY: `self.hwnd` is exclusively owned by `TestWindow` and destroyed once.
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
     }
 }
 
+/// Test window procedure for the hidden tray-test host window.
+///
+/// # Safety
+///
+/// Invoked only by the Windows message dispatcher with valid Win32 window
+/// procedure arguments.
 unsafe extern "system" fn test_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -158,6 +169,7 @@ unsafe extern "system" fn test_wndproc(
 ) -> windows::Win32::Foundation::LRESULT {
     match msg {
         WM_DESTROY => windows::Win32::Foundation::LRESULT(0),
+        // SAFETY: Forwards unhandled messages to Win32's default window procedure.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
@@ -255,7 +267,7 @@ fn commands_before_the_icon_exists_are_harmless() {
     handle.set_alert(true);
     handle.notify("title", "body", TrayNotifyLevel::Warning);
     assert_eq!(handle.test_probe().balloons_sent, 0);
-    assert!(handle.drain_events().is_empty());
+    assert_eq!(handle.drain_events(), [] as [duthub_desktop::tray::TrayEvent; 0]);
 
     assert!(
         handle.set_icon_visible(false),
@@ -356,6 +368,8 @@ fn icon_lifecycle_against_a_real_shell() {
     // A TaskbarCreated replay must either keep the icon reachable or report
     // IconLost so the UI can bring the window back.
     let taskbar_created = handle.test_probe().taskbar_created_msg;
+    // SAFETY: `handle` is still alive, so its tray host HWND is valid; `PostMessageW`
+    // is thread-safe and simulates a `TaskbarCreated` broadcast.
     unsafe {
         let _ = PostMessageW(
             Some(HWND(handle.test_probe().hwnd as *mut c_void)),

@@ -56,6 +56,7 @@ const CARD_SKILLS: [(&str, &str); 5] = [
 ];
 
 /// Build the card for a listener bound to `127.0.0.1:<port>`.
+#[must_use]
 pub fn build_agent_card(port: u16) -> AgentCard {
     build_agent_card_at(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
@@ -63,6 +64,7 @@ pub fn build_agent_card(port: u16) -> AgentCard {
 /// Build the card for a listener bound to `<addr>:<port>`. Non-loopback
 /// callers are rejected upstream (ADR-2); the card itself stays descriptive
 /// of the actual bound address, which is always a loopback literal here.
+#[must_use]
 pub fn build_agent_card_at(addr: IpAddr, port: u16) -> AgentCard {
     let mut security_schemes = HashMap::new();
     security_schemes.insert(

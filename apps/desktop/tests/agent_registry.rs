@@ -1,6 +1,6 @@
 //! 通用 ACP Agent 注册表 + 外部 goose 启动链回归。
 //!
-//! - 外部 goose 路径真正被 Host 采用（程序/哈希记录进 SessionView）；
+//! - 外部 goose 路径真正被 Host 采用（程序/哈希记录进 `SessionView`）；
 //! - 两个 ACP 条目可按 DUT 选择（默认 goose 解析 + 外部 ACP 条目）；
 //! - 外部程序哈希不匹配 fail closed；CLI profile 明确拒绝；
 //! - `agents.json` 不存 token；版本门槛接受 >= 1.60.2。
@@ -159,8 +159,7 @@ fn host_uses_external_goose_override_not_embedded_copy() {
         "外部 goose 未就绪：{:?} stderr={}",
         host.view("dut-ext").map(|view| view.status()),
         host.view("dut-ext")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     let launch = host.launch("dut-ext").expect("必须记录实际启动规格");
     assert_eq!(launch.agent_id, "goose");
@@ -233,8 +232,7 @@ fn two_acp_entries_are_selected_per_dut() {
         "dut-b 未就绪：{:?} stderr={}",
         host.view("dut-b").map(|view| view.status()),
         host.view("dut-b")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     let launch_a = host.launch("dut-a").unwrap();
     let launch_b = host.launch("dut-b").unwrap();

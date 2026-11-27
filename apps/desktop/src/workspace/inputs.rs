@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, In, FluentBuilder, AppContext, goose_path_field_value, boot_reference_path, InteractiveElement, Window, Context, InputState, InputEvent, Dd, BoundEditor, Palette, Input, Styled, StatefulInteractiveElement, px, theme, Div, i18n, IntoElement, Arc, ParentElement, div, SharedString, Textarea, TextareaState, icon, OnChangeFn, UsbDiscovery, FlashPresetTest, store, usb_debug_enabled, ViewMode, ConfigPage, Pixels, workspace_pane_widths, DragMoveEvent, PaneDivider, CENTER_PANE_MIN_WIDTH, demo_dut_template, HashMap, DutsState, JobKind, cx_spawn_job, AdbDevice, JobResult, RelayPress, AlertSource, Duration};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -10,14 +10,13 @@ impl Workbench {
         match id {
             In::RelayBoardName | In::RelayBoardNode => self
                 .relay_board_edit()
-                .map(|board| {
+                .map_or_default(|board| {
                     if id == In::RelayBoardName {
                         board.name
                     } else {
                         board.node
                     }
-                })
-                .unwrap_or_default(),
+                }),
             In::Find => self.find_query.clone(),
             In::CfgSearch => self.cfg_search.clone(),
             In::Target | In::AgentModel => String::new(),
@@ -31,8 +30,8 @@ impl Workbench {
             | In::AgentRegEnvKeys
             | In::AgentRegEnvValue => self.drafts.get(&id).cloned().unwrap_or_default(),
             In::Prompt => self.input.clone(),
-            In::Port => dut.map(|d| d.serial.port.clone()).unwrap_or_default(),
-            In::DutName => dut.map(|d| d.name.clone()).unwrap_or_default(),
+            In::Port => dut.map_or_default(|d| d.serial.port.clone()),
+            In::DutName => dut.map_or_default(|d| d.name.clone()),
             In::BootReference => dut
                 .and_then(|dut| {
                     dut.serial.reference_log.clone().or_else(|| {
@@ -52,11 +51,11 @@ impl Workbench {
                             .to_string()
                     })
             }),
-            In::Baud => dut.map(|d| d.serial.baud.to_string()).unwrap_or_default(),
+            In::Baud => dut.map_or_default(|d| d.serial.baud.to_string()),
             In::SessionBaud => self
                 .sessions
                 .get(self.active_session)
-                .map(|s| {
+                .map_or_default(|s| {
                     s.baud_draft.clone().unwrap_or_else(|| {
                         if s.baud == 0 {
                             String::new()
@@ -64,76 +63,66 @@ impl Workbench {
                             s.baud.to_string()
                         }
                     })
-                })
-                .unwrap_or_default(),
-            In::AdbSerial => dut.map(|d| d.adb.serial.clone()).unwrap_or_default(),
+                }),
+            In::AdbSerial => dut.map_or_default(|d| d.adb.serial.clone()),
             In::RelayNode => dut
-                .map(|d| match &d.relay {
+                .map_or_default(|d| match &d.relay {
                     duthub_core::model::RelayConfig::UsbSerial { node, .. } => node.clone(),
                     _ => String::new(),
-                })
-                .unwrap_or_default(),
+                }),
             In::PduAddress => dut
-                .map(|d| match &d.relay {
+                .map_or_default(|d| match &d.relay {
                     duthub_core::model::RelayConfig::SnmpPdu { snmp, .. } => snmp.address.clone(),
                     _ => String::new(),
-                })
-                .unwrap_or_default(),
+                }),
             In::PduCredential => dut
-                .map(|d| match &d.relay {
+                .map_or_default(|d| match &d.relay {
                     duthub_core::model::RelayConfig::SnmpPdu { snmp, .. } => {
                         snmp.credential_ref.clone()
                     }
                     _ => String::new(),
-                })
-                .unwrap_or_default(),
+                }),
             In::McpUrl => dut
-                .map(|d| match &d.mcp {
+                .map_or_default(|d| match &d.mcp {
                     duthub_core::model::McpConfig::StreamableHttp { url } => url.clone(),
                     _ => String::new(),
-                })
-                .unwrap_or_default(),
+                }),
             In::McpCommand => dut
-                .map(|d| match &d.mcp {
+                .map_or_default(|d| match &d.mcp {
                     duthub_core::model::McpConfig::Stdio { command, .. } => command.clone(),
                     _ => String::new(),
-                })
-                .unwrap_or_default(),
+                }),
             In::McpArgs => dut
-                .map(|d| match &d.mcp {
+                .map_or_default(|d| match &d.mcp {
                     duthub_core::model::McpConfig::Stdio { args, .. } => args.join("\n"),
                     _ => String::new(),
-                })
-                .unwrap_or_default(),
+                }),
             In::McpCwd => dut
-                .map(|d| match &d.mcp {
+                .map_or_default(|d| match &d.mcp {
                     duthub_core::model::McpConfig::Stdio { cwd, .. } => cwd.clone(),
                     _ => String::new(),
-                })
-                .unwrap_or_default(),
+                }),
             In::McpEnv => dut
-                .map(|d| match &d.mcp {
+                .map_or_default(|d| match &d.mcp {
                     duthub_core::model::McpConfig::Stdio { env, .. } => env
                         .iter()
                         .map(|(k, v)| format!("{k}={v}"))
                         .collect::<Vec<_>>()
                         .join("\n"),
                     _ => String::new(),
-                })
-                .unwrap_or_default(),
+                }),
             In::SerialRuleRegex | In::SerialRuleDescription => self
                 .settings
                 .serial
                 .highlight_rules
                 .get(self.serial_rule_selected)
-                .map(|rule| {
+                .map_or_default(|rule| {
                     if id == In::SerialRuleRegex {
                         rule.regex.clone()
                     } else {
                         crate::pages::prompt_rule_description(self.lang, rule).to_owned()
                     }
-                })
-                .unwrap_or_default(),
+                }),
             In::SerialScrollback => self.drafts.get(&id).cloned().unwrap_or_else(|| {
                 self.settings
                     .serial
@@ -166,11 +155,9 @@ impl Workbench {
                 .cloned()
                 .unwrap_or_else(|| self.settings.dut_storage_gib().to_string()),
             In::HeartbeatInterval => dut
-                .map(|d| self.heartbeat_config(&d.id).interval_secs.to_string())
-                .unwrap_or_default(),
+                .map_or_default(|d| self.heartbeat_config(&d.id).interval_secs.to_string()),
             In::HeartbeatCommand => dut
-                .map(|d| self.heartbeat_config(&d.id).command)
-                .unwrap_or_default(),
+                .map_or_default(|d| self.heartbeat_config(&d.id).command),
             In::HeartbeatExpectedResponse => dut
                 .and_then(|d| self.heartbeat_config(&d.id).expected_response)
                 .unwrap_or_default(),
@@ -195,8 +182,7 @@ impl Workbench {
                     value.clone()
                 } else {
                     dut.and_then(|dut| self.settings.agent_access.listener_for_dut(&dut.id))
-                        .map(|listener| listener.port.to_string())
-                        .unwrap_or_default()
+                        .map_or_default(|listener| listener.port.to_string())
                 }
             }
             In::DutA2aPort => {
@@ -215,8 +201,7 @@ impl Workbench {
                 if let Some(value) = self.drafts.get(&id) {
                     value.clone()
                 } else {
-                    dut.map(|dut| dut.a2a.agent_name.clone())
-                        .unwrap_or_default()
+                    dut.map_or_default(|dut| dut.a2a.agent_name.clone())
                 }
             }
             // Draft arm (pit #41): display reads the draft and falls back to
@@ -237,14 +222,12 @@ impl Workbench {
                 .settings
                 .a2a
                 .as_ref()
-                .map(|a| a.agent_name.clone())
-                .unwrap_or_default(),
+                .map_or_default(|a| a.agent_name.clone()),
             In::A2aPort => self.drafts.get(&In::A2aPort).cloned().unwrap_or_else(|| {
                 self.settings
                     .a2a
                     .as_ref()
-                    .map(|a| a.port.to_string())
-                    .unwrap_or_default()
+                    .map_or_default(|a| a.port.to_string())
             }),
             In::CmdName
             | In::CmdValue
@@ -255,20 +238,18 @@ impl Workbench {
             | In::RenameName => self
                 .modal
                 .as_ref()
-                .map(|m| match id {
+                .map_or_default(|m| match id {
                     In::CmdName | In::NewPresetName | In::PeerName | In::RenameName => {
                         m.draft.clone()
                     }
                     _ => m.draft2.clone(),
-                })
-                .unwrap_or_default(),
+                }),
             // Third modal field (icon / test args) keeps its own draft so an
             // empty value stays visible instead of snapping back (pit #41).
             In::CmdIcon | In::NewPresetTestArgs => self
                 .modal
                 .as_ref()
-                .map(|m| m.draft3.clone())
-                .unwrap_or_default(),
+                .map_or_default(|m| m.draft3.clone()),
         }
     }
 
@@ -1263,24 +1244,21 @@ impl Workbench {
         let Some(dut) = self.duts.selected_mut() else {
             return;
         };
-        match tool {
-            Some(tool) => {
-                if !usb_debug_enabled(&dut.adb) || dut.adb.tool != tool {
-                    dut.adb.tool = tool.into();
-                    dut.adb.mode = "usb".into();
-                    dut.adb.serial.clear();
-                    self.duts.mark_connection_dirty();
-                }
-                let hdc = tool == "hdc";
-                self.usb_debug_view = Some(hdc);
-                self.scan_usb_devices(hdc);
-                self.open_dd = Some(Dd::AdbSerial.key().into());
-            }
-            None => {
-                dut.adb.mode = "disabled".into();
+        if let Some(tool) = tool {
+            if !usb_debug_enabled(&dut.adb) || dut.adb.tool != tool {
+                dut.adb.tool = tool.into();
+                dut.adb.mode = "usb".into();
                 dut.adb.serial.clear();
                 self.duts.mark_connection_dirty();
             }
+            let hdc = tool == "hdc";
+            self.usb_debug_view = Some(hdc);
+            self.scan_usb_devices(hdc);
+            self.open_dd = Some(Dd::AdbSerial.key().into());
+        } else {
+            dut.adb.mode = "disabled".into();
+            dut.adb.serial.clear();
+            self.duts.mark_connection_dirty();
         }
     }
 
@@ -1507,7 +1485,18 @@ impl Workbench {
     }
 
     pub(crate) fn save_connection(&mut self, cx: &mut Context<Self>) {
-        if !self.duts.editing_new_connection {
+        if self.duts.editing_new_connection {
+            match self.persist_new_connection() {
+                Ok((index, true)) => {
+                    self.connection_open = false;
+                    self.connect_dut(index, cx);
+                }
+                Ok((_, false)) => self.notify_toast(crate::i18n::label("saveBinding")),
+                Err(err) => {
+                    self.notify_toast(format!("{} {err}", crate::i18n::label("saveFailed")));
+                }
+            }
+        } else {
             if self.save_duts() {
                 self.connection_open = false;
                 let index = self.duts.selected;
@@ -1523,17 +1512,6 @@ impl Workbench {
                     } else if !dut.serial.port.trim().is_empty() {
                         self.connect_dut(index, cx);
                     }
-                }
-            }
-        } else {
-            match self.persist_new_connection() {
-                Ok((index, true)) => {
-                    self.connection_open = false;
-                    self.connect_dut(index, cx);
-                }
-                Ok((_, false)) => self.notify_toast(crate::i18n::label("saveBinding")),
-                Err(err) => {
-                    self.notify_toast(format!("{} {err}", crate::i18n::label("saveFailed")))
                 }
             }
         }
@@ -1633,7 +1611,7 @@ impl Workbench {
             .relay_press
             .as_ref()
             .and_then(|press| press.worker.as_ref())
-            .is_some_and(|worker| worker.is_finished())
+            .is_some_and(std::thread::JoinHandle::is_finished)
         {
             return false;
         }
@@ -1708,8 +1686,7 @@ impl Workbench {
             .collect();
         let ts_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as u64);
         let duts = self
             .duts
             .file

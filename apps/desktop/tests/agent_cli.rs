@@ -150,8 +150,7 @@ fn cli_profile_streams_ndjson_and_persists_resume() {
         "CLI 会话未就绪：{:?} stderr={}",
         host.view("dut-cli").map(|view| view.status()),
         host.view("dut-cli")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     host.prompt("dut-cli", "hello duthub").unwrap();
     assert!(
@@ -159,8 +158,7 @@ fn cli_profile_streams_ndjson_and_persists_resume() {
         "CLI 一轮未结束：{:?} stderr={}",
         host.view("dut-cli").map(|view| view.status()),
         host.view("dut-cli")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
 
     let view = host.view("dut-cli").unwrap();
@@ -434,8 +432,7 @@ fn cli_stop_kills_process_tree() {
     assert!(
         wait_until(Duration::from_secs(20), || {
             std::fs::metadata(&heartbeat)
-                .map(|metadata| metadata.len() > 0)
-                .unwrap_or(false)
+                .is_ok_and(|metadata| metadata.len() > 0)
         }),
         "孙进程心跳没有启动（fixture 未运行）"
     );
@@ -689,8 +686,7 @@ fn cli_live_claude_exposes_thirteen_plan_tools() {
         "real CLI 未就绪：{:?} stderr={}",
         host.view("dut-cli").map(|view| view.status()),
         host.view("dut-cli")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     host.prompt("dut-cli", "Reply with the single word ok.")
         .unwrap();
@@ -699,8 +695,7 @@ fn cli_live_claude_exposes_thirteen_plan_tools() {
         "real CLI 一轮未结束：{:?} stderr={}",
         host.view("dut-cli").map(|view| view.status()),
         host.view("dut-cli")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     let entries = host.view("dut-cli").unwrap().transcript_snapshot();
     let system = entries

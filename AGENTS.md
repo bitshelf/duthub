@@ -9,7 +9,7 @@ Rust 工作区 + gpui-kit 0.9.1 桌面应用（串口调试 + MCP Agent 工作�
 - UI 一律用 gpui-kit 组件（`gpui-kit = "0.9.1"`，facade crate）；新组件先查 `component` 模块，不要手造。
 - **全球化 / i18n 约束（禁止硬编码中文文案）**：桌面 UI 所有可见文案（按钮、标签、占位符、toast、弹窗、告警）一律走 `crate::i18n::label` / `crate::i18n::message`，并同步维护 `apps/desktop/locales/zh-CN.json` 与 `en-US.json`（中文界面弹中文，英文界面弹英文）。所有库 crate（`crates/*`）禁止硬编码中文错误或告警字符串：需向用户展示的警告/状态返回类型化枚举由桌面层本地化，底层/系统/协议技术错误统一使用英文。
 - 每个阶段收尾：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` 全绿。
-- 提交信息用中文，概述做了什么与为什么；不 push。
+- 提交信息概述做了什么与为什么；不 push。
 
 ## 品牌命名规范（2026-11-20 全量统一，勿回退）
 

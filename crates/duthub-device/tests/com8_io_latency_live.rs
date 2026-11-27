@@ -204,27 +204,32 @@ fn com8_io_latency_live() {
         latencies.push((ch, got));
         std::thread::sleep(Duration::from_millis(120)); // 键间隔，模拟手打
     }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "microsecond latencies fit well within f64 mantissa"
+    )]
+    let us_to_ms = |us: u128| us as f64 / 1000.0;
     println!("\n=== 逐键延迟（TX → 回显 | TX → 快照）===");
     for (ch, l) in &latencies {
         println!(
             "  {ch:?}: {:>6.1} ms | {}",
-            l.echo_us as f64 / 1000.0,
+            us_to_ms(l.echo_us),
             match l.snapshot_us {
-                Some(us) => format!("{:>6.1} ms", us as f64 / 1000.0),
+                Some(us) => format!("{:>6.1} ms", us_to_ms(us)),
                 None => "（无快照事件）".to_string(),
             }
         );
     }
     let mut echo_vals: Vec<u128> = latencies.iter().map(|(_, l)| l.echo_us).collect();
-    echo_vals.sort();
+    echo_vals.sort_unstable();
     let avg = echo_vals.iter().sum::<u128>() / echo_vals.len().max(1) as u128;
     let p95 = echo_vals[(echo_vals.len() * 95).div_ceil(100) - 1];
     println!(
         "回显延迟: min {:.1} / avg {:.1} / p95 {:.1} / max {:.1} ms",
-        echo_vals[0] as f64 / 1000.0,
-        avg as f64 / 1000.0,
-        p95 as f64 / 1000.0,
-        echo_vals[echo_vals.len() - 1] as f64 / 1000.0
+        us_to_ms(echo_vals[0]),
+        us_to_ms(avg),
+        us_to_ms(p95),
+        us_to_ms(echo_vals[echo_vals.len() - 1])
     );
 
     // 2) 空格正确性（双向）：
@@ -345,7 +350,7 @@ fn com8_io_latency_live() {
     );
     println!(
         "\n=== 突发排空（TX 合并）===\n  8 个退格入队耗时 {enqueued_us} µs（合并后应为 1 次 USB 写事务）；\n  8 次擦除回显全部到达总耗时 {} ms",
-        t0.elapsed().as_micros() as f64 / 1000.0
+        us_to_ms(t0.elapsed().as_micros())
     );
 
     measure_repeated_edits(&service, &mut col, &mut rx);

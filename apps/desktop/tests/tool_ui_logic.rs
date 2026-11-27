@@ -104,7 +104,7 @@ fn kernel_errors_map_to_display_kinds_with_verbatim_detail() {
     };
     let failure = InstallFailure::from_error(&invalid);
     assert_eq!(failure.kind, InstallFailureKind::ProxyInvalidUrl);
-    assert!(!failure.detail.is_empty());
+    assert_ne!(failure.detail, "");
 }
 
 // ---------------------------------------------------------------------------

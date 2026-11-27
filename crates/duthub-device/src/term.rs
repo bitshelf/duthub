@@ -1,8 +1,8 @@
-//! 终端仿真网格（PuTTY 模式，alacritty_terminal 0.26）。
+//! 终端仿真网格（PuTTY `模式，alacritty_terminal` 0.26）。
 //!
 //! - real 会话持 `Term` + `vte::ansi::Processor`：串口原始字节直接
 //!   `processor.advance(&mut term, bytes)`——设备 shell 自己负责回显/提示符/
-//!   光标（无本地 [TX] 伪造行，与 PuTTY 行为一致）。
+//!   光标（无本地 [TX] 伪造行，与 `PuTTY` 行为一致）。
 //! - UI 渲染从 Term 网格提取：[`snapshot_screen`] 把可见区 + 适度回滚历史
 //!   转成文本行 + 前景/背景色（`ScreenSnapshot`），经总线整体替换到 UI。
 //! - Scrollback defaults to one million rows and grows as output arrives.
@@ -43,6 +43,7 @@ pub struct TermGrid {
 }
 
 impl TermGrid {
+    #[must_use]
     pub fn new(cols: usize, rows: usize) -> Self {
         Self { cols, rows }
     }
@@ -61,11 +62,13 @@ impl Dimensions for TermGrid {
 }
 
 /// 新建 real 会话的仿真终端（VoidListener：驱动事件全部丢弃）。
+#[must_use]
 pub fn create_term() -> Term<VoidListener> {
     create_term_with_scrollback(SCROLLBACK_HISTORY)
 }
 
 /// 按设置的回滚行数建终端（「串口」设置段；下限 100，默认 [`SCROLLBACK_HISTORY`]）。
+#[must_use]
 pub fn create_term_with_scrollback(scrollback_rows: usize) -> Term<VoidListener> {
     let mut term = create_term_with_grid(TermGrid::new(DEFAULT_COLS, DEFAULT_ROWS));
     term.grid_mut()
@@ -213,15 +216,19 @@ fn resolve_color(color: Color, dyn_colors: &DynColors, is_fg: bool) -> Option<u3
                     return None;
                 }
                 NamedColor::Background if !is_fg => return None,
-                NamedColor::Cursor => BASE16[7],
-                NamedColor::Black | NamedColor::DimBlack => BASE16[0],
+                NamedColor::Black | NamedColor::DimBlack | NamedColor::Background => BASE16[0],
                 NamedColor::Red | NamedColor::DimRed => BASE16[1],
                 NamedColor::Green | NamedColor::DimGreen => BASE16[2],
                 NamedColor::Yellow | NamedColor::DimYellow => BASE16[3],
                 NamedColor::Blue | NamedColor::DimBlue => BASE16[4],
                 NamedColor::Magenta | NamedColor::DimMagenta => BASE16[5],
                 NamedColor::Cyan | NamedColor::DimCyan => BASE16[6],
-                NamedColor::White | NamedColor::DimWhite => BASE16[7],
+                NamedColor::Cursor
+                | NamedColor::White
+                | NamedColor::DimWhite
+                | NamedColor::Foreground
+                | NamedColor::BrightForeground
+                | NamedColor::DimForeground => BASE16[7],
                 NamedColor::BrightBlack => BASE16[8],
                 NamedColor::BrightRed => BASE16[9],
                 NamedColor::BrightGreen => BASE16[10],
@@ -230,11 +237,6 @@ fn resolve_color(color: Color, dyn_colors: &DynColors, is_fg: bool) -> Option<u3
                 NamedColor::BrightMagenta => BASE16[13],
                 NamedColor::BrightCyan => BASE16[14],
                 NamedColor::BrightWhite => BASE16[15],
-                // 默认色被 INVERSE 换到对侧：前景当白、背景当黑
-                NamedColor::Foreground
-                | NamedColor::BrightForeground
-                | NamedColor::DimForeground => BASE16[7],
-                NamedColor::Background => BASE16[0],
             }
         }
         Color::Spec(rgb) => rgb,
@@ -253,11 +255,11 @@ fn resolve_color(color: Color, dyn_colors: &DynColors, is_fg: bool) -> Option<u3
                     }
                 }
                 232..=255 => {
-                    let level = 8 + (usize::from(idx) - 232) * 10;
+                    let level = 8 + (idx - 232) * 10;
                     Rgb {
-                        r: level as u8,
-                        g: level as u8,
-                        b: level as u8,
+                        r: level,
+                        g: level,
+                        b: level,
                     }
                 }
             }
@@ -286,10 +288,15 @@ pub fn snapshot_screen_scrollback(term: &Term<VoidListener>, max_rows: usize) ->
     let grid = term.grid();
     let bottommost = grid.bottommost_line().0;
     let topmost = grid.topmost_line().0;
-    let start = (bottommost + 1 - max_rows as i32).max(topmost);
+    let max_rows = i32::try_from(max_rows).unwrap_or(i32::MAX);
+    let start = bottommost
+        .saturating_add(1)
+        .saturating_sub(max_rows)
+        .max(topmost);
     snapshot_screen_range(term, start..=bottommost, true)
 }
 
+#[derive(Debug)]
 pub struct TerminalHistoryPage {
     pub screen: ScreenSnapshot,
     pub skip: usize,
@@ -305,19 +312,22 @@ pub(crate) fn snapshot_terminal_history(
     let grid = term.grid();
     let top = grid.topmost_line().0;
     let bottom = grid.bottommost_line().0;
-    if skip > (bottom - top) as usize {
+    let total_span = usize::try_from(bottom - top).unwrap_or(0);
+    if skip > total_span {
         return TerminalHistoryPage {
             screen: ScreenSnapshot::default(),
             skip,
             earlier: 0,
         };
     }
-    let end = bottom - skip as i32;
-    let start = (end + 1 - HISTORY_PAGE_ROWS as i32).max(top);
+    let skip_i32 = i32::try_from(skip).unwrap_or(i32::MAX);
+    let end = bottom - skip_i32;
+    let page_rows = i32::try_from(HISTORY_PAGE_ROWS).unwrap_or(i32::MAX);
+    let start = (end + 1 - page_rows).max(top);
     TerminalHistoryPage {
         screen: snapshot_screen_range(term, start..=end, false),
         skip,
-        earlier: (start - top) as usize,
+        earlier: usize::try_from(start - top).unwrap_or(0),
     }
 }
 
@@ -336,12 +346,13 @@ fn snapshot_screen_range(
             alacritty_terminal::vte::ansi::CursorShape::Hidden
         );
 
-    let expected_rows = (*range.end() - *range.start() + 1).max(0) as usize;
+    let expected_rows = usize::try_from((*range.end() - *range.start() + 1).max(0)).unwrap_or(0);
     let mut rows: Vec<ScreenRow> = Vec::with_capacity(expected_rows);
     let mut cursor_row: Option<u32> = None;
     let mut cursor_char: Option<u32> = None;
     for line in range {
         let row = &grid[Line(line)];
+        let row_idx = u32::try_from(rows.len()).unwrap_or(u32::MAX);
         let mut cursor_here = !cursor_hidden && line == cursor.line.0;
         let mut text = String::with_capacity(cols);
         let mut fg: Option<u32> = None;
@@ -353,7 +364,7 @@ fn snapshot_screen_range(
             let cell = &row[Column(col)];
             if cursor_here && col == cursor.column.0 {
                 cursor_char = Some(char_count);
-                cursor_row = Some(rows.len() as u32);
+                cursor_row = Some(row_idx);
                 cursor_here = false;
             }
             if cell.flags.intersects(Flags::WIDE_CHAR_SPACER) {
@@ -385,7 +396,7 @@ fn snapshot_screen_range(
             }
         }
         if trimmed_bytes < text.len() {
-            let tail_cursor = if cursor_row == Some(rows.len() as u32) {
+            let tail_cursor = if cursor_row == Some(row_idx) {
                 cursor_char
             } else {
                 None
@@ -415,7 +426,7 @@ fn snapshot_screen_range(
         bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
         // Filled by `SessionCtx::emit_screen` from the raw-byte meter; the
         // snapshot builder itself knows nothing about garbled detection.
-        garbled: Default::default(),
+        garbled: duthub_core::ipc::GarbledStats::default(),
     }
 }
 
@@ -449,11 +460,10 @@ mod tests {
         let oldest = snapshot_terminal_history(&term, first.skip + first.screen.rows.len());
         assert_eq!(oldest.screen.rows[0].text, "00000");
         assert_eq!(oldest.earlier, 0);
-        assert!(
+        assert_eq!(
             snapshot_terminal_history(&term, SCROLLBACK_HISTORY)
                 .screen
-                .rows
-                .is_empty()
+                .rows, [] as [duthub_core::ipc::ScreenRow; 0]
         );
     }
 
@@ -483,7 +493,7 @@ mod tests {
                 frame.rows[frame.cursor_row.unwrap() as usize].text,
                 expected
             );
-            assert_eq!(frame.cursor_char, Some(expected.len() as u32));
+            assert_eq!(frame.cursor_char, Some(u32::try_from(expected.len()).unwrap()));
             assert!(frame.bracketed_paste);
         }
     }
@@ -536,7 +546,7 @@ mod tests {
         reset_terminal(&mut term, &mut parser);
         assert_eq!((term.columns(), term.screen_lines()), (82, 19));
         assert!(!term.mode().contains(TermMode::ALT_SCREEN));
-        assert!(snapshot_screen(&term).rows.is_empty());
+        assert_eq!(snapshot_screen(&term).rows, [] as [duthub_core::ipc::ScreenRow; 0]);
 
         parser.advance(&mut term, b"fresh shell");
         let after = snapshot_screen(&term);
@@ -556,7 +566,7 @@ mod tests {
         assert!(!flush_expired_sync(
             &mut term,
             &mut parser,
-            deadline - std::time::Duration::from_millis(1),
+            deadline.checked_sub(std::time::Duration::from_millis(1)).unwrap(),
         ));
         assert!(
             snapshot_screen(&term)
@@ -584,8 +594,8 @@ mod tests {
         assert!(!screen.application_cursor && !screen.bracketed_paste);
     }
 
-    /// 终端仿真重构（alacritty_terminal）单元级验证：字节流进 Processor →
-    /// Term 网格承载设备侧回显与 ANSI（代替旧 LineAssembler 行重组测试）。
+    /// `终端仿真重构（alacritty_terminal）单元级验证：字节流进` Processor →
+    /// Term 网格承载设备侧回显与 ANSI（代替旧 `LineAssembler` 行重组测试）。
     #[test]
     fn term_simulator_renders_remote_echo_and_sgr_colors() {
         let mut term = create_term();
@@ -608,7 +618,7 @@ mod tests {
             .iter()
             .find(|r| r.text.contains("red"))
             .expect("ANSI 输出行存在");
-        assert_eq!(red.fg, Some(0xcc6666), "SGR 31 必须映射为红色前景");
+        assert_eq!(red.fg, Some(0x00cc_6666), "SGR 31 必须映射为红色前景");
         assert!(
             snap.cursor_row.is_some() && snap.cursor_char.is_some(),
             "光标必须定位（提示符在等输入）"
@@ -628,7 +638,7 @@ mod tests {
             .iter()
             .position(|r| r.text.contains("fresh"))
             .expect("清屏后新内容必须可见");
-        assert_eq!(snap.cursor_row, Some(fresh_idx as u32));
+        assert_eq!(snap.cursor_row, Some(u32::try_from(fresh_idx).unwrap()));
         assert_eq!(snap.cursor_char, Some(5), "光标在 fresh 之后");
     }
 
@@ -668,9 +678,9 @@ mod tests {
         );
         let snap = snapshot_screen(&term);
         let row = snap.rows.iter().find(|r| r.text.contains('A')).unwrap();
-        assert_eq!(row.fg, Some(0xff0000), "indexed 196 → 立方红");
+        assert_eq!(row.fg, Some(0x00ff_0000), "indexed 196 → 立方红");
         let row = snap.rows.iter().find(|r| r.text.contains('B')).unwrap();
-        assert_eq!(row.fg, Some(0x12ff34), "SGR 38;2 直写 RGB");
+        assert_eq!(row.fg, Some(0x0012_ff34), "SGR 38;2 直写 RGB");
     }
 
     /// 光标隐藏（DECTCEM ?25）时快照不携带光标。
@@ -758,13 +768,13 @@ mod tests {
             "快照只能携带设备发送的字节（尾随空格因光标在其上而保留）：{:?}",
             snap.rows
         );
-        assert_eq!(snap.rows[0].fg, Some(0xb5bd68), "SGR 32 → 调色板绿");
+        assert_eq!(snap.rows[0].fg, Some(0x00b5_bd68), "SGR 32 → 调色板绿");
         assert_eq!(snap.cursor_row, Some(0));
         assert_eq!(snap.cursor_char, Some(14), "光标停在提示符空格之后");
     }
 
     /// IO-1（主场景，模拟 real.rs 读循环分块到达）：设备侧回显行、提示符、
-    /// SGR 颜色与光标位置全部由仿真器承载并出现在 snapshot_screen 的快照
+    /// SGR 颜色与光标位置全部由仿真器承载并出现在 `snapshot_screen` 的快照
     /// 行中，本地不伪造任何回显。逐帧喂入（提示符 → 逐字节回显键入 →
     /// 命令输出 + 新提示符），每帧快照必须如实反映已收字节。
     #[test]
@@ -774,7 +784,7 @@ mod tests {
         feed(&mut term, b"\x1b[32mroot@rk3576:~#\x1b[0m ");
         let snap = snapshot_screen(&term);
         assert_eq!(snap.rows[0].text, "root@rk3576:~# ");
-        assert_eq!(snap.rows[0].fg, Some(0xb5bd68), "提示符 SGR 32 → 调色板绿");
+        assert_eq!(snap.rows[0].fg, Some(0x00b5_bd68), "提示符 SGR 32 → 调色板绿");
         assert_eq!(snap.cursor_row, Some(0));
         assert_eq!(snap.cursor_char, Some(15), "光标停在提示符空格之后");
 
@@ -805,7 +815,7 @@ mod tests {
             "回显行、输出行、新提示符必须按序出现在快照中：{:?}",
             snap.rows
         );
-        assert_eq!(snap.rows[1].fg, Some(0xcc6666), "SGR 31 → 调色板红");
+        assert_eq!(snap.rows[1].fg, Some(0x00cc_6666), "SGR 31 → 调色板红");
         let cursor_row = snap.cursor_row.expect("光标必须可见（提示符在等输入）") as usize;
         assert!(
             snap.rows[cursor_row].text.contains("root@rk3576:~#"),

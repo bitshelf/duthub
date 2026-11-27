@@ -26,16 +26,17 @@ pub trait ProcessRunner: Send + Sync {
 }
 
 /// 真实执行器：argv-only，无 shell；工作目录为可执行文件所在目录。
+#[derive(Debug)]
 pub struct RealProcessRunner;
 
 impl ProcessRunner for RealProcessRunner {
-    #[tracing::instrument(name = "process.run", skip(self, args), fields(exe = %exe.display(), timeout_ms = timeout.as_millis() as u64))]
+    #[tracing::instrument(name = "process.run", skip(self, args), fields(exe = %exe.display(), timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)))]
     fn run(&self, exe: &Path, args: &[String], timeout: Duration) -> DeviceResult<ProcessResult> {
         let output = run_capped(exe, args, &[], timeout, MAX_OUTPUT)?;
         Ok(ProcessResult {
             exit_code: Some(output.exit_code),
-            stdout: display_output(output.stdout),
-            stderr: display_output(output.stderr),
+            stdout: display_output(&output.stdout),
+            stderr: display_output(&output.stderr),
             elapsed_ms: output.elapsed_ms,
         })
     }
@@ -82,7 +83,7 @@ pub fn run_binary_with_env(
         return Err(DeviceError::Invalid(format!(
             "exit {}: {}",
             output.exit_code,
-            display_output(output.stderr).trim()
+            display_output(&output.stderr).trim()
         )));
     }
     if output.stdout.truncated {
@@ -125,26 +126,24 @@ fn run_capped(
     let started = Instant::now();
     let mut timed_out = false;
     let status = loop {
-        match child
+        if let Some(status) = child
             .try_wait()
             .map_err(|e| DeviceError::Invalid(e.to_string()))?
         {
-            Some(status) => break status,
-            None => {
-                if started.elapsed() > timeout {
-                    // 超时即取消：终止整个进程树（仅杀主进程时，
-                    // 派生的孙进程会继续持有输出管道）
-                    kill_process_tree(&mut child);
-                    timed_out = true;
-                    break child
-                        .wait()
-                        .map_err(|e| DeviceError::Invalid(e.to_string()))?;
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            }
+            break status;
         }
+        if started.elapsed() > timeout {
+            // 超时即取消：终止整个进程树（仅杀主进程时，
+            // 派生的孙进程会继续持有输出管道）
+            kill_process_tree(&mut child);
+            timed_out = true;
+            break child
+                .wait()
+                .map_err(|e| DeviceError::Invalid(e.to_string()))?;
+        }
+        std::thread::sleep(POLL_INTERVAL);
     };
-    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     drop(stdout_reader);
     drop(stderr_reader);
@@ -198,8 +197,10 @@ fn collect_outputs(
         match rx.recv_timeout(remaining) {
             Ok((Stream::Stdout, text)) => stdout = Some(text),
             Ok((Stream::Stderr, text)) => stderr = Some(text),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(
+                std::sync::mpsc::RecvTimeoutError::Timeout
+                | std::sync::mpsc::RecvTimeoutError::Disconnected,
+            ) => break,
         }
     }
     (stdout, stderr)
@@ -230,19 +231,18 @@ fn read_capped<R: Read>(mut reader: R, cap: usize) -> Captured {
     let mut chunk = [0u8; 4096];
     loop {
         match reader.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => {
                 let copied = n.min(cap - output.bytes.len());
                 output.bytes.extend_from_slice(&chunk[..copied]);
                 output.truncated |= copied != n;
             }
-            Err(_) => break,
         }
     }
     output
 }
 
-fn display_output(output: Captured) -> String {
+fn display_output(output: &Captured) -> String {
     let mut text = String::from_utf8_lossy(&output.bytes).into_owned();
     if output.truncated {
         text.push_str("\n[输出已截断]");
@@ -274,8 +274,7 @@ pub fn resolve_executable(spec: &str) -> DeviceResult<PathBuf> {
     let candidate = PathBuf::from(trimmed);
     let has_dir_part = candidate
         .parent()
-        .map(|p| !p.as_os_str().is_empty())
-        .unwrap_or(false);
+        .is_some_and(|p| !p.as_os_str().is_empty());
     if has_dir_part {
         return if candidate.is_file() {
             Ok(candidate)
@@ -329,7 +328,7 @@ mod tests {
     #[test]
     fn read_capped_truncates() {
         let data = vec![b'x'; 70_000];
-        let text = display_output(read_capped(&data[..], MAX_OUTPUT));
+        let text = display_output(&read_capped(&data[..], MAX_OUTPUT));
         assert!(text.contains("[输出已截断]"));
         assert!(text.len() < 70_000);
     }

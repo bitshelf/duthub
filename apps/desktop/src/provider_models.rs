@@ -781,7 +781,7 @@ fn edit_model_dialog(
                                     }
                                 }
                                 cx.notify();
-                            })
+                            });
                         }),
                 ),
             )
@@ -816,7 +816,7 @@ fn save_model_entry(
             .iter_mut()
             .find(|entry| entry.id == previous)
             .ok_or_else(|| label("enterModelName").to_owned())?;
-        entry.id = model.to_owned();
+        model.clone_into(&mut entry.id);
         if agent.active_provider_id.as_deref() == Some(provider)
             && agent.active_model_id.as_deref() == Some(previous)
         {

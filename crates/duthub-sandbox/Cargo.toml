@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 base64.workspace = true
 mxc-sdk.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

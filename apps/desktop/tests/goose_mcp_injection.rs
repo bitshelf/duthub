@@ -151,13 +151,12 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 fn extension_names(extension_results: &Value) -> Vec<&str> {
     extension_results
         .as_array()
-        .map(|entries| {
+        .map_or_default(|entries| {
             entries
                 .iter()
                 .filter_map(|entry| entry.get("name").and_then(Value::as_str))
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 fn binding() -> GooseBinding {

@@ -65,7 +65,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 }
 
 fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -76,7 +76,7 @@ fn process_alive(pid: u32) -> bool {
             return false;
         };
         let mut code = 0u32;
-        let queried = GetExitCodeProcess(handle, &mut code).is_ok();
+        let queried = GetExitCodeProcess(handle, &raw mut code).is_ok();
         let _ = CloseHandle(handle);
         queried && code == STILL_ACTIVE.0 as u32
     }

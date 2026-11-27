@@ -49,6 +49,7 @@ pub struct MediaOpRequest {
 
 impl MediaOpRequest {
     /// Build a request together with the receiver the caller awaits.
+    #[must_use]
     pub fn channel(
         id: OpId,
         dut_id: String,
@@ -81,7 +82,8 @@ pub enum MediaOpReply {
 }
 
 /// A failure the MCP layer maps onto a `MEDIA_*` `data.code`.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{code}: {message}")]
 pub struct MediaOpError {
     pub code: &'static str,
     pub message: String,

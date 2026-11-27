@@ -1,9 +1,9 @@
-//! MCP 运行时桥接：desktop 状态 → duthub_mcp::McpState。
+//! MCP 运行时桥接：desktop 状态 → `duthub_mcp::McpState`。
 //!
 //! - HTTP 端点（默认 127.0.0.1:8797/mcp；开启局域网后为 0.0.0.0:8797）后台线程托管。
 //! - Workbench 每帧把 DUT 摘要 + 最近日志推入共享快照；快照写入循环约 2s 落盘
 //!   工作目录 `runtime/mcp-state.json`（stdio 快照子进程经同源解析读取）。
-//! - 审批令牌在 RuntimeMcpState 内单次消费。
+//! - 审批令牌在 `RuntimeMcpState` 内单次消费。
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -61,6 +61,10 @@ impl TokenBucket {
     /// Refill up to `now_ms` and report whether at least one token is free.
     fn has_token(&mut self, now_ms: u64) -> bool {
         let last = self.last_ms.unwrap_or(now_ms);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "elapsed ms between rate-limit refills fits well within f64 mantissa"
+        )]
         let elapsed = now_ms.saturating_sub(last) as f64;
         self.tokens = (self.tokens + elapsed * self.refill_per_ms).min(self.capacity);
         self.last_ms = Some(now_ms);
@@ -228,34 +232,33 @@ impl RuntimeMcpState {
         duthub_desktop::tool_resolver::effective_spec(&cfg.adb_executable, "adb")
     }
 
-    fn begin_agent_action<'a>(
-        lease: &'a Option<Arc<ControlLeaseManager>>,
-    ) -> Result<Option<impl Drop + 'a>, String> {
+    fn begin_agent_action(
+        lease: Option<&Arc<ControlLeaseManager>>,
+    ) -> Result<Option<impl Drop + '_>, String> {
         lease
-            .as_ref()
             .map(|lease| lease.begin_agent_action().map_err(|err| lease_err(&err)))
             .transpose()
     }
 
     /// 控制动作统一走共用设备操作入口；授权错误带类别码便于 MCP 客户端感知。
     /// Device 错误（动作真正执行失败）同时转弹窗提醒（需求⑤接入点③）；
-    /// ApprovalRequired 是审批协议的正常环节（客户端据此走 approval.request），
+    /// `ApprovalRequired` 是审批协议的正常环节（客户端据此走 approval.request），
     /// 不算异常、不弹窗。
     fn control_execute(
         &self,
         dut_id: &str,
         action: ControlAction,
         approval_token: &str,
-        writer: WriteIdentity,
+        writer: &WriteIdentity,
     ) -> Result<(), String> {
         let action_label = action.mark_label().to_string();
         self.control
-            .execute_by_id_as(dut_id, action, approval_token, &writer)
+            .execute_by_id_as(dut_id, action, approval_token, writer)
             .map_err(|err| match err {
                 ControlEntryError::Approval(approval) => {
                     format!(
                         "ApprovalRequired/{}: {}",
-                        code_of(&approval),
+                        code_of(approval),
                         approval.message()
                     )
                 }
@@ -268,16 +271,16 @@ impl RuntimeMcpState {
             })
     }
 
-    /// 继电器写动作（relay_test）失败同样转弹窗提醒；只读查询（relay_status）不算动作。
+    /// `继电器写动作（relay_test）失败同样转弹窗提醒；只读查询（relay_status）不算动作`。
     fn relay_test_execute(
         &self,
         dut_id: &str,
         channel: u8,
         approval_token: &str,
-        writer: WriteIdentity,
+        writer: &WriteIdentity,
     ) -> Result<duthub_core::backend::ChannelTestReport, String> {
         self.control
-            .channel_test_as(dut_id, channel, approval_token, &writer)
+            .channel_test_as(dut_id, channel, approval_token, writer)
             .map_err(|err| match &err {
                 ControlEntryError::Device(device_err) => {
                     if !matches!(device_err, duthub_core::DeviceError::Lease(_)) {
@@ -301,7 +304,7 @@ impl RuntimeMcpState {
             .ok_or_else(|| "控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 弹窗提醒入队（去重/抑制/总开关都在 AlertCenter 内裁决）。
+    /// 弹窗提醒入队（去重/抑制/总开关都在 `AlertCenter` 内裁决）。
     fn report_control_failure(&self, dut_id: &str, action: &str, err: &str) {
         let (title, detail) = crate::alerts::control_action_alert_texts(dut_id, action, err);
         let _ = self
@@ -342,7 +345,7 @@ fn lease_err(err: &LeaseError) -> String {
     format!("LeaseRequired/{}: {}", lease_error_code(err), err.message())
 }
 
-fn code_of(err: &duthub_core::ApprovalError) -> &'static str {
+fn code_of(err: duthub_core::ApprovalError) -> &'static str {
     match err {
         duthub_core::ApprovalError::Missing => "Missing",
         duthub_core::ApprovalError::Unknown => "Unknown",
@@ -427,7 +430,7 @@ impl McpState for RuntimeMcpState {
             .filter_map(|e| match &e.event {
                 duthub_core::UiEvent::SerialChunk { text, .. } => Some(LogLineDto {
                     seq: e.seq,
-                    text: text.to_string(),
+                    text: text.clone(),
                 }),
                 _ => None,
             })
@@ -558,7 +561,7 @@ impl McpState for RuntimeMcpState {
         use duthub_core::process::{ProcessRunner, RealProcessRunner, resolve_executable};
 
         let lease = self.device.lease_manager();
-        let _agent_action = Self::begin_agent_action(&lease)?;
+        let _agent_action = Self::begin_agent_action(lease.as_ref())?;
         let dut = self
             .dut_info(dut_id)
             .ok_or_else(|| "DUT not found".to_string())?;
@@ -685,7 +688,7 @@ impl McpState for RuntimeMcpState {
         approval_token: &str,
         writer: WriteIdentity,
     ) -> Result<(), String> {
-        self.control_execute(dut_id, ControlAction::Power { on }, approval_token, writer)
+        self.control_execute(dut_id, ControlAction::Power { on }, approval_token, &writer)
     }
 
     fn control_reset(
@@ -694,7 +697,7 @@ impl McpState for RuntimeMcpState {
         approval_token: &str,
         writer: WriteIdentity,
     ) -> Result<(), String> {
-        self.control_execute(dut_id, ControlAction::Reset, approval_token, writer)
+        self.control_execute(dut_id, ControlAction::Reset, approval_token, &writer)
     }
 
     fn control_power_key(
@@ -708,7 +711,7 @@ impl McpState for RuntimeMcpState {
             dut_id,
             ControlAction::PowerKey { long_press },
             approval_token,
-            writer,
+            &writer,
         )
     }
 
@@ -723,7 +726,7 @@ impl McpState for RuntimeMcpState {
             dut_id,
             ControlAction::PowerCycle { off_ms },
             approval_token,
-            writer,
+            &writer,
         )
     }
 
@@ -738,7 +741,7 @@ impl McpState for RuntimeMcpState {
             dut_id,
             ControlAction::EnterMaskrom { hold_ms },
             approval_token,
-            writer,
+            &writer,
         )
     }
 
@@ -753,7 +756,7 @@ impl McpState for RuntimeMcpState {
             dut_id,
             ControlAction::EnterLoader { hold_ms },
             approval_token,
-            writer,
+            &writer,
         )
     }
 
@@ -770,7 +773,7 @@ impl McpState for RuntimeMcpState {
         approval_token: &str,
         writer: WriteIdentity,
     ) -> Result<duthub_core::backend::ChannelTestReport, String> {
-        self.relay_test_execute(dut_id, channel, approval_token, writer)
+        self.relay_test_execute(dut_id, channel, approval_token, &writer)
     }
 
     fn heartbeat_get(&self, dut_id: &str) -> Result<HeartbeatViewDto, String> {
@@ -793,7 +796,7 @@ impl McpState for RuntimeMcpState {
             .transpose()?;
         let applied = self.heartbeat.update_config(dut_id, |mut cfg| {
             if let Some(command) = update.command {
-                cfg.command = command.trim().to_owned();
+                command.trim().clone_into(&mut cfg.command);
                 cfg.enabled = true;
             }
             if let Some(secs) = update.interval_secs {
@@ -860,7 +863,7 @@ impl McpState for RuntimeMcpState {
         _writer: WriteIdentity,
     ) -> Result<ProcessResultDto, String> {
         let lease = self.device.lease_manager();
-        let _agent_action = Self::begin_agent_action(&lease)?;
+        let _agent_action = Self::begin_agent_action(lease.as_ref())?;
         let root = self
             .dut_artifact_root()
             .ok_or_else(|| "DUT artifact directory unavailable".to_string())?;
@@ -910,7 +913,7 @@ impl McpState for RuntimeMcpState {
         _writer: WriteIdentity,
     ) -> Result<ProcessResultDto, String> {
         let lease = self.device.lease_manager();
-        let _agent_action = Self::begin_agent_action(&lease)?;
+        let _agent_action = Self::begin_agent_action(lease.as_ref())?;
         let exe = self.resolve_flash_executable(preset_id)?;
         let _ = self.device.log_mark(dut_id, "flash reboot");
         let out = duthub_flash::FlashTester::real()
@@ -1098,7 +1101,7 @@ fn snapshot_content_digest(snapshot: &duthub_mcp::snapshot::StateSnapshot) -> St
     duthub_core::util::sha256_hex(&bytes)
 }
 
-/// 待启动端点：(is_main, port, listener id, bound DUT id)。
+/// `待启动端点：(is_main`, port, listener id, bound DUT id)。
 type EndpointSpec = (bool, u16, Option<Arc<str>>, Option<Arc<str>>);
 
 /// 启动 MCP HTTP 端点（默认 `127.0.0.1:{port}`；`lan_requested` 时绑 `0.0.0.0`，
@@ -1108,19 +1111,17 @@ type EndpointSpec = (bool, u16, Option<Arc<str>>, Option<Arc<str>>);
 /// W4a：绑定/启动失败记录进 [`McpRuntimeHandles::failures`]，不再静默丢失。
 #[allow(clippy::too_many_arguments)] // 与 RuntimeMcpState::new 同理由：运行时装配参数由 Workbench 一次性注入
 pub fn spawn_mcp_runtime(
-    state: Arc<dyn duthub_mcp::state::McpState>,
-    notifier: Option<Arc<dyn duthub_mcp::notify::UserNotifier>>,
-    access: Option<Arc<duthub_mcp::auth_http::AccessContext>>,
+    state: &Arc<dyn duthub_mcp::state::McpState>,
+    notifier: Option<&Arc<dyn duthub_mcp::notify::UserNotifier>>,
+    access: Option<&Arc<duthub_mcp::auth_http::AccessContext>>,
     port: u16,
     lan_requested: bool,
     listeners: Vec<duthub_core::agent_access::AgentListener>,
     snapshot: Arc<Mutex<duthub_mcp::snapshot::StateSnapshot>>,
-    data_dir: PathBuf,
-    main_bound_endpoint: Arc<OnceLock<SocketAddr>>,
+    data_dir: &std::path::Path,
+    main_bound_endpoint: &OnceLock<SocketAddr>,
 ) -> McpRuntimeHandles {
-    let auth_enabled = access
-        .as_ref()
-        .is_some_and(|ctx| ctx.auth.settings().enabled);
+    let auth_enabled = access.is_some_and(|ctx| ctx.auth.settings().enabled);
     let lan_access = lan_requested && auth_enabled;
     if lan_requested && !auth_enabled {
         eprintln!("[mcp] 已配置局域网访问但认证未开启：回退 127.0.0.1（fail closed）");
@@ -1159,10 +1160,10 @@ pub fn spawn_mcp_runtime(
         match duthub_mcp::transport::spawn_http_listener_on(
             listener,
             state.clone(),
-            access.clone(),
+            access.cloned(),
             listener_id,
             listener_dut,
-            notifier.clone(),
+            notifier.cloned(),
         ) {
             Ok(handle) => {
                 if is_main {

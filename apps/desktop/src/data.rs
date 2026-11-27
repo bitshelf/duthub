@@ -155,9 +155,9 @@ impl DutsState {
             new_connection: None,
             editing_new_connection: false,
             dirty: false,
-            saved_media: Default::default(),
-            saved_usb: Default::default(),
-            saved_names: Default::default(),
+            saved_media: std::collections::HashMap::default(),
+            saved_usb: std::collections::HashMap::default(),
+            saved_names: std::collections::HashMap::default(),
         };
         state.sync_saved_media();
         state
@@ -368,7 +368,7 @@ mod tests {
         let selected = selected_flash_config(Some(&saved), Some("phoenix"), &catalog);
         assert_eq!(selected.preset_id.as_deref(), Some("phoenix"));
         assert_eq!(selected.executable, catalog[0].executable);
-        assert!(selected.test_args.is_empty());
+        assert_eq!(selected.test_args, Vec::<String>::new());
     }
 
     #[test]
@@ -390,8 +390,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("duthub-fresh-{}", uuid::Uuid::new_v4()));
         let (state, error) = DutsState::load(&path);
         assert!(error.is_none());
-        assert!(state.file.duts.is_empty());
-        assert!(state.file.relay_boards.is_empty());
+        assert_eq!(state.file.duts, Vec::<DutConfig>::new());
+        assert_eq!(
+            state.file.relay_boards,
+            Vec::<duthub_core::model::RelayBoard>::new()
+        );
     }
 
     #[test]
@@ -402,12 +405,12 @@ mod tests {
         second.id = "removable".into();
         data.duts.push(second);
         data.alerts_by_dut
-            .insert("removable".into(), Default::default());
+            .insert("removable".into(), AlertSettings::default());
         data.relay_boards[0].node.clear();
         assert!(remove_connection(&mut data, "removable"));
         assert!(!remove_connection(&mut data, "removable"));
         assert_eq!(data.duts, [original]);
-        assert!(data.relay_boards[0].node.is_empty());
+        assert_eq!(data.relay_boards[0].node, "");
         assert!(!data.alerts_by_dut.contains_key("removable"));
     }
 
@@ -435,7 +438,7 @@ mod tests {
         state.save(&dir).unwrap();
         let (reloaded, error) = DutsState::load(&dir);
         assert!(error.is_none());
-        assert!(reloaded.file.duts.is_empty());
+        assert_eq!(reloaded.file.duts, Vec::<DutConfig>::new());
         std::fs::remove_file(dir.join("duts.json")).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }

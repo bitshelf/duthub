@@ -116,7 +116,7 @@ pub(crate) fn extract_tool<R: Read + Seek>(
         source,
     })?;
     let mut files = Vec::with_capacity(spec.entries.len());
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     for (_entry, slot) in spec.entries.iter().zip(matched_indices) {
         let (index, name, base, declared) = slot.expect("missing entries rejected above");
         let member = archive

@@ -30,7 +30,7 @@ use crate::server::{McpServerCore, plan_mode_error, plan_tool_allowed};
 use crate::state::McpState;
 
 /// stdio 传输：阻塞直到客户端断开。由独立进程（bin duthub-mcp）调用。
-/// stdio 视为本地管理员（偏差 5）：McpServerCore 不接 AccessContext。
+/// stdio 视为本地管理员（偏差 5）：McpServerCore 不接 `AccessContext`。
 pub async fn serve_stdio(
     state: Arc<dyn McpState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -203,7 +203,7 @@ fn http_router_for_listener(
 ) -> axum::Router {
     let core = McpServerCore::new(state, access.clone())
         .with_listener_endpoint(endpoint)
-        .with_listener_dut(listener_dut.as_deref())
+        .with_listener_dut_arc(listener_dut)
         .with_user_notifier(notifier);
     let service = StreamableHttpService::new(
         move || Ok(core.clone()),
@@ -234,9 +234,19 @@ pub struct ListenerHandle {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
+impl std::fmt::Debug for ListenerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListenerHandle")
+            .field("endpoint", &self.endpoint)
+            .field("active", &self.shutdown.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ListenerHandle {
     /// 发送 shutdown 信号并等待服务线程退出。
     /// 返回 `false` = 在 `timeout` 内 join 未完成（信号已发出，端口随后释放）。
+    #[must_use]
     pub fn shutdown_and_join_with_timeout(mut self, timeout: Duration) -> bool {
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
@@ -368,8 +378,7 @@ async fn serve_listener(
         "[mcp] HTTP serving on {}",
         listener
             .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default()
+            .map_or_default(|a| a.to_string())
     );
     axum::serve(
         listener,
@@ -394,6 +403,7 @@ pub fn assert_bind_allowed(addr: &SocketAddr, auth_enabled: bool) -> Result<(), 
 
 /// 对外展示地址：`0.0.0.0` 通配绑定替换为探测到的本机局域网 IPv4
 /// （探测失败回退 127.0.0.1）；具体地址原样返回。
+#[must_use]
 pub fn advertised_endpoint(addr: SocketAddr) -> SocketAddr {
     if !addr.ip().is_unspecified() {
         return addr;

@@ -42,6 +42,7 @@ impl FreeSpace for Fs4FreeSpace {
 
 /// Disk budget: `declared + slack + reserved + other in-flight remainders`
 /// versus the currently available bytes.
+#[must_use]
 pub fn budget_required(
     declared_len: u64,
     reserved_disk_bytes: u64,
@@ -67,6 +68,16 @@ pub struct ExpiringDiskStore {
     locker: Arc<dyn Locker>,
 }
 
+impl std::fmt::Debug for ExpiringDiskStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpiringDiskStore")
+            .field("root", &self.root)
+            .field("ttl", &self.ttl)
+            .field("lock_wait", &self.lock_wait)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ExpiringDiskStore {
     pub fn new(
         root: impl Into<PathBuf>,
@@ -85,11 +96,13 @@ impl ExpiringDiskStore {
     }
 
     /// Storage root (the `data/` and `metadata/` directories live below it).
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// Upload ids known to the store: the `<id>.json` records under `metadata/`.
+    #[must_use]
     pub fn ids(&self) -> Vec<String> {
         read_ids_in(&self.root)
     }
@@ -159,6 +172,7 @@ impl ExpiringDiskStore {
     /// Payload bytes currently occupied by the store (completed artifacts and
     /// in-flight staging). Ledger/marker files are bookkeeping overhead and do
     /// not count against the DUT capacity.
+    #[must_use]
     pub fn used_bytes(&self) -> u64 {
         dir_size(&self.root.join("data"))
     }
@@ -262,6 +276,7 @@ impl ExpiringDiskStore {
 
     /// `true` once an unfinished upload is older than `ttl`. Completed uploads
     /// never expire: they are published artifacts.
+    #[must_use]
     pub fn is_expired(upload: &UploadInfo, ttl: Duration) -> bool {
         if ttl.is_zero() || !Self::is_unfinished(upload) {
             return false;
@@ -510,12 +525,12 @@ fn dir_size(dir: &Path) -> u64 {
         return 0;
     };
     read_dir
-        .filter_map(|item| item.ok())
+        .filter_map(std::result::Result::ok)
         .map(|item| {
-            if item.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            if item.file_type().is_ok_and(|kind| kind.is_dir()) {
                 dir_size(&item.path())
             } else {
-                item.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                item.metadata().map_or(0, |metadata| metadata.len())
             }
         })
         .sum()
@@ -597,7 +612,7 @@ mod tests {
             .await
             .unwrap();
         if written > 0 {
-            let payload = vec![0u8; written as usize];
+            let payload = vec![0u8; usize::try_from(written).unwrap()];
             let stream = Box::pin(futures_util::stream::once(async move {
                 Ok::<_, io::Error>(Bytes::from(payload))
             }));
@@ -707,7 +722,7 @@ mod tests {
         drop(held);
 
         assert_eq!(store.delete_expired().await.unwrap(), 1);
-        assert!(store.ids().is_empty());
+        assert_eq!(store.ids(), Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -730,7 +745,7 @@ mod tests {
         store.remove("upload").await.unwrap();
 
         assert!(!marker.exists());
-        assert!(store.ids().is_empty());
+        assert_eq!(store.ids(), Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -820,7 +835,7 @@ mod tests {
         drop(blocker);
 
         assert_eq!(store.delete_expired().await.unwrap(), 1);
-        assert!(store.ids().is_empty());
+        assert_eq!(store.ids(), Vec::<String>::new());
         assert!(!store.failed_marker("stuck").unwrap().exists());
     }
 

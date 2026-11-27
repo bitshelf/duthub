@@ -167,7 +167,7 @@ async fn checksum_mismatch_is_a_terminal_460_without_staging() {
         !server.store().failed_marker(&id).unwrap().exists(),
         "discarded cleanly, no flag left"
     );
-    assert!(server.store().ids().is_empty());
+    assert_eq!(server.store().ids(), Vec::<String>::new());
     let (status, _) = head_offset(&http, &url, Some(TOKEN_A)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     handle.shutdown_and_join().await;
@@ -200,7 +200,7 @@ async fn sha256_mismatch_is_terminal_too() {
         response.json::<serde_json::Value>().await.unwrap()["algorithm"],
         "sha256"
     );
-    assert!(server.store().ids().is_empty());
+    assert_eq!(server.store().ids(), Vec::<String>::new());
     handle.shutdown_and_join().await;
 }
 
@@ -270,7 +270,7 @@ async fn checksum_declarations_are_validated_up_front() {
         }
     }
     // None of the rejected creations left a record behind.
-    assert!(server.store().ids().is_empty());
+    assert_eq!(server.store().ids(), Vec::<String>::new());
     handle.shutdown_and_join().await;
 }
 
@@ -653,9 +653,12 @@ async fn second_upload_of_the_same_name_keeps_the_first() {
         .collect();
     assert_eq!(files.len(), 2, "{files:?}");
     assert!(
-        files
-            .iter()
-            .any(|name| name.starts_with("flash-") && name.ends_with(".img")),
+        files.iter().any(|name| {
+            name.starts_with("flash-")
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("img"))
+        }),
         "{files:?}"
     );
     assert_eq!(server.store().ids().len(), 2);

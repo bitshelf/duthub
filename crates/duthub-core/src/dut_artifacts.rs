@@ -221,6 +221,7 @@ pub fn open_subdir_for_write(dir: &Dir, name: &str) -> io::Result<Dir> {
     open_plain_subdir(dir, name)
 }
 
+#[must_use]
 pub fn log_sequence(name: &str) -> Option<u64> {
     let (prefix, time) = name.strip_suffix(".txt")?.rsplit_once('_')?;
     let (prefix, date) = prefix.rsplit_once('_')?;
@@ -252,7 +253,7 @@ fn open_plain_subdir(dir: &Dir, name: &str) -> io::Result<Dir> {
     dir.open_dir(name)
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct Artifact {
     pub id: String,
     pub bytes: u64,

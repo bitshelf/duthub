@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 /// Sliding window for automatic restarts.
-pub const RESTART_WINDOW: Duration = Duration::from_secs(10 * 60);
+pub const RESTART_WINDOW: Duration = Duration::from_mins(10);
 /// Maximum automatic restarts allowed inside [`RESTART_WINDOW`].
 pub const MAX_RESTARTS_PER_WINDOW: usize = 3;
 /// First restart delay; the following delays double up to [`MAX_RESTART_DELAY`].
@@ -32,6 +32,7 @@ impl Default for RestartBudget {
 }
 
 impl RestartBudget {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             window: RESTART_WINDOW,
@@ -67,7 +68,10 @@ impl RestartBudget {
         if self.delay_step >= self.limit {
             return None;
         }
-        let multiplier = 1u32.checked_shl(self.delay_step as u32).unwrap_or(u32::MAX);
+        let multiplier = u32::try_from(self.delay_step)
+            .ok()
+            .and_then(|shift| 1u32.checked_shl(shift))
+            .unwrap_or(u32::MAX);
         self.delay_step += 1;
         Some(
             INITIAL_RESTART_DELAY
@@ -77,6 +81,7 @@ impl RestartBudget {
     }
 
     /// Restarts admitted inside the current window (diagnostics/tests).
+    #[must_use]
     pub fn restarts_in_window(&self, now: Instant) -> usize {
         self.attempts
             .iter()

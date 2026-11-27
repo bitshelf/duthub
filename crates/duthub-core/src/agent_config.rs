@@ -42,6 +42,7 @@ pub const RESERVED_ENV_KEYS: &[&str] = &[
 ];
 
 /// Case-insensitive membership test for [`RESERVED_ENV_KEYS`].
+#[must_use]
 pub fn is_reserved_env_key(key: &str) -> bool {
     let key = key.trim();
     RESERVED_ENV_KEYS
@@ -49,24 +50,15 @@ pub fn is_reserved_env_key(key: &str) -> bool {
         .any(|reserved| reserved.eq_ignore_ascii_case(key))
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AgentConfigError {
+    #[error("Agent 配置 I/O 失败: {0}")]
     Io(String),
+    #[error("Agent 配置损坏: {0}")]
     Parse(String),
+    #[error("Agent 配置无效: {0}")]
     Invalid(String),
 }
-
-impl std::fmt::Display for AgentConfigError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AgentConfigError::Io(error) => write!(formatter, "Agent 配置 I/O 失败: {error}"),
-            AgentConfigError::Parse(error) => write!(formatter, "Agent 配置损坏: {error}"),
-            AgentConfigError::Invalid(error) => write!(formatter, "Agent 配置无效: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for AgentConfigError {}
 
 /// Agent 接入形态（本轮只实现 ACP；`cli` 仅存储并明确拒绝启动）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +69,7 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             AgentKind::Acp => "ACP",
@@ -130,6 +123,7 @@ fn default_trust_level() -> String {
 
 impl AgentDefinition {
     /// 默认 goose 条目（`program = null`，解析到下载安装或 PATH 上的 goose）。
+    #[must_use]
     pub fn goose() -> Self {
         Self {
             id: DEFAULT_AGENT_ID.into(),
@@ -146,6 +140,7 @@ impl AgentDefinition {
         }
     }
 
+    #[must_use]
     pub fn is_goose(&self) -> bool {
         self.id == DEFAULT_AGENT_ID
     }
@@ -184,6 +179,7 @@ impl Default for AgentsFile {
 }
 
 impl AgentsFile {
+    #[must_use]
     pub fn agent(&self, id: &str) -> Option<&AgentDefinition> {
         let id = id.trim();
         self.agents.iter().find(|agent| agent.id == id)
@@ -194,6 +190,7 @@ impl AgentsFile {
         self.agents.iter_mut().find(|agent| agent.id == id)
     }
 
+    #[must_use]
     pub fn goose(&self) -> Option<&AgentDefinition> {
         self.agent(DEFAULT_AGENT_ID)
     }
@@ -211,14 +208,17 @@ impl AgentsFile {
 }
 
 /// 默认注册表（goose）。
+#[must_use]
 pub fn default_agents() -> AgentsFile {
     AgentsFile::default()
 }
 
+#[must_use]
 pub fn agents_path(work_dir: &Path) -> PathBuf {
     work_dir.join(AGENTS_FILE_NAME)
 }
 
+#[must_use]
 pub fn agent_bindings_path(work_dir: &Path) -> PathBuf {
     work_dir.join(AGENT_BINDINGS_FILE_NAME)
 }
@@ -366,6 +366,7 @@ fn validate_sha256(expected: &str) -> Result<(), AgentConfigError> {
 }
 
 /// keyring 条目名：`acp/<agent id>/env/<KEY>`（service 固定 `duthub`）。
+#[must_use]
 pub fn agent_env_entry(agent_id: &str, key: &str) -> String {
     format!("acp/{agent_id}/env/{key}")
 }
@@ -520,6 +521,7 @@ impl Default for AgentBindingsFile {
 
 impl AgentBindingsFile {
     /// 该 DUT 的 Agent id；未配置/空白回退默认 goose。
+    #[must_use]
     pub fn agent_id_for(&self, dut_id: &str) -> String {
         self.bindings
             .get(dut_id.trim())
@@ -542,6 +544,7 @@ impl AgentBindingsFile {
         }
     }
 
+    #[must_use]
     pub fn is_enabled(&self, dut_id: &str) -> bool {
         let dut_id = dut_id.trim();
         self.enabled.get(dut_id).copied().unwrap_or(false)
@@ -706,7 +709,7 @@ mod tests {
         assert!(matches!(error, AgentConfigError::Parse(_)), "{error}");
         let backups: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|entry| entry.ok())
+            .filter_map(Result::ok)
             .filter(|entry| {
                 entry
                     .file_name()
@@ -858,7 +861,7 @@ mod tests {
         assert!(load_agent_bindings(&dir).is_err());
         let backups = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|entry| entry.ok())
+            .filter_map(Result::ok)
             .filter(|entry| {
                 entry
                     .file_name()

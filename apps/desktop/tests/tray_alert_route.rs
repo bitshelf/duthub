@@ -14,7 +14,6 @@
 //! ```
 
 #![cfg(windows)]
-#![expect(clippy::undocumented_unsafe_blocks, reason = "Win32 tray test harness")]
 
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -57,6 +56,9 @@ struct TestWindow {
 
 impl TestWindow {
     fn create() -> Self {
+        // SAFETY: Registers a test window class with static UTF-16 names and a
+        // matching `system` ABI wndproc, creates an owned top-level window on the
+        // current thread, and shows it.
         let window = unsafe {
             let module = GetModuleHandleW(PCWSTR::null()).expect("GetModuleHandleW");
             let hinst = windows::Win32::Foundation::HINSTANCE(module.0);
@@ -104,6 +106,7 @@ impl TestWindow {
         let deadline = Instant::now() + duration;
         loop {
             let mut msg = MSG::default();
+            // SAFETY: Pumps queued Win32 messages for windows owned by the current thread.
             unsafe {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     let _ = TranslateMessage(&msg);
@@ -120,12 +123,19 @@ impl TestWindow {
 
 impl Drop for TestWindow {
     fn drop(&mut self) {
+        // SAFETY: `self.hwnd` is exclusively owned by `TestWindow` and destroyed once.
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
     }
 }
 
+/// Test window procedure for the hidden alert-route host window.
+///
+/// # Safety
+///
+/// Invoked only by the Windows message dispatcher with valid Win32 window
+/// procedure arguments.
 unsafe extern "system" fn test_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -134,6 +144,7 @@ unsafe extern "system" fn test_wndproc(
 ) -> windows::Win32::Foundation::LRESULT {
     match msg {
         WM_DESTROY => windows::Win32::Foundation::LRESULT(0),
+        // SAFETY: Forwards unhandled messages to Win32's default window procedure.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }

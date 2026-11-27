@@ -50,6 +50,7 @@ pub const HOLD_SECS: Duration = Duration::from_secs(300);
 /// Never returns `Duration::ZERO`. Out-of-range and `None` values fall back to
 /// [`DEFAULT_EPHEMERAL_IDLE_SECS`] instead of clamping to one second: a
 /// hand-edited typo must not turn into aggressive reclaim.
+#[must_use]
 pub fn effective_idle(capture: &CaptureSettings) -> Duration {
     let secs = capture
         .idle_secs
@@ -62,6 +63,7 @@ pub fn effective_idle(capture: &CaptureSettings) -> Duration {
 ///
 /// Called by the settings action only, never from `persist_settings`: an
 /// invalid idle value must not block unrelated settings from saving.
+#[must_use]
 pub fn validate_idle_secs(value: u32) -> Option<u32> {
     (IDLE_MIN_SECS..=IDLE_MAX_SECS)
         .contains(&value)
@@ -80,6 +82,7 @@ pub fn validate_idle_secs(value: u32) -> Option<u32> {
 /// `ffplay` and `listen_ip` are preserved verbatim: there is no `ffplay` tool
 /// id, and the sibling-file rule stays in `media.rs`. `idle_secs` rides along
 /// untouched.
+#[must_use]
 pub fn resolved_capture_settings_in(
     base: &CaptureSettings,
     tools_root: Option<&Path>,
@@ -94,6 +97,7 @@ pub fn resolved_capture_settings_in(
 
 /// [`resolved_capture_settings_in`] anchored at
 /// `tool_resolver::config_tools_root()` (the exe-sibling `.duthub/tools`).
+#[must_use]
 pub fn resolved_capture_settings(base: &CaptureSettings) -> CaptureSettings {
     match tool_resolver::config_tools_root() {
         Some(root) => resolved_capture_settings_in(base, Some(&root)),
@@ -114,6 +118,7 @@ const PNG_HEADER_LEN: usize = 24;
 /// Returns `None` for anything that is not a PNG header with non-zero
 /// dimensions (truncated, wrong signature, wrong first chunk). Callers omit
 /// `width`/`height` instead of fabricating values.
+#[must_use]
 pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < PNG_HEADER_LEN {
         return None;
@@ -127,10 +132,11 @@ pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// Size of a regular file, or `None` when it is missing / not a file.
+#[must_use]
 pub fn artifact_bytes(path: &Path) -> Option<u64> {
     std::fs::metadata(path)
         .ok()
-        .filter(|metadata| metadata.is_file())
+        .filter(std::fs::Metadata::is_file)
         .map(|metadata| metadata.len())
 }
 
@@ -197,12 +203,14 @@ pub enum DemandKind {
 
 impl DemandKind {
     /// Pins never expire on their own.
+    #[must_use]
     pub fn is_pin(self) -> bool {
         matches!(self, Self::Manual)
     }
 
     /// Holds must be acquired through [`DemandEntry::acquire_hold`] so they
     /// expire even when the holder disappears silently.
+    #[must_use]
     pub fn is_hold(self) -> bool {
         matches!(self, Self::ExternalPreview | Self::CopyUrl)
     }
@@ -244,7 +252,7 @@ pub struct DemandEntry {
     /// Distinguishes "was leased, now empty" (interactive → `StopNow`) from a
     /// never-leased entry (`NotLeased`).
     released_empty: bool,
-    /// True when the session was created solely by an AgentOp (ephemeral).
+    /// True when the session was created solely by an `AgentOp` (ephemeral).
     pub ephemeral: bool,
     /// Mirrored from `Capture::is_recording()` on every tick: a recording
     /// (manual or Agent) pins the session exactly like `DemandKind::Manual`.
@@ -258,6 +266,7 @@ pub struct DemandEntry {
 
 impl DemandEntry {
     /// Empty ledger; `ephemeral = true` for Agent-opened sessions.
+    #[must_use]
     pub fn new(ephemeral: bool) -> Self {
         Self {
             ephemeral,
@@ -331,12 +340,14 @@ impl DemandEntry {
     }
 
     /// Whether a `Manual` lease is held. Expired holds are never pins.
+    #[must_use]
     pub fn has_pin(&self) -> bool {
         self.leases.values().any(|kind| kind.is_pin())
     }
 
     /// Whether the raw lease map is empty. Expired-but-unswept holds still
     /// count here; `decide` is the expiry-aware query.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.leases.is_empty()
     }
@@ -362,6 +373,7 @@ impl DemandEntry {
     ///
     /// There is no time-based unlock for a recording: only `recordStop` or
     /// `stop_capture` clears it. Recording length itself has no upper bound.
+    #[must_use]
     pub fn decide(&self, now: Instant, idle: Duration) -> ReclaimDecision {
         if self.has_pin() || self.recording || self.agent_recording.is_some() {
             return ReclaimDecision::Pinned;

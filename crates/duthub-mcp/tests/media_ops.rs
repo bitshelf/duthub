@@ -759,7 +759,7 @@ async fn bound_listener_rejects_cross_dut_capture() {
         error.message.contains("UNAUTHORIZED"),
         "cross-DUT capture must be denied by the bound listener: {error}"
     );
-    assert!(state.submitted().is_empty());
+    assert_eq!(state.submitted(), [] as [Submitted; 0]);
 
     // The bound DUT itself still works through the same listener.
     let error = call_error(

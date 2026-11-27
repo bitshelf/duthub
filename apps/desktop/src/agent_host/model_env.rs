@@ -34,6 +34,7 @@ impl fmt::Debug for GooseBinding {
 
 impl GooseBinding {
     /// 脱敏后的显示值（UI/日志可用）。
+    #[must_use]
     pub fn redacted_debug(&self) -> String {
         format!(
             "{} · {} · {}",
@@ -206,9 +207,10 @@ fn append_skipped(message: String, skipped: &[String]) -> String {
 
 /// F19：产品协议白名单与「Agent 模型」的 API 格式选项保持一致。
 ///
-/// OpenAI 兼容族（含 DeepSeek/Qwen 别名）与 Anthropic 由 `goose_env` 直接支持；
+/// `OpenAI` 兼容族（含 DeepSeek/Qwen 别名）与 Anthropic 由 `goose_env` 直接支持；
 /// Gemini 尚无产品接线（UI 不提供），legacy `agent.provider=gemini` 也显式拒绝，
 /// 避免「UI 禁用但 legacy 可进入」。
+#[must_use]
 pub fn protocol_supported(provider: Provider) -> bool {
     !matches!(provider, Provider::Gemini)
 }
@@ -224,7 +226,7 @@ fn ensure_protocol_supported(provider: Provider) -> Result<(), String> {
 }
 
 /// F19：Host 启动前归一化绑定：trim 所有字段，并校验协议、Base URL、模型与密钥。
-pub fn normalize_binding(binding: GooseBinding) -> Result<GooseBinding, String> {
+pub fn normalize_binding(binding: &GooseBinding) -> Result<GooseBinding, String> {
     ensure_protocol_supported(binding.provider)?;
     let base_url = if binding.base_url.trim().is_empty() {
         binding.provider.default_base().to_owned()
@@ -277,7 +279,7 @@ fn build_binding(
 
 /// 生成 goose 需要的环境变量（不含继承环境；调用方用白名单叠加）。
 ///
-/// 路径收敛要点（**不是 OS 强制边界**；受限令牌 / AppContainer 仍 deferred）：
+/// 路径收敛要点（**不是 OS 强制边界**；受限令牌 / `AppContainer` 仍 deferred）：
 /// - `GOOSE_PATH_ROOT` 固定到每 DUT 目录，config/sessions 不落用户主目录；
 /// - `GOOSE_DISABLE_KEYRING=1`：goose 默认会尝试系统 keyring，在无交互会话中
 ///   可能无限阻塞；duthub 的模型密钥只经环境变量注入，不落 goose 配置。
@@ -368,6 +370,7 @@ fn normalize_base(provider: Provider, base_url: &str) -> String {
 /// `validate_extension_results`（要求恰好一个 duthub）按 fail-closed 拒绝，表现为
 /// 会话停在 Failed。工具面校验不放松，这里把后来新增的内置扩展一并关掉；goose
 /// 再新增内置扩展时应同步本表与校验测试（AGENTS #62）。
+#[must_use]
 pub fn goose_config_yaml() -> &'static str {
     "# Managed by duthub. Do not edit: rewritten on every session start.\n\
 extensions:\n\
@@ -556,7 +559,7 @@ mod tests {
 
     #[test]
     fn normalize_binding_trims_and_rejects_incomplete_values() {
-        let binding = normalize_binding(GooseBinding {
+        let binding = normalize_binding(&GooseBinding {
             provider: Provider::Openai,
             base_url: "  https://api.example.com/v1/  ".into(),
             model: "  model-a  ".into(),
@@ -588,7 +591,7 @@ mod tests {
             },
         ] {
             assert!(
-                normalize_binding(broken).is_err(),
+                normalize_binding(&broken).is_err(),
                 "must reject incomplete or unsupported bindings"
             );
         }

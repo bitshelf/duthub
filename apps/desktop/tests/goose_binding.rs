@@ -1,6 +1,6 @@
 //! F7/F11/F19：模型绑定选择 + 会话恢复回退回归。
 //!
-//! - 双 provider：显式选中 B 必须使用 B 的 base_url/model/key（不按启用顺序）；
+//! - 双 provider：显式选中 B 必须使用 B 的 `base_url/model/key（不按启用顺序`）；
 //! - Host 启动前 trim/校验绑定（空字段在 spawn 前拒绝）；
 //! - 有 session-id 且 Agent 支持 loadSession 时恢复；stale/失败回退新会话并提示
 //!   「已降级为新会话」。
@@ -200,7 +200,7 @@ fn selected_provider_b_wins_with_its_own_endpoint_model_and_key() {
 
 #[test]
 fn host_start_normalizes_binding_and_rejects_blank_fields() {
-    let normalized = model_env::normalize_binding(GooseBinding {
+    let normalized = model_env::normalize_binding(&GooseBinding {
         provider: Provider::Openai,
         base_url: "  https://api.example.com/v1/  ".into(),
         model: "  model-a  ".into(),
@@ -260,8 +260,7 @@ fn stale_session_id_falls_back_to_new_session_with_degraded_note() {
         "回退新会话后未就绪：{:?} stderr={}",
         host.view("dut-stale").map(|view| view.status()),
         host.view("dut-stale")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
 
     let view = host.view("dut-stale").unwrap();
@@ -332,8 +331,7 @@ fn stored_session_id_is_resumed_when_agent_supports_load() {
         second.view("dut-resume").map(|view| view.status()),
         second
             .view("dut-resume")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     let view = second.view("dut-resume").unwrap();
     assert_eq!(

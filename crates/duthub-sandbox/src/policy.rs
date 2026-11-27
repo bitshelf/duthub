@@ -42,9 +42,13 @@ pub enum NetworkPolicy {
 
 /// UI, clipboard, and input-injection isolation policy mapped to MXC `UiPolicy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "1:1 mirror of mxc-sdk UiPolicy capability flags"
+)]
 pub struct UiPolicy {
     /// When `true`, blocks Win32k system calls (`UiPolicy.disable = true`).
-    /// Keep `false` for Windows runtimes (such as PowerShell / WinHttp /
+    /// Keep `false` for Windows runtimes (such as PowerShell / `WinHttp` /
     /// GUI-linked tools) that fail DLL init when Win32k is disabled; clipboard,
     /// input injection, desktop, and system-settings isolation remain enforced.
     pub block_win32k: bool,
@@ -55,6 +59,7 @@ pub struct UiPolicy {
 
 impl UiPolicy {
     /// Strictest UI isolation including blocking Win32k syscalls.
+    #[must_use]
     pub const fn strict() -> Self {
         Self {
             block_win32k: true,
@@ -119,6 +124,7 @@ impl SandboxPolicy {
 
     /// Policy for an Agent host process (`goose`, CLI profiles): cell writable,
     /// host secrets and sibling DUTs denied, loopback + outbound network allowed.
+    #[must_use]
     pub fn agent_cell(cell: &CellSpec, allowed_exe_dir: Option<&Path>) -> Self {
         Self {
             readable: Vec::new(),
@@ -135,6 +141,7 @@ impl SandboxPolicy {
 
     /// Policy for untrusted script execution: cell writable, protected paths
     /// denied, zero network (loopback included), UI isolated.
+    #[must_use]
     pub fn script_cell(cell: &CellSpec) -> Self {
         Self {
             readable: Vec::new(),
@@ -149,6 +156,7 @@ impl SandboxPolicy {
         }
     }
 
+    #[must_use]
     pub fn timeout_or_default(&self) -> Duration {
         if self.timeout.is_zero() {
             DEFAULT_TIMEOUT
@@ -157,6 +165,7 @@ impl SandboxPolicy {
         }
     }
 
+    #[must_use]
     pub fn max_output_or_default(&self) -> usize {
         if self.max_output_bytes == 0 {
             DEFAULT_OUTPUT_BYTES
@@ -208,39 +217,24 @@ pub struct ExecResult {
 }
 
 /// Fail-closed sandbox error variants (English technical messages per crate policy).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     /// No supported MXC containment backend is available on this host.
+    #[error("sandbox backend unavailable: {0}")]
     Unsupported(String),
     /// The scope, paths, request, or policy violated validation bounds.
+    #[error("sandbox policy rejected: {0}")]
     PolicyRejected(String),
     /// Container directory or environment setup failed before launch.
+    #[error("sandbox setup failed: {0}")]
     Setup(String),
     /// The MXC engine failed to start the containerized process.
+    #[error("sandbox spawn failed: {0}")]
     Spawn(String),
     /// Waiting for or collecting output from the running container failed.
+    #[error("sandbox execution failed: {0}")]
     Execution(String),
 }
-
-impl std::fmt::Display for SandboxError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SandboxError::Unsupported(reason) => {
-                write!(formatter, "sandbox backend unavailable: {reason}")
-            }
-            SandboxError::PolicyRejected(reason) => {
-                write!(formatter, "sandbox policy rejected: {reason}")
-            }
-            SandboxError::Setup(reason) => write!(formatter, "sandbox setup failed: {reason}"),
-            SandboxError::Spawn(reason) => write!(formatter, "sandbox spawn failed: {reason}"),
-            SandboxError::Execution(reason) => {
-                write!(formatter, "sandbox execution failed: {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SandboxError {}
 
 impl From<std::io::Error> for SandboxError {
     fn from(error: std::io::Error) -> Self {
@@ -435,19 +429,23 @@ impl ScratchLayout {
         Self { root: root.into() }
     }
 
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    #[must_use]
     pub fn temp(&self) -> PathBuf {
         self.root.join("tmp")
     }
 
+    #[must_use]
     pub fn home(&self) -> PathBuf {
         self.root.join("home")
     }
 
     /// Directories that must exist before launching a command.
+    #[must_use]
     pub fn required_dirs(&self) -> Vec<PathBuf> {
         let home = self.home();
         vec![
@@ -488,8 +486,7 @@ impl CellSpec {
         let dut_key = root
             .parent()
             .and_then(Path::file_name)
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|name| name.to_string_lossy().into_owned());
         Ok(Self {
             scope: scope.to_owned(),
             work_dir,
@@ -510,12 +507,9 @@ impl CellSpec {
         }
         let dut_key = root
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|name| name.to_string_lossy().into_owned());
         let work_dir = root
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.clone());
+            .parent().map_or_else(|| root.clone(), Path::to_path_buf);
         Ok(Self {
             scope: scope.to_owned(),
             work_dir,
@@ -538,7 +532,13 @@ impl CellSpec {
                 work_dir.display()
             )));
         }
-        let dut_key: String = dut_id.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let dut_key = dut_id
+            .bytes()
+            .fold(String::with_capacity(dut_id.len() * 2), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            });
         let scope = if dut_key.len() + "dut-".len() <= SCOPE_MAX_CHARS {
             format!("dut-{dut_key}")
         } else {
@@ -557,32 +557,39 @@ impl CellSpec {
         })
     }
 
+    #[must_use]
     pub fn scope(&self) -> &str {
         &self.scope
     }
 
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    #[must_use]
     pub fn work_dir(&self) -> &Path {
         &self.work_dir
     }
 
+    #[must_use]
     pub fn dut_key(&self) -> &str {
         &self.dut_key
     }
 
+    #[must_use]
     pub fn layout(&self) -> ScratchLayout {
         ScratchLayout::new(&self.root)
     }
 
+    #[must_use]
     pub fn required_dirs(&self) -> Vec<PathBuf> {
         self.layout().required_dirs()
     }
 
     /// Host secrets, configuration, evidence, and sibling DUT directories that
     /// this cell must never read.
+    #[must_use]
     pub fn protected_paths(&self) -> Vec<PathBuf> {
         self.protected_paths_excluding(None)
     }
@@ -724,7 +731,7 @@ fn quote_arg(arg: &str) -> String {
         match ch {
             '\\' => backslashes += 1,
             '"' => {
-                for _ in 0..(backslashes * 2 + 1) {
+                for _ in 0..=(backslashes * 2) {
                     out.push('\\');
                 }
                 out.push('"');
@@ -762,15 +769,13 @@ fn quote_arg(arg: &str) -> String {
 pub fn windows_powershell() -> PathBuf {
     std::env::var_os("SystemRoot")
         .map(PathBuf::from)
-        .filter(|root| root.is_absolute())
-        .map(|root| {
+        .filter(|root| root.is_absolute()).map_or_else(|| {
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        }, |root| {
             root.join("System32")
                 .join("WindowsPowerShell")
                 .join("v1.0")
                 .join("powershell.exe")
-        })
-        .unwrap_or_else(|| {
-            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
         })
 }
 
@@ -1003,6 +1008,7 @@ const SYSTEM_PATHS_FOR_RECURSIVE_DELETE: &[&str] = &[
 ];
 
 /// Defense-in-depth denylist for destructive host commands checked before spawn.
+#[must_use]
 pub fn script_denial_reason(script: &str) -> Option<(&'static str, &'static str)> {
     let lowered = script.to_lowercase();
     for restriction in SCRIPT_RESTRICTIONS {

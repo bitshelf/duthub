@@ -43,6 +43,7 @@ pub struct A2aEndpointView {
 }
 
 /// Project the per-DUT config + live runtime status onto display fields.
+#[must_use]
 pub fn a2a_endpoint_view(config: &DutA2aConfig, status: &A2aStatus) -> A2aEndpointView {
     match status {
         A2aStatus::Running { endpoint } => {
@@ -165,6 +166,7 @@ pub enum CleanupStep {
 
 impl CleanupStep {
     /// Stable key persisted inside `pending-cleanup.json` (never renumber).
+    #[must_use]
     pub fn key(self) -> &'static str {
         match self {
             CleanupStep::StripMcp => "strip_mcp",
@@ -285,11 +287,13 @@ pub struct PendingCleanupEntry {
 }
 
 /// `<work_dir>/agent/pending-cleanup.json`.
+#[must_use]
 pub fn pending_cleanup_path(work_dir: &Path) -> PathBuf {
     work_dir.join("agent").join("pending-cleanup.json")
 }
 
 /// Load the journal; a missing file is an empty list (first-run semantics).
+#[must_use]
 pub fn load_pending_cleanup(work_dir: &Path) -> Vec<PendingCleanupEntry> {
     let Ok(raw) = std::fs::read_to_string(pending_cleanup_path(work_dir)) else {
         return Vec::new();
@@ -327,8 +331,7 @@ pub fn append_pending_cleanup(
         reason: reason.to_owned(),
         recorded_at_unix_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         env_keys: Vec::new(),
     });
     save_pending_cleanup(work_dir, &entries)
@@ -347,8 +350,7 @@ pub fn append_agent_env_pending_cleanup(
     let mut entries = load_pending_cleanup(work_dir);
     let recorded_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     if let Some(entry) = entries.iter_mut().find(|entry| {
         entry.dut_id == agent_id && entry.step == CleanupStep::DeleteAgentEnvKeys.key()
     }) {
@@ -372,6 +374,7 @@ pub fn append_agent_env_pending_cleanup(
 /// Per-DUT agent directory for probing/deletion, **without creating it**
 /// (`store::agent_dut_dir` would mkdir as a side effect; rendering a badge or
 /// removing a DUT must not invent directories).
+#[must_use]
 pub fn agent_dut_probe_path(work_dir: &Path, dut_id: &str) -> Option<PathBuf> {
     let key = duthub_core::store::agent_dut_key(dut_id)?;
     Some(work_dir.join("agent").join("dut").join(key))
@@ -396,6 +399,7 @@ pub fn delete_agent_dir_idempotent(work_dir: &Path, dut_id: &str) -> Result<(), 
 /// field names an Agent, never a DUT, so the DUT steps must not run.
 /// Fully-successful entries are removed from the journal; entries that
 /// failed again are kept and returned as human-readable failure strings.
+#[must_use]
 pub fn retry_pending_cleanup(work_dir: &Path) -> (usize, Vec<String>) {
     let entries = load_pending_cleanup(work_dir);
     if entries.is_empty() {
@@ -479,6 +483,7 @@ pub struct AgentEditorDraft {
 /// Render args as a JSON array for the editor input. Round-trips through
 /// [`parse_args_json`], so arguments containing spaces or quotes survive
 /// edit → save without whitespace splitting ever seeing them.
+#[must_use]
 pub fn args_to_json(args: &[String]) -> String {
     serde_json::to_string(args).unwrap_or_else(|_| "[]".to_owned())
 }
@@ -600,6 +605,7 @@ pub enum EnvValueState {
 }
 
 /// Map a keyring read result onto the editor state machine.
+#[must_use]
 pub fn env_value_source(read: &Result<Option<String>, String>) -> EnvValueState {
     match read {
         // An empty value counts as "not set": launch treats it the same way.
@@ -678,6 +684,7 @@ pub fn validate_agent_toggle(file: &AgentsFile, agent_id: &str) -> Result<(), St
 /// per-DUT Agent dropdown — a change would not affect the running process.
 /// A missing session renders as `Stopped` (terminal), so the selector stays
 /// editable.
+#[must_use]
 pub fn running_agent_selector_disabled(status: &SessionStatus) -> bool {
     !status.is_terminal()
 }
@@ -685,6 +692,7 @@ pub fn running_agent_selector_disabled(status: &SessionStatus) -> bool {
 /// One-line display of the *actually launched* agent for the running panel.
 /// Shows the launch spec's agent id (never the pending dropdown selection);
 /// `None` means the worker has not recorded a spec yet (still starting).
+#[must_use]
 pub fn running_launch_line(launch: Option<&AgentLaunchSpec>) -> String {
     match launch {
         Some(spec) => {
@@ -718,6 +726,7 @@ pub enum SandboxBoundaryProof {
 }
 
 /// Derive [`SandboxBoundaryProof`] directly from a real [`duthub_sandbox::SandboxStatus`].
+#[must_use]
 pub fn sandbox_boundary_proof(status: &duthub_sandbox::SandboxStatus) -> SandboxBoundaryProof {
     if status.supports_agent_isolation() {
         SandboxBoundaryProof::VerifiedByBackend
@@ -745,6 +754,7 @@ pub enum SandboxBadgeState {
 }
 
 /// Project [`duthub_sandbox::SandboxStatus`] onto a locale-independent badge state.
+#[must_use]
 pub fn sandbox_badge_state(status: &duthub_sandbox::SandboxStatus) -> SandboxBadgeState {
     if status.supports_agent_isolation() {
         SandboxBadgeState::Ready {
@@ -766,6 +776,7 @@ pub fn sandbox_badge_state(status: &duthub_sandbox::SandboxStatus) -> SandboxBad
 ///
 /// `os_sandboxed` is shown as verified only with a backend boundary proof.
 /// Without one it downgrades to unverified without echoing raw `os_sandboxed`.
+#[must_use]
 pub fn effective_trust_label(trust_level: &str, proof: SandboxBoundaryProof) -> &'static str {
     match trust_level.trim() {
         "os_sandboxed" if proof == SandboxBoundaryProof::VerifiedByBackend => "OS 沙箱（已验证）",
@@ -787,6 +798,7 @@ pub fn effective_trust_label(trust_level: &str, proof: SandboxBoundaryProof) -> 
 /// previous frame. Follow only when new entries arrived; when the user
 /// scrolled up to read history the caller's near-bottom check keeps the
 /// viewport where it is.
+#[must_use]
 pub fn should_follow(seen: u64, total: u64) -> bool {
     total > seen
 }
@@ -794,6 +806,7 @@ pub fn should_follow(seen: u64, total: u64) -> bool {
 /// Decide whether the deferred prompt-clear may wipe the editor: only when
 /// the editor still holds exactly the sent text. Anything typed (or pasted)
 /// between enqueue and the deferred clear must survive.
+#[must_use]
 pub fn should_clear_prompt(current_value: &str, sent: &str) -> bool {
     current_value == sent
 }
@@ -881,6 +894,7 @@ pub enum AuthenticodeBadge {
 }
 
 /// Project the source + signature onto the badge variant.
+#[must_use]
 pub fn authenticode_badge(source: ProgramSource, signature: &str) -> AuthenticodeBadge {
     match source {
         ProgramSource::External => AuthenticodeBadge::ExternalUnverified,
@@ -899,6 +913,7 @@ pub fn authenticode_badge(source: ProgramSource, signature: &str) -> Authenticod
 /// signature chain, so the honest projection is [`ProgramSource::External`].
 /// `_selected_has_external_program` is retained for source compatibility with
 /// `pages.rs`, which still passes the per-DUT selection.
+#[must_use]
 pub fn program_source(
     launch: Option<&AgentLaunchSpec>,
     _selected_has_external_program: bool,
@@ -919,6 +934,7 @@ pub fn program_source(
 /// running session's credential. A session without a credential id never
 /// inherits unattributed events (GUI writes, stdio admin) — an empty list is
 /// the honest empty state.
+#[must_use]
 pub fn inspector_audit_events(
     recent: &[AuditEvent],
     credential_id: Option<&str>,
@@ -938,6 +954,7 @@ pub fn inspector_audit_events(
 /// Transcript System entries that record a permission denial. The host
 /// worker writes `AcpEvent::PermissionDenied` as 「已拒绝权限请求：{title}」;
 /// the Inspector lists them as the session's permission-denial evidence.
+#[must_use]
 pub fn permission_denial_entries(entries: &[TranscriptEntry]) -> Vec<String> {
     entries
         .iter()
@@ -955,6 +972,7 @@ pub fn permission_denial_entries(entries: &[TranscriptEntry]) -> Vec<String> {
 /// `.mcp.json` fragment for one per-DUT listener. The Bearer token is embedded
 /// verbatim: this text exists to be pasted into a client config, and the panel
 /// already shows the same token for copying.
+#[must_use]
 pub fn mcp_client_config(server_name: &str, url: &str, token: &str) -> String {
     let value = serde_json::json!({
         "mcpServers": {
@@ -973,6 +991,7 @@ pub fn mcp_client_config(server_name: &str, url: &str, token: &str) -> String {
 
 /// A2A client config: the discovery URL plus the Bearer header. The card URL
 /// is only produced while the per-DUT listener is actually running.
+#[must_use]
 pub fn a2a_client_config(card_url: &str, token: &str) -> String {
     let value = serde_json::json!({
         "agentCardUrl": card_url,
@@ -986,6 +1005,7 @@ pub fn a2a_client_config(card_url: &str, token: &str) -> String {
 
 /// Stable client-config key for one DUT: `duthub-<slug>` where the slug is the
 /// stable id lowercased with non-alphanumerics folded to single dashes.
+#[must_use]
 pub fn mcp_server_name(id: &str) -> String {
     let mut slug = String::new();
     for ch in id.chars() {

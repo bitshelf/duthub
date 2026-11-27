@@ -1,6 +1,6 @@
 //! F3/F4/F5/F8：goose 会话生命周期回归。
 //!
-//! - start→stop→立即 start 不得出现两个 goose（同 DUT 共享 GOOSE_PATH_ROOT）；
+//! - start→stop→立即 start 不得出现两个 goose（同 DUT 共享 `GOOSE_PATH_ROOT`）；
 //! - 失败/终止后可以重启；
 //! - stop 不在 UI 线程做 stdin I/O；
 //! - MCP 不可达时扩展校验拒绝（F1 负向）；
@@ -255,8 +255,7 @@ fn start_stop_restart_serializes_sessions() {
         "会话未就绪：{:?} {}",
         host.view("dut-life").map(|view| view.status()),
         host.view("dut-life")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     let first_session = host.view("dut-life").unwrap().session_id().unwrap();
 
@@ -473,7 +472,7 @@ fn kill_terminates_grandchild_process() {
 
     assert!(
         wait_until(Duration::from_secs(15), || {
-            std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0) > 0
+            std::fs::metadata(&marker).map_or(0, |m| m.len()) > 0
         }),
         "grandchild never wrote marker: {}",
         marker.display()
@@ -486,9 +485,9 @@ fn kill_terminates_grandchild_process() {
         "root process still alive after kill: {root}"
     );
     std::thread::sleep(Duration::from_millis(250));
-    let after_kill = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    let after_kill = std::fs::metadata(&marker).map_or(0, |m| m.len());
     std::thread::sleep(Duration::from_millis(600));
-    let later = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    let later = std::fs::metadata(&marker).map_or(0, |m| m.len());
     assert_eq!(
         after_kill, later,
         "grandchild kept writing after AcpClient::kill() ({after_kill} -> {later})"

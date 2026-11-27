@@ -22,12 +22,14 @@ use duthub_core::model::{DownloadProxyMode, ToolDownloadSettings};
 use duthub_tooldown::ProxyConfig;
 
 /// Directory holding downloaded tools: `<config dir>/tools/`.
+#[must_use]
 pub fn tools_root(config_dir: &Path) -> PathBuf {
     config_dir.join("tools")
 }
 
 /// The process config dir's tools root. `None` = the exe path is unresolvable;
 /// callers then fall through to the pre-existing explicit/PATH resolution.
+#[must_use]
 pub fn config_tools_root() -> Option<PathBuf> {
     duthub_core::store::data_dir()
         .ok()
@@ -37,12 +39,14 @@ pub fn config_tools_root() -> Option<PathBuf> {
 /// First executable of a valid downloaded install of `tool_id`, or `None`.
 /// Unknown tool id, missing install, corrupt manifest or missing executable
 /// files all land on `None` (fail open into the existing resolution).
+#[must_use]
 pub fn downloaded_executable_in(tools_root: &Path, tool_id: &str) -> Option<PathBuf> {
     let spec = duthub_tooldown::spec_by_id(tool_id)?;
     duthub_tooldown::installed_executable(tools_root, spec)
 }
 
 /// [`downloaded_executable_in`] anchored at the process config dir.
+#[must_use]
 pub fn downloaded_executable(tool_id: &str) -> Option<PathBuf> {
     downloaded_executable_in(&config_tools_root()?, tool_id)
 }
@@ -54,6 +58,7 @@ pub fn downloaded_executable(tool_id: &str) -> Option<PathBuf> {
 /// extracted from, so comparing them can never match. A corrupt manifest, an
 /// empty digest, or a manifest written before executable digests existed counts
 /// as not-installed (reinstall required).
+#[must_use]
 pub fn downloaded_install_in(tools_root: &Path, tool_id: &str) -> Option<(PathBuf, String)> {
     let spec = duthub_tooldown::spec_by_id(tool_id)?;
     let manifest =
@@ -72,6 +77,7 @@ pub fn downloaded_install_in(tools_root: &Path, tool_id: &str) -> Option<(PathBu
 }
 
 /// [`downloaded_install_in`] anchored at the process config dir.
+#[must_use]
 pub fn downloaded_install(tool_id: &str) -> Option<(PathBuf, String)> {
     downloaded_install_in(&config_tools_root()?, tool_id)
 }
@@ -82,6 +88,7 @@ pub fn downloaded_install(tool_id: &str) -> Option<(PathBuf, String)> {
 /// `%VAR%` expansion is never hijacked by a download. Public so the settings
 /// page's effective-path display classifies rows with the same predicate the
 /// resolver applies (single source of truth for the shadowing rule).
+#[must_use]
 pub fn downloads_shadow(configured: &str, tool_id: &str) -> bool {
     let trimmed = configured.trim();
     trimmed.is_empty() || trimmed.eq_ignore_ascii_case(tool_id)
@@ -91,6 +98,7 @@ pub fn downloads_shadow(configured: &str, tool_id: &str) -> bool {
 /// clients (`AdbClient::devices_l`, `HdcClient::list_targets`, `Shell::start`):
 /// the downloaded absolute path when it shadows, otherwise the configured
 /// value with the historical bare-name fallback.
+#[must_use]
 pub fn effective_spec_in(configured: &str, tool_id: &str, tools_root: &Path) -> String {
     if downloads_shadow(configured, tool_id)
         && let Some(path) = downloaded_executable_in(tools_root, tool_id)
@@ -106,6 +114,7 @@ pub fn effective_spec_in(configured: &str, tool_id: &str, tools_root: &Path) -> 
 }
 
 /// [`effective_spec_in`] anchored at the process config dir.
+#[must_use]
 pub fn effective_spec(configured: &str, tool_id: &str) -> String {
     let trimmed = configured.trim();
     match config_tools_root() {
@@ -118,6 +127,7 @@ pub fn effective_spec(configured: &str, tool_id: &str) -> String {
 /// The downloaded executable when it should run instead of PATH for this
 /// setting; `None` = keep the caller's existing resolution. Used by the media
 /// page's ffmpeg/ffplay lookup ahead of its PATH search.
+#[must_use]
 pub fn downloaded_preferred_in(
     configured: &str,
     tool_id: &str,
@@ -131,6 +141,7 @@ pub fn downloaded_preferred_in(
 }
 
 /// [`downloaded_preferred_in`] anchored at the process config dir.
+#[must_use]
 pub fn downloaded_preferred(configured: &str, tool_id: &str) -> Option<PathBuf> {
     downloaded_preferred_in(configured, tool_id, &config_tools_root()?)
 }
@@ -138,6 +149,7 @@ pub fn downloaded_preferred(configured: &str, tool_id: &str) -> Option<PathBuf> 
 /// Map the stored proxy policy onto the download kernel's client config.
 /// `Custom` passes the stored URL through verbatim: an unparsable URL fails
 /// tooldown's client build with `InvalidProxyUrl` (no silent rewrite here).
+#[must_use]
 pub fn proxy_config(download: &ToolDownloadSettings) -> ProxyConfig {
     match download.proxy.mode {
         DownloadProxyMode::Off => ProxyConfig::Off,

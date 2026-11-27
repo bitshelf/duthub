@@ -113,8 +113,7 @@ fn initialize_status(endpoint: SocketAddr, bearer: Option<&str>) -> u16 {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let auth_line = bearer
-        .map(|token| format!("Authorization: Bearer {token}\r\n"))
-        .unwrap_or_default();
+        .map_or_default(|token| format!("Authorization: Bearer {token}\r\n"));
     let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: {endpoint}\r\n{auth_line}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -142,7 +141,7 @@ async fn connect(
         .expect("client init")
 }
 
-fn call(name: &str, arguments: serde_json::Value) -> CallToolRequestParams {
+fn call(name: &str, arguments: &serde_json::Value) -> CallToolRequestParams {
     CallToolRequestParams::new(name.to_owned())
         .with_arguments(arguments.as_object().unwrap().clone())
 }
@@ -150,7 +149,7 @@ fn call(name: &str, arguments: serde_json::Value) -> CallToolRequestParams {
 async fn tool_error(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
     name: &str,
-    arguments: serde_json::Value,
+    arguments: &serde_json::Value,
 ) -> String {
     client
         .call_tool_once(call(name, arguments))
@@ -175,7 +174,7 @@ async fn zero_grant_general_token_cannot_read_files_or_logs() {
             json!({"dutId": "dut-a", "fileId": "trace.txt"}),
         ),
     ] {
-        let error = tool_error(&client, tool, arguments).await;
+        let error = tool_error(&client, tool, &arguments).await;
         assert!(error.contains("UNAUTHORIZED"), "{tool}: {error}");
     }
 
@@ -316,7 +315,7 @@ async fn evidence_scope_allows_dut_list_but_rejects_files_and_media() {
         ("media_streams", json!({"dutId": "dut-a"})),
         ("skill_export", json!({})),
     ] {
-        let error = tool_error(&client, tool, arguments).await;
+        let error = tool_error(&client, tool, &arguments).await;
         assert!(error.contains("EVIDENCE_SCOPE_ONLY"), "{tool}: {error}");
     }
 

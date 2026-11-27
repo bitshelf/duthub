@@ -14,21 +14,21 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 /// Current unix time in whole seconds.
+#[must_use]
 pub fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Current unix time in whole milliseconds — matches the precision fileloft's
 /// `expires_at` carries, so the GC sweep and the tus-layer expiry check agree
 /// instead of drifting by up to a second.
+#[must_use]
 pub fn now_epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Which tus operation is being authorized.
@@ -73,11 +73,13 @@ pub struct AuthContext<'a> {
 }
 
 /// Authorization failures mapped one-to-one onto HTTP statuses by the router.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
     /// 401 — missing or invalid token.
+    #[error("unauthorized")]
     Unauthorized,
     /// 403 — authenticated but not allowed.
+    #[error("forbidden: {0}")]
     Forbidden(String),
 }
 
@@ -94,6 +96,7 @@ pub trait UploadAuthorizer: Send + Sync {
 
 /// Fail-closed default used when the host provides no authorizer: every
 /// authenticated operation is rejected with 401, only OPTIONS stays anonymous.
+#[derive(Debug)]
 pub struct DenyAllAuthorizer;
 
 impl UploadAuthorizer for DenyAllAuthorizer {
@@ -114,6 +117,7 @@ pub struct StaticTokenAuthorizer {
 }
 
 impl StaticTokenAuthorizer {
+    #[must_use]
     pub fn new(scopes: HashMap<String, UploadScope>) -> Self {
         let entries = scopes
             .into_iter()

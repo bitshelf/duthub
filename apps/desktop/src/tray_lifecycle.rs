@@ -48,6 +48,7 @@ pub struct LifecycleState {
 
 impl LifecycleState {
     /// A visible window with or without a usable tray.
+    #[must_use]
     pub fn new(tray_ready: bool) -> Self {
         Self {
             tray_ready,
@@ -56,11 +57,13 @@ impl LifecycleState {
     }
 
     /// Same tray readiness in an explicit phase.
+    #[must_use]
     pub fn with_phase(self, phase: LifecyclePhase) -> Self {
         Self { phase, ..self }
     }
 
     /// Shutdown already latched: every further event is a no-op.
+    #[must_use]
     pub fn is_quitting(&self) -> bool {
         self.phase == LifecyclePhase::Quitting
     }
@@ -150,6 +153,7 @@ impl LifecycleTransition {
 }
 
 /// Evaluates one event. This is the whole policy of the window lifecycle.
+#[must_use]
 pub fn on_event(state: LifecycleState, event: LifecycleEvent) -> LifecycleTransition {
     // Once shutdown is latched nothing may bring a window back. The platform
     // close is allowed through by the gate itself (`prepare_main_window_close`
@@ -195,6 +199,7 @@ fn close_transition(state: LifecycleState) -> LifecycleTransition {
 /// through here so the order cannot drift between the decision and the
 /// executor. `DestroyMain` is the point of no return, so the inline preview is
 /// released first.
+#[must_use]
 pub fn actions_for_close_plan(plan: &[CloseStep]) -> Vec<LifecycleAction> {
     let mut actions = Vec::with_capacity(plan.len() + 1);
     for step in plan {
@@ -228,6 +233,7 @@ fn quit_actions() -> Vec<LifecycleAction> {
 /// The visible window is rendered by `render_root` (dialog), so `Dialog` needs
 /// no action here. `QueueOnly` keeps the alert queued. `Both` is a balloon
 /// plus a blink; `Tray` is either channel alone.
+#[must_use]
 pub fn alert_actions(presentation: AlertPresentation, count: u64) -> Vec<LifecycleAction> {
     match alert_route(presentation) {
         AlertRoute::Dialog | AlertRoute::Queue => Vec::new(),
@@ -255,6 +261,7 @@ pub fn alert_actions(presentation: AlertPresentation, count: u64) -> Vec<Lifecyc
 /// without queueing it, so the presentation policy's "quiet time only lets
 /// critical alerts through" would be impossible otherwise. Agent notices (not
 /// critical) keep the flag.
+#[must_use]
 pub fn balloon_notification(
     title: String,
     body: String,
@@ -436,8 +443,14 @@ mod tests {
 
     #[test]
     fn alert_actions_follow_the_presentation() {
-        assert!(alert_actions(AlertPresentation::InAppDialog, 2).is_empty());
-        assert!(alert_actions(AlertPresentation::QueueOnly, 2).is_empty());
+        assert_eq!(
+            alert_actions(AlertPresentation::InAppDialog, 2),
+            Vec::<LifecycleAction>::new()
+        );
+        assert_eq!(
+            alert_actions(AlertPresentation::QueueOnly, 2),
+            Vec::<LifecycleAction>::new()
+        );
         assert_eq!(
             alert_actions(AlertPresentation::BalloonAndFlash, 2),
             vec![

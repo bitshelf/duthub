@@ -8,29 +8,18 @@
 //! path separators or anything a filesystem would reinterpret.
 
 /// Publish-name / board-name validation failures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PublishError {
     /// Name violates single-component filename rules.
+    #[error("invalid name: {0:?}")]
     InvalidName(String),
     /// Windows reserved device name in any casing or stem form.
+    #[error("reserved device name: {0:?}")]
     ReservedDeviceName(String),
     /// Extension outside the configured whitelist.
+    #[error("extension not allowed: {0:?}")]
     ExtensionNotAllowed(String),
 }
-
-impl std::fmt::Display for PublishError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidName(name) => write!(f, "invalid name: {name:?}"),
-            Self::ReservedDeviceName(name) => write!(f, "reserved device name: {name:?}"),
-            Self::ExtensionNotAllowed(name) => {
-                write!(f, "extension not allowed: {name:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PublishError {}
 
 /// Base single-component rules shared by publish names and board names.
 fn base_filename_rules(name: &str) -> bool {

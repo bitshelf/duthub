@@ -408,7 +408,7 @@ mod windows {
             .len();
         assert!(first > 0, "grandchild never wrote marker.txt");
         std::thread::sleep(Duration::from_millis(800));
-        let second = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        let second = std::fs::metadata(&marker).map_or(0, |m| m.len());
         assert_eq!(
             first, second,
             "descendant survived container timeout and kept writing ({first} -> {second})"
@@ -422,7 +422,7 @@ mod windows {
         let too_long = "x".repeat(MAX_SCRIPT_CHARS + 1);
         match run_script(&fixture.cell, &fixture.policy, &too_long) {
             Err(SandboxError::PolicyRejected(reason)) => {
-                assert!(reason.contains("exceeds limit"), "{reason}")
+                assert!(reason.contains("exceeds limit"), "{reason}");
             }
             other => panic!("oversized script must be refused, got {other:?}"),
         }
@@ -438,7 +438,7 @@ mod windows {
             "Format-Volume -DriveLetter C",
         ) {
             Err(SandboxError::PolicyRejected(reason)) => {
-                assert!(reason.contains("prohibited"), "{reason}")
+                assert!(reason.contains("prohibited"), "{reason}");
             }
             other => panic!("destructive script must be refused, got {other:?}"),
         }

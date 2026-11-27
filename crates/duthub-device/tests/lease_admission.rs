@@ -143,11 +143,6 @@ fn agent_controlled_gui_write_denied_until_takeover() {
 /// GUI 路径放行；admit 失败不消费审批令牌（M10）。
 #[test]
 fn control_entry_lease_admission_gates_agent_actions() {
-    let (service, mgr, _sink) = service_with_lease("control-entry");
-    service
-        .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(120));
     // 记录型假后端：验证驱动只在 admit 放行后被调用
     #[derive(Default)]
     struct MockBackend {
@@ -177,6 +172,11 @@ fn control_entry_lease_admission_gates_agent_actions() {
             Err(duthub_core::DeviceError::Unsupported)
         }
     }
+    let (service, mgr, _sink) = service_with_lease("control-entry");
+    service
+        .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(120));
     let backend = Arc::new(MockBackend::default());
     let approval = Arc::new(ApprovalManager::new());
     let control = ControlService::new(Some(backend.clone()), approval.clone())
@@ -193,7 +193,7 @@ fn control_entry_lease_admission_gates_agent_actions() {
             reference_similarity: None,
             split_logs: false,
         },
-        adb: Default::default(),
+        adb: duthub_core::model::AdbConfig::default(),
         relay: RelayConfig::UsbSerial {
             host: String::new(),
             node: "COM25".into(),
@@ -209,10 +209,10 @@ fn control_entry_lease_admission_gates_agent_actions() {
         mcp: McpConfig::StreamableHttp {
             url: "http://127.0.0.1:8797/mcp".into(),
         },
-        a2a: Default::default(),
-        flash: Default::default(),
-        media: Default::default(),
-        heartbeat: Default::default(),
+        a2a: duthub_core::model::DutA2aConfig::default(),
+        flash: duthub_core::model::FlashConfig::default(),
+        media: duthub_core::model::DutMediaConfig::default(),
+        heartbeat: duthub_core::model::HeartbeatConfig::default(),
     });
     // GUI 会话在场 → Agent 控制动作被租约拒（INV-01 扩展到控制通道）
     let token = approval.issue("dut-a", "control.power", r#"{"on":true}"#);

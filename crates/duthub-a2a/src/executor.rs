@@ -1,7 +1,7 @@
-//! A2A executor: turns DataPart skill requests into evidence tool calls.
+//! A2A executor: turns `DataPart` skill requests into evidence tool calls.
 //!
 //! Contract (ADR-9):
-//! - input is a single DataPart `{skill, dutId?, args}`; TextPart-only
+//! - input is a single `DataPart` `{skill, dutId?, args}`; TextPart-only
 //!   messages, unknown skills, non-object args and cross-DUT requests fail
 //!   the task with `TASK_STATE_FAILED` + a policy reason (protocol-level
 //!   failure, not a transport error);
@@ -36,7 +36,7 @@ const DEDUP_CAP: usize = 4096;
 /// Poll interval while waiting inside the test-only delay window.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Client skill request carried in a DataPart (camelCase keys).
+/// Client skill request carried in a `DataPart` (camelCase keys).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SkillRequest {
@@ -135,7 +135,7 @@ impl CancelFlags {
             .remove(task_id);
     }
 
-    fn is_set(&self, flag: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+    fn is_set(flag: &std::sync::atomic::AtomicBool) -> bool {
         flag.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
@@ -154,6 +154,17 @@ pub struct DuthubExecutor {
     test_delay: Option<Duration>,
 }
 
+impl std::fmt::Debug for DuthubExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuthubExecutor")
+            .field("dut_id", &self.dut_id)
+            .field("ownership", &self.ownership)
+            .field("has_audit", &self.audit.is_some())
+            .field("test_delay", &self.test_delay)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DuthubExecutor {
     pub fn new(state: Arc<dyn McpState>, dut_id: impl Into<Arc<str>>) -> Self {
         Self {
@@ -168,6 +179,7 @@ impl DuthubExecutor {
     }
 
     /// Attach an audit sink so A2A skill requests emit structured audit lines.
+    #[must_use]
     pub fn with_audit(mut self, audit: Arc<AuditSink>) -> Self {
         self.audit = Some(audit);
         self
@@ -175,6 +187,7 @@ impl DuthubExecutor {
 
     /// **Test-only** hook: delay execution so a task stays `Working` and can
     /// be canceled. Never call from production code.
+    #[must_use]
     pub fn with_test_delay(mut self, delay: Duration) -> Self {
         self.test_delay = Some(delay);
         self
@@ -195,16 +208,18 @@ impl DuthubExecutor {
     }
 
     /// Ownership registry shared with the request authorizer.
+    #[must_use]
     pub fn ownership(&self) -> Arc<TaskOwnership> {
         self.ownership.clone()
     }
 
     /// The DUT this executor is bound to.
+    #[must_use]
     pub fn dut_id(&self) -> Arc<str> {
         self.dut_id.clone()
     }
 
-    fn status_event(&self, task_id: &str, context_id: &str, state: TaskState) -> StreamResponse {
+    fn status_event(task_id: &str, context_id: &str, state: TaskState) -> StreamResponse {
         StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.to_owned(),
             context_id: context_id.to_owned(),
@@ -217,7 +232,7 @@ impl DuthubExecutor {
         })
     }
 
-    fn failed_event(&self, task_id: &str, context_id: &str, reason: &str) -> StreamResponse {
+    fn failed_event(task_id: &str, context_id: &str, reason: &str) -> StreamResponse {
         let message = Message::new(Role::Agent, vec![Part::text(reason.to_owned())]);
         StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.to_owned(),
@@ -232,7 +247,6 @@ impl DuthubExecutor {
     }
 
     fn artifact_event(
-        &self,
         task_id: &str,
         context_id: &str,
         skill: &str,
@@ -271,22 +285,19 @@ impl DuthubExecutor {
         let cancel_flag = self.cancel_flags.arm(&task_id);
 
         // 1. Parse the skill request out of the message.
-        let request = match ctx.message.as_ref().and_then(parse_skill_request) {
-            Some(request) => request,
-            None => {
-                self.record_audit("<invalid>", AuditOutcome::Denied, "missing_data_part");
-                self.fail(
-                    &mut sink,
-                    &task_id,
-                    &context_id,
-                    "POLICY: message must carry one DataPart {skill, dutId?, args}; \
-                     TextPart-only messages are rejected",
-                )
-                .await;
-                self.ownership.forget(&task_id);
-                self.cancel_flags.remove(&task_id);
-                return;
-            }
+        let Some(request) = ctx.message.as_ref().and_then(parse_skill_request) else {
+            self.record_audit("<invalid>", AuditOutcome::Denied, "missing_data_part");
+            self.fail(
+                &mut sink,
+                &task_id,
+                &context_id,
+                "POLICY: message must carry one DataPart {skill, dutId?, args}; \
+                 TextPart-only messages are rejected",
+            )
+            .await;
+            self.ownership.forget(&task_id);
+            self.cancel_flags.remove(&task_id);
+            return;
         };
 
         // 2. Whitelist + cross-DUT + args shaping (policy layer).
@@ -311,7 +322,7 @@ impl DuthubExecutor {
         if !self
             .emit(
                 &mut sink,
-                self.status_event(&task_id, &context_id, TaskState::Working),
+                Self::status_event(&task_id, &context_id, TaskState::Working),
             )
             .await
         {
@@ -323,7 +334,7 @@ impl DuthubExecutor {
         if let Some(delay) = self.test_delay {
             let deadline = tokio::time::Instant::now() + delay;
             loop {
-                if self.cancel_flags.is_set(&cancel_flag) {
+                if CancelFlags::is_set(&cancel_flag) {
                     self.cancel_flags.remove(&task_id);
                     return;
                 }
@@ -377,13 +388,13 @@ impl DuthubExecutor {
             }
         };
 
-        if self.cancel_flags.is_set(&cancel_flag) {
+        if CancelFlags::is_set(&cancel_flag) {
             self.cancel_flags.remove(&task_id);
             return;
         }
 
         // 6. Artifact + terminal Completed status.
-        let artifact = self.artifact_event(&task_id, &context_id, &request.skill, result);
+        let artifact = Self::artifact_event(&task_id, &context_id, &request.skill, result);
         if !self.emit(&mut sink, artifact).await {
             self.cancel_flags.remove(&task_id);
             return;
@@ -391,7 +402,7 @@ impl DuthubExecutor {
         let _ = self
             .emit(
                 &mut sink,
-                self.status_event(&task_id, &context_id, TaskState::Completed),
+                Self::status_event(&task_id, &context_id, TaskState::Completed),
             )
             .await;
         self.cancel_flags.remove(&task_id);
@@ -413,7 +424,7 @@ impl DuthubExecutor {
         reason: &str,
     ) {
         let _ = self
-            .emit(sink, self.failed_event(task_id, context_id, reason))
+            .emit(sink, Self::failed_event(task_id, context_id, reason))
             .await;
     }
 }

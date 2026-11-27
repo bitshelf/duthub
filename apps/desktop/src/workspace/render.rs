@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Window, Context, IntoElement, AppContext, Ordering, WindowExt, FluentBuilder, usb_debug_enabled, InteractiveElement, Styled, div, px, ParentElement, ViewMode, PaneDivider, StatefulInteractiveElement, icon_btn, theme, MouseMoveEvent, MouseButton, MouseDownEvent, ConfigPage, Notification, AlertItem, Palette, AlertSource, SharedString, icon, img, LinkState, Disableable, btn, i18n, BtnVariant, WindowControlArea, CommandState, Command, CommandItem, AnyElement, GarbleLevel, Div, kit_icon, In, DEFAULT_TERMINAL_FONT_SIZE, terminal_grid_for, terminal_selection_bg, KeyDownEvent, arrow_escape_prefix, typed_char, LogLine, Pixels, LineKind, Arc, SessionView, ModalKind, HashMap, store, archive_safe_name, boot_reference_path, demo_dut_template, render_connection, render_flash_tools, render_usb_debug, render_settings, ModalState, QuickCommand};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -21,7 +21,7 @@ impl Workbench {
             self.main_close_hook_installed = true;
             let weak = cx.weak_entity();
             window.on_window_should_close(cx, move |_window, cx| {
-                weak.update(cx, |this, cx| this.prepare_main_window_close(cx))
+                weak.update(cx, super::Workbench::prepare_main_window_close)
                     .unwrap_or(true)
             });
         }
@@ -286,7 +286,7 @@ impl Workbench {
     /// 标题固定，detail 展示来源与上下文；按钮 知道了 / 忽略此类（按 source
     /// 抑制并落盘）/ 打开面板（仅 Agent 来源）。浮层内 kit Button 渲染异常
     /// （坑 #2），按钮一律手绘 div；禁用 Esc/遮罩/X 关闭，关闭动作全部经按钮，
-    /// 保证 alert_dialog_open 生命周期可控。
+    /// 保证 `alert_dialog_open` 生命周期可控。
     pub(super) fn open_alert_dialog(
         &mut self,
         item: AlertItem,
@@ -883,7 +883,7 @@ impl Workbench {
                         )
                         .disabled(history.earlier == 0 || session.history_pending.is_some())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.request_terminal_history(older, true, cx)
+                            this.request_terminal_history(older, true, cx);
                         })),
                     )
                     .child(
@@ -895,7 +895,7 @@ impl Workbench {
                         )
                         .disabled(newer == 0 || session.history_pending.is_some())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.request_terminal_history(newer, true, cx)
+                            this.request_terminal_history(newer, true, cx);
                         })),
                     )
                     .child(
@@ -977,7 +977,7 @@ impl Workbench {
                         }
                     }
                     Ok(_) if show_empty_notice => {
-                        this.notify_toast(i18n::label("terminalHistoryEmpty"))
+                        this.notify_toast(i18n::label("terminalHistoryEmpty"));
                     }
                     Ok(_) => {}
                     Err(error) => this.notify_toast(i18n::message(
@@ -1044,7 +1044,7 @@ impl Workbench {
             let query = state.read(cx).query(cx);
             let mut choices = view
                 .upgrade()
-                .map(|view| {
+                .map_or_default(|view| {
                     let this = view.read(cx);
                     this.sessions
                         .iter()
@@ -1057,8 +1057,7 @@ impl Workbench {
                             )
                         })
                         .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                });
 
             if !query.trim().is_empty() {
                 let pattern = Pattern::new(
@@ -1365,7 +1364,7 @@ impl Workbench {
         } else {
             self.sessions
                 .get(self.active_session)
-                .map(|v| {
+                .map_or(0, |v| {
                     let annotations = v.history.is_none().then_some(v.lines.as_slice());
                     let terminal_rows = v
                         .displayed_screen()
@@ -1379,7 +1378,6 @@ impl Workbench {
                         .filter(|line| line.to_lowercase().contains(&folded_query))
                         .count()
                 })
-                .unwrap_or(0)
         };
         let mut bar = div()
             .flex()
@@ -1451,8 +1449,7 @@ impl Workbench {
         let is_device = self
             .sessions
             .get(active)
-            .map(|s| s.source == "device")
-            .unwrap_or(false);
+            .is_some_and(|s| s.source == "device");
         let (font_family, font_size, cell_width) = self.terminal_font(window);
         let row_height = font_size * (20.6 / DEFAULT_TERMINAL_FONT_SIZE);
         if is_device {
@@ -1693,13 +1690,12 @@ impl Workbench {
         let empty = self
             .sessions
             .get(active)
-            .map(|s| {
+            .is_none_or(|s| {
                 s.lines.is_empty()
                     && s.screen
                         .as_ref()
                         .is_none_or(|sc| sc.rows.iter().all(|r| r.text.is_empty()))
-            })
-            .unwrap_or(true);
+            });
         if empty && !is_device {
             viewport = viewport.child(
                 div()
@@ -1892,13 +1888,10 @@ impl Workbench {
             .iter()
             .filter(|rule| rule.enabled && !rule.regex.trim().is_empty())
             .filter_map(|rule| {
-                let compiled = match cache.get(&rule.regex) {
-                    Some(compiled) => compiled.clone(),
-                    None => {
-                        let compiled = regex::Regex::new(&rule.regex).ok();
-                        cache.insert(rule.regex.clone(), compiled.clone());
-                        compiled
-                    }
+                let compiled = if let Some(compiled) = cache.get(&rule.regex) { compiled.clone() } else {
+                    let compiled = regex::Regex::new(&rule.regex).ok();
+                    cache.insert(rule.regex.clone(), compiled.clone());
+                    compiled
                 };
                 compiled.map(|regex| crate::highlight::CompiledRule {
                     regex,
@@ -1940,7 +1933,7 @@ impl Workbench {
             .line_height(row_height)
             .text_size(font_size)
             .whitespace_nowrap()
-            .text_color(row.fg.map(theme::rgba_hex).unwrap_or(p.term_fg))
+            .text_color(row.fg.map_or(p.term_fg, theme::rgba_hex))
             .when(hit, |el| el.bg(p.match_));
         if let Some(bg) = row.bg {
             el = el.bg(theme::rgba_hex(bg));
@@ -2374,7 +2367,7 @@ impl Workbench {
                     if let Err(err) = self.duts.save(&self.data_dir) {
                         self.notify_toast(i18n::message(
                             "saveSessionFailed",
-                            &[("error", &err.to_string())],
+                            &[("error", &err.clone())],
                         ));
                     }
                 }
@@ -2974,7 +2967,7 @@ impl Workbench {
     }
 
     /// 打开 kit Dialog：外壳（遮罩/动画/标题栏）由 kit 管理，
-    /// 表单主体仍由 render_modal_parts 渲染（草稿状态留在 Workbench）。
+    /// 表单主体仍由 `render_modal_parts` 渲染（草稿状态留在 Workbench）。
     pub fn open_modal(&mut self, kind: ModalKind, window: &mut Window, cx: &mut Context<Self>) {
         for field in [
             In::CmdName,
@@ -3000,14 +2993,13 @@ impl Workbench {
                 .flash_tools
                 .iter()
                 .find(|preset| preset.id == *id)
-                .map(|preset| {
+                .map_or_default(|preset| {
                     (
                         preset.name.clone(),
                         preset.executable.clone(),
                         preset.test_args.clone(),
                     )
-                })
-                .unwrap_or_default(),
+                }),
             _ => Default::default(),
         };
         self.modal = Some(ModalState {
@@ -3133,15 +3125,13 @@ impl Workbench {
             ModalKind::NewCommand => {
                 let current_icon = self
                     .modal
-                    .as_ref()
-                    .map(|m| {
+                    .as_ref().map_or_else(|| "bolt".to_string(), |m| {
                         if m.draft3.is_empty() {
                             "bolt".to_string()
                         } else {
                             m.draft3.clone()
                         }
-                    })
-                    .unwrap_or_else(|| "bolt".to_string());
+                    });
                 let mut picker = div().flex().flex_wrap().gap(px(6.)).mb(px(12.));
                 for name in [
                     "bolt", "terminal", "play", "power", "refresh", "check", "settings", "code",
@@ -3295,8 +3285,7 @@ impl Workbench {
                     let (name, value) = w
                         .modal
                         .as_ref()
-                        .map(|m| (m.draft.clone(), m.draft2.clone()))
-                        .unwrap_or_default();
+                        .map_or_default(|m| (m.draft.clone(), m.draft2.clone()));
                     if name.trim().is_empty() || value.trim().is_empty() {
                         w.notify_toast(crate::i18n::label("nameAndCommandRequired"));
                         return;
@@ -3373,8 +3362,7 @@ impl Workbench {
                     let (name, url) = w
                         .modal
                         .as_ref()
-                        .map(|m| (m.draft.clone(), m.draft2.clone()))
-                        .unwrap_or_default();
+                        .map_or_default(|m| (m.draft.clone(), m.draft2.clone()));
                     if name.trim().is_empty() || url.trim().is_empty() {
                         w.notify_toast(crate::i18n::label("nameAndAddressRequired"));
                         return;

@@ -23,11 +23,12 @@ fn load_workspace_setting(candidates: &[PathBuf]) -> Option<String> {
 ///    （相对路径锚定本进程 exe 目录）；
 /// 2) 均未配置时优先选择新快照，兼容旧目录中的快照。
 fn discover_data_dir() -> PathBuf {
+    use duthub_core::store::{config_dir_in, default_work_dir_in, resolve_portable_work_dir_in};
+
     let anchor = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    use duthub_core::store::{config_dir_in, default_work_dir_in, resolve_portable_work_dir_in};
     match duthub_core::store::explicit_workspace(&anchor, std::env::args_os().skip(1)) {
         Ok(Some(root)) => return configured_data_dir(root),
         Ok(None) => {}
@@ -60,12 +61,14 @@ fn configured_data_dir(root: PathBuf) -> PathBuf {
     }
 }
 
-fn main() {
+use anyhow::Context;
+
+fn run() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
-        .expect("runtime");
+        .context("failed to build Tokio runtime")?;
 
     let args: Vec<_> = std::env::args().collect();
     if let Some(index) = args.iter().position(|arg| arg == "--bridge") {
@@ -80,29 +83,33 @@ fn main() {
         let result = rt.block_on(duthub_mcp::transport::bridge_stdio(endpoint, token));
         // On Windows a pending blocking stdin operation cannot be cancelled by Tokio.
         rt.shutdown_background();
-        if let Err(err) = result {
-            eprintln!("[duthub-mcp] {err}");
-            std::process::exit(1);
-        }
-        return;
+        result.map_err(anyhow::Error::msg)?;
+        return Ok(());
     }
 
     rt.block_on(async move {
         let snapshot_path = discover_data_dir().join("runtime").join("mcp-state.json");
         if !snapshot_path.exists() {
             eprintln!(
-                "[duthub-mcp] 快照不存在（{}）：工具将返回空数据。请先启动 duthub 桌面端。",
+                "[duthub-mcp] snapshot missing ({}): tools will return empty data until duthub desktop is started.",
                 snapshot_path.display()
             );
         }
-        // 常驻 stdio 进程：每次工具调用前重读快照（desktop 每 2s 落盘），
-        // 避免 long-lived 会话的数据停留在进程启动时刻。
+        // Long-lived stdio process: reload the snapshot before each tool call
+        // (the desktop writes every 2s) so data never goes stale.
         let state = duthub_mcp::snapshot::reloading_snapshot_state(&snapshot_path);
-        if let Err(err) = duthub_mcp::transport::serve_stdio(state).await {
-            eprintln!("[duthub-mcp] stdio 服务错误: {err}");
-            std::process::exit(1);
-        }
-    });
+        duthub_mcp::transport::serve_stdio(state)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("stdio server error")
+    })
+}
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("[duthub-mcp] {err:#}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]

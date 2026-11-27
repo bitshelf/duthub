@@ -327,7 +327,7 @@ fn manual_lease_pins_forever() {
     assert!(entry.has_pin());
     assert!(!entry.is_empty());
     assert_eq!(
-        entry.decide(t0 + Duration::from_secs(86_400), IDLE),
+        entry.decide(t0 + Duration::from_hours(24), IDLE),
         ReclaimDecision::Pinned
     );
     // Releasing the pin falls back to the ephemeral idle path.
@@ -412,16 +412,16 @@ fn recording_mirror_pins_without_a_lease_and_restarts_idle_after_stop() {
     entry.recording = false;
     // The idle window restarts only after the recording is finished.
     assert_eq!(
-        entry.decide(t0 + Duration::from_secs(660), IDLE),
+        entry.decide(t0 + Duration::from_mins(11), IDLE),
         ReclaimDecision::Keep
     );
-    entry.sweep_expired(t0 + Duration::from_secs(660));
+    entry.sweep_expired(t0 + Duration::from_mins(11));
     assert_eq!(
         entry.decide(t0 + Duration::from_secs(719), IDLE),
         ReclaimDecision::Keep
     );
     assert_eq!(
-        entry.decide(t0 + Duration::from_secs(720), IDLE),
+        entry.decide(t0 + Duration::from_mins(12), IDLE),
         ReclaimDecision::Reclaim
     );
 }
@@ -448,7 +448,7 @@ fn agent_recording_mirror_pins_until_cleared() {
         ReclaimDecision::Keep
     );
     assert_eq!(
-        entry.decide(t0 + Duration::from_secs(3660), IDLE),
+        entry.decide(t0 + Duration::from_mins(61), IDLE),
         ReclaimDecision::Reclaim
     );
 }
@@ -460,7 +460,7 @@ fn copy_url_hold_expires_without_release() {
     entry.acquire_hold(7, DemandKind::CopyUrl, t0, HOLD_SECS);
     assert!(!entry.is_empty());
     assert_eq!(
-        entry.decide(t0 + HOLD_SECS - Duration::from_millis(1), IDLE),
+        entry.decide((t0 + HOLD_SECS).checked_sub(Duration::from_millis(1)).unwrap(), IDLE),
         ReclaimDecision::Keep
     );
     // Expiry is visible to `decide` even before the sweep runs.
@@ -521,7 +521,7 @@ fn expired_hold_does_not_release_a_manual_pin() {
     assert!(!entry.is_empty());
     assert!(entry.has_pin());
     assert_eq!(
-        entry.decide(t0 + Duration::from_secs(86_400), IDLE),
+        entry.decide(t0 + Duration::from_hours(24), IDLE),
         ReclaimDecision::Pinned
     );
 }

@@ -63,7 +63,7 @@ fn the_crate_never_runs_an_unsandboxed_command() {
     let src = manifest_dir().join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files);
-    assert!(!files.is_empty());
+    assert_ne!(files, [] as [std::path::PathBuf; 0]);
     for file in &files {
         let content = std::fs::read_to_string(file).expect("read source");
         for forbidden in [

@@ -51,8 +51,9 @@ pub fn learn(
             };
         }
         let mut raw = String::new();
+        let max_bytes = usize::try_from(MAX_REFERENCE_BYTES).unwrap_or(usize::MAX);
         let capture = async {
-            while raw.len() < MAX_REFERENCE_BYTES as usize {
+            while raw.len() < max_bytes {
                 let event = events.recv().await.map_err(|error| error.to_string())?;
                 if event.dut_id.as_deref() != Some(dut_id) {
                     continue;
@@ -132,10 +133,12 @@ fn evaluate(samples: Vec<String>, minimum_percent: u8) -> Result<(String, f64), 
 }
 
 fn normalize(sample: &str) -> String {
-    static ANSI: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap());
+    static ANSI: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("static ANSI regex literal is valid")
+    });
     static VOLATILE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\[\s*\d+\.\d+\](?:\[\s*T\d+\])?|\b0x[0-9a-f]+\b|\b[0-9a-f]{8,}\b|\b\d+(?:\.\d+)?\b").unwrap()
+        Regex::new(r"(?i)\[\s*\d+\.\d+\](?:\[\s*T\d+\])?|\b0x[0-9a-f]+\b|\b[0-9a-f]{8,}\b|\b\d+(?:\.\d+)?\b")
+            .expect("static volatile-token regex literal is valid")
     });
     let prefix = sample[..sample.floor_char_boundary(sample.len().min(COMPARE_BYTES))]
         .lines()
@@ -166,7 +169,12 @@ fn similarity(left: &str, right: &str) -> f64 {
     let jaccard = if union == 0 {
         if left == right { 1.0 } else { 0.0 }
     } else {
-        left_grams.intersection(&right_grams).count() as f64 / union as f64
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "trigram counts over bounded 8 KiB prefix fit in f64 mantissa"
+        )]
+        let ratio = left_grams.intersection(&right_grams).count() as f64 / union as f64;
+        ratio
     };
     0.6 * strsim::jaro_winkler(left, right) + 0.4 * jaccard
 }

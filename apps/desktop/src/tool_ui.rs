@@ -39,17 +39,23 @@ pub struct InstallProgress {
 /// Percent 0..=100, but only when a real total is known. `None` = unknown
 /// total (chunked response) — callers must show an indeterminate state
 /// instead of fabricating a percentage.
+#[must_use]
 pub fn progress_percent(bytes: u64, total: Option<u64>) -> Option<u8> {
     let total = total?;
     if total == 0 {
         return None;
     }
-    Some((((bytes.min(total)) * 100) / total) as u8)
+    Some(u8::try_from(((bytes.min(total)) * 100) / total).unwrap_or(100))
 }
 
 /// Decimal byte units (B/KB/MB/…) for "received X" style status lines.
+#[must_use]
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "human-readable byte size display formatted to 1 decimal place"
+    )]
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1000.0 && unit < UNITS.len() - 1 {
@@ -82,6 +88,7 @@ pub enum ProxyUrlProblem {
 
 impl ProxyUrlProblem {
     /// Short reason text for `{reason}` interpolation in the localized toast.
+    #[must_use]
     pub fn reason(&self) -> String {
         match self {
             ProxyUrlProblem::NoScheme => {
@@ -110,8 +117,7 @@ pub fn validate_custom_proxy_url(url: &str) -> Result<(), ProxyUrlProblem> {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host_part = authority
         .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(authority);
+        .map_or(authority, |(_, host)| host);
     // Bracketed IPv6 hosts: `[::1]` → check the inside; an unbalanced bracket
     // is rejected here (the kernel would reject it at build time anyway).
     let bare_host = if let Some(after) = host_part.strip_prefix('[') {
@@ -152,6 +158,7 @@ pub enum EffectiveToolPath {
 
 /// Classify one tool's effective resolution. `configured` is the raw settings
 /// value (`None` for tools without a settings key, i.e. goose).
+#[must_use]
 pub fn effective_tool_path(
     configured: Option<&str>,
     tool_id: &str,
@@ -188,7 +195,7 @@ pub fn effective_tool_path(
 /// One tool row's on-disk facts, refreshed on page open / install finish.
 /// `installed` mirrors the kernel's validated-install notion (manifest parses,
 /// belongs to this tool, every executable still on disk).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ToolRowSnapshot {
     pub spec_id: &'static str,
     pub installed: bool,
@@ -205,6 +212,7 @@ pub struct ToolRowSnapshot {
 }
 
 /// Build the snapshot for one built-in spec against `tools_root`.
+#[must_use]
 pub fn tool_row_snapshot(
     spec: &ToolSpec,
     configured: Option<&str>,
@@ -248,6 +256,7 @@ pub enum ToolPurpose {
 impl ToolPurpose {
     /// Redownload/Update run the kernel with `force = true`; a plain Download
     /// is the idempotent variant that skips when a valid install exists.
+    #[must_use]
     pub fn forced(self) -> bool {
         !matches!(self, ToolPurpose::Download)
     }
@@ -296,6 +305,7 @@ pub struct InstallFailure {
 }
 
 impl InstallFailure {
+    #[must_use]
     pub fn from_error(error: &ToolInstallError) -> Self {
         let kind = match error {
             ToolInstallError::InvalidDownloadUrl => InstallFailureKind::InvalidDownloadUrl,
@@ -358,6 +368,15 @@ pub struct ToolInstallCenter {
     active: HashMap<&'static str, ActiveInstall>,
 }
 
+impl std::fmt::Debug for ToolInstallCenter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolInstallCenter")
+            .field("active", &self.active.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for ToolInstallCenter {
     fn default() -> Self {
         Self::new()
@@ -365,6 +384,7 @@ impl Default for ToolInstallCenter {
 }
 
 impl ToolInstallCenter {
+    #[must_use]
     pub fn new() -> Self {
         ToolInstallCenter {
             queue: Arc::new(Mutex::new(Vec::new())),
@@ -374,23 +394,27 @@ impl ToolInstallCenter {
     }
 
     /// The run currently in flight for `tool`, if any.
+    #[must_use]
     pub fn active(&self, tool: &str) -> Option<&ActiveInstall> {
         self.active.get(tool)
     }
 
     /// Whether any tool is downloading. Rows stay usable in parallel; this is
     /// only a diagnostic/view helper.
+    #[must_use]
     pub fn any_active(&self) -> bool {
         !self.active.is_empty()
     }
 
     /// Latest kernel-reported progress for one tool, if a run is in flight.
+    #[must_use]
     pub fn progress(&self, tool: &str) -> Option<InstallProgress> {
         self.progress.lock().unwrap().get(tool).copied()
     }
 
     /// Snapshot of every in-flight tool's progress (the tick compares it to the
     /// values the last frame showed).
+    #[must_use]
     pub fn progress_snapshot(&self) -> HashMap<&'static str, InstallProgress> {
         self.progress.lock().unwrap().clone()
     }
@@ -555,10 +579,11 @@ fn run_install(
 // ---------------------------------------------------------------------------
 
 /// Remove `.tooldown-*` staging directories under `tools_root` left behind by
-/// a crashed/killed download run (the kernel's TempDir cleanup is best-effort
+/// a crashed/killed download run (the kernel's `TempDir` cleanup is best-effort
 /// while a file is locked by a running process on Windows). Best-effort:
 /// per-directory failures are skipped and retried on the next sweep. Returns
 /// how many leftovers were removed.
+#[must_use]
 pub fn sweep_staging_leftovers(tools_root: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(tools_root) else {
         return 0;
@@ -567,7 +592,7 @@ pub fn sweep_staging_leftovers(tools_root: &Path) -> usize {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let is_staging_dir = name.to_string_lossy().starts_with(".tooldown-")
-            && entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            && entry.file_type().is_ok_and(|t| t.is_dir());
         if is_staging_dir && std::fs::remove_dir_all(entry.path()).is_ok() {
             removed += 1;
         }

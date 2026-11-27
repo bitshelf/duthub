@@ -228,7 +228,7 @@ pub fn probe_request(
 
     #[cfg(target_os = "windows")]
     {
-        let output = v1::probe(Some(&mxc_req)).map_err(map_mxc_error)?;
+        let output = v1::probe(Some(&mxc_req)).map_err(|err| map_mxc_error(&err))?;
         if let Some(error) = output.error {
             return Err(SandboxError::Unsupported(error));
         }
@@ -276,7 +276,8 @@ pub fn run(
         Some(timeout_ms),
     )?;
 
-    let mut process = v1::spawn(mxc_req, SpawnOptions::default()).map_err(map_mxc_error)?;
+    let mut process =
+        v1::spawn(mxc_req, SpawnOptions::default()).map_err(|err| map_mxc_error(&err))?;
     let stdout_closer = process.stdout_closer();
     let stderr_closer = process.stderr_closer();
 
@@ -373,7 +374,7 @@ pub fn spawn_streaming(
         &request.environment,
         None,
     )?;
-    let process = v1::spawn(mxc_req, SpawnOptions::default()).map_err(map_mxc_error)?;
+    let process = v1::spawn(mxc_req, SpawnOptions::default()).map_err(|err| map_mxc_error(&err))?;
     Ok(SandboxedProcess::from_mxc(process))
 }
 
@@ -669,9 +670,7 @@ fn is_windows_system_dir(path: &Path) -> bool {
     #[cfg(windows)]
     {
         let win_dir = std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("windir"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            .or_else(|| std::env::var_os("windir")).map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         path_within(path, &win_dir)
     }
     #[cfg(not(windows))]
@@ -734,7 +733,7 @@ fn read_bounded(stream: Option<Box<dyn Read + Send>>, limit: usize) -> io::Resul
                     truncated = true;
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
             Err(error) => return Err(error),
         }
@@ -750,7 +749,7 @@ fn summary_from_mxc(capture: &v1::CaptureDenialsResult) -> DenialCaptureSummary 
     }
 }
 
-fn map_mxc_error(error: MxcError) -> SandboxError {
+fn map_mxc_error(error: &MxcError) -> SandboxError {
     let message = error.to_string();
     match error.code {
         ErrorCode::BackendUnavailable | ErrorCode::UnsupportedContainment => {

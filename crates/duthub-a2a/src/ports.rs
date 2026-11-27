@@ -20,6 +20,7 @@ pub enum PortOwner {
 
 impl PortOwner {
     /// Short human-readable identity for conflict reasons and logs.
+    #[must_use]
     pub fn label(&self) -> String {
         match self {
             PortOwner::A2a { dut_id } => format!("a2a:{dut_id}"),
@@ -43,6 +44,7 @@ pub struct PortRegistry {
 }
 
 impl PortRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -54,12 +56,9 @@ impl PortRegistry {
             .reserved
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match reserved.get(&port) {
-            Some(holder) => Err(PortTaken { by: holder.clone() }),
-            None => {
-                reserved.insert(port, owner);
-                Ok(())
-            }
+        if let Some(holder) = reserved.get(&port) { Err(PortTaken { by: holder.clone() }) } else {
+            reserved.insert(port, owner);
+            Ok(())
         }
     }
 

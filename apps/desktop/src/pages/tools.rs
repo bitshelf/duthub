@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Palette, Context, IntoElement, Styled, div, px, ParentElement, StatefulInteractiveElement, AppContext, subtle, btn, SharedString, BtnVariant, Window, In, settings_panel, field, InteractiveElement, FlashPresetTest, Disableable, icon_btn, panel_head, settings_panel_with_header};
 
 /// 烧录工具预设页（自设置独立成分类）。
 pub fn render_flash_tools(
@@ -28,7 +28,7 @@ pub fn render_flash_tools(
 }
 
 /// Compact download/update/cancel controls for a functional page that
-/// configures one tool's executable path (the ADB section below, FFmpeg on the
+/// configures one tool's executable path (the ADB section below, `FFmpeg` on the
 /// capture page). Shares the settings page's install center, proxy policy and
 /// progress slot, so what it shows is the real runtime state: idle →
 /// download/update, running → live progress + cancel, another tool running →
@@ -49,12 +49,9 @@ pub(crate) fn tool_install_controls(
     let busy = w.tool_installs.active(tool_id).is_some();
     let progress = w.tool_progress_view.get(tool_id).copied();
     let status = if busy {
-        match progress.and_then(|progress| progress_percent(progress.bytes, progress.total)) {
-            Some(pct) => crate::i18n::message("toolDownloading", &[("pct", &pct.to_string())]),
-            None => {
-                let bytes = format_bytes(progress.map(|progress| progress.bytes).unwrap_or(0));
-                crate::i18n::message("toolDownloadingBytes", &[("bytes", &bytes)])
-            }
+        if let Some(pct) = progress.and_then(|progress| progress_percent(progress.bytes, progress.total)) { crate::i18n::message("toolDownloading", &[("pct", &pct.to_string())]) } else {
+            let bytes = format_bytes(progress.map_or(0, |progress| progress.bytes));
+            crate::i18n::message("toolDownloadingBytes", &[("bytes", &bytes)])
         }
     } else {
         String::new()

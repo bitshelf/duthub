@@ -53,9 +53,8 @@ async fn ztus_create(
     length: u64,
     checksum: Option<&str>,
 ) -> reqwest::Response {
-    let extra: Vec<(&str, &str)> = checksum
-        .map(|value| vec![("Upload-Checksum", value)])
-        .unwrap_or_default();
+    let extra: Vec<(&str, &str)> =
+        checksum.map_or_else(Vec::new, |value| vec![("Upload-Checksum", value)]);
     post_upload_with(
         ztus,
         base,
@@ -171,7 +170,7 @@ async fn prior_knowledge_h2c_client_resumes_from_head() {
         &url,
         Some(TOKEN_A),
         offset,
-        payload[offset as usize..].to_vec(),
+        payload[usize::try_from(offset).unwrap()..].to_vec(),
     )
     .await;
     assert_eq!(response.status().as_u16(), 204);

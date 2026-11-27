@@ -337,7 +337,7 @@ async fn generic_listener_rejects_an_explicit_foreign_dut() {
         .await
         .expect_err("explicit foreign DUT must be rejected");
     assert!(error.contains("UNAUTHORIZED"), "{error}");
-    assert!(notifier.requests().is_empty());
+    assert_eq!(notifier.requests(), [] as [duthub_mcp::NotifyRequest; 0]);
 
     // The granted DUT and a global notice both work.
     let data = call(&client, NOTIFY, json!({"message": "x", "dutId": "dut-a"}))
@@ -374,7 +374,7 @@ async fn generic_listener_without_grants_is_rejected() {
         .await
         .expect_err("zero grant must be rejected");
     assert!(error.contains("UNAUTHORIZED"), "{error}");
-    assert!(notifier.requests().is_empty());
+    assert_eq!(notifier.requests(), [] as [duthub_mcp::NotifyRequest; 0]);
 
     client.cancel().await.ok();
     task.abort();

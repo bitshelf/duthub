@@ -49,9 +49,9 @@ fn inv01_concurrent_acquire_single_winner() {
     let winners: Vec<_> = outcomes.iter().filter_map(|r| r.as_ref().ok()).collect();
     assert_eq!(winners.len(), 1, "INV-01：并发 acquire 必须恰好 1 个成功");
     // 5 个失败者全部 Busy，消息指明持有者
-    for err in outcomes.into_iter().filter_map(|r| r.err()) {
+    for err in outcomes.into_iter().filter_map(std::result::Result::err) {
         match err {
-            LeaseError::Busy { holder, .. } => assert!(!holder.is_empty()),
+            LeaseError::Busy { holder, .. } => assert_ne!(holder, ""),
             other => panic!("并发失败必须是 Busy，得到 {other:?}"),
         }
     }
@@ -70,7 +70,7 @@ fn inv01_agent_acquire_rejected_while_gui_holds() {
             assert!(
                 holder.contains("GUI"),
                 "Busy 消息必须指明 GUI 持有：{holder}"
-            )
+            );
         }
         other => panic!("期望 Busy，得到 {other:?}"),
     }

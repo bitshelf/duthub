@@ -62,6 +62,7 @@ impl MonitorAction {
     ///
     /// Composite variants exist because the design table lists two actions
     /// for `Redock` and `PreviewFailed` while [`next`] returns a single value.
+    #[must_use]
     pub fn steps(self) -> &'static [MonitorAction] {
         match self {
             Self::None => &[],
@@ -76,6 +77,7 @@ impl MonitorAction {
     }
 
     /// Whether this action includes `step` at any position.
+    #[must_use]
     pub fn contains(self, step: MonitorAction) -> bool {
         self.steps().contains(&step)
     }
@@ -92,6 +94,7 @@ impl MonitorAction {
 /// - `Floating + OpenFloat`, `Docked + Redock/UserClosedWindow` → no-op;
 /// - `Closing` swallows every event (except `PreviewFailed`, which the table
 ///   marks "any state").
+#[must_use]
 pub fn next(state: MonitorPlacement, event: MonitorEvent) -> (MonitorPlacement, MonitorAction) {
     use MonitorAction as A;
     use MonitorEvent as E;
@@ -102,17 +105,19 @@ pub fn next(state: MonitorPlacement, event: MonitorEvent) -> (MonitorPlacement, 
         (P::Docked, E::OpenFloat) => (P::Floating, A::OpenFloatWindow),
         (P::Floating, E::Redock) => (P::Docked, A::CloseFloatWindowAndFocusMain),
         (P::Floating, E::UserClosedWindow) => (P::Docked, A::ShowDockedPlaceholder),
-        (P::Floating, E::SidePanelClosed | E::PanelSwitched) => (P::Floating, A::None),
         (P::Docked, E::SidePanelClosed | E::PanelSwitched) => (P::Docked, A::StopPreview),
-        (P::Floating, E::MainWindowClosing) => (P::Closing, A::CloseFloatWindow),
-        (P::Closing, E::MainWindowClosed) => (P::Closing, A::None),
+        (P::Floating, E::MainWindowClosing | E::MainWindowClosed) => {
+            (P::Closing, A::CloseFloatWindow)
+        }
         (_, E::PreviewFailed) => (P::Docked, A::StopPreviewAndCloseFloatWindow),
 
         // Total-function extensions (see rustdoc).
-        (P::Docked, E::MainWindowClosing | E::MainWindowClosed) => (P::Closing, A::None),
-        (P::Floating, E::MainWindowClosed) => (P::Closing, A::CloseFloatWindow),
-        (P::Floating, E::OpenFloat) => (P::Floating, A::None),
+        (P::Docked, E::MainWindowClosing | E::MainWindowClosed) | (P::Closing, _) => {
+            (P::Closing, A::None)
+        }
+        (P::Floating, E::OpenFloat | E::SidePanelClosed | E::PanelSwitched) => {
+            (P::Floating, A::None)
+        }
         (P::Docked, E::Redock | E::UserClosedWindow) => (P::Docked, A::None),
-        (P::Closing, _) => (P::Closing, A::None),
     }
 }

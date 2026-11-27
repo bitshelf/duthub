@@ -57,6 +57,7 @@ pub fn explicit_workspace(
     }
     Ok(root)
 }
+#[must_use]
 pub fn config_dir_in(exe_dir: &Path) -> PathBuf {
     exe_dir.join(CONFIG_DIR)
 }
@@ -106,6 +107,7 @@ fn create_default_config(
 }
 
 /// 默认运行产物目录 = exe 同级 `duthub-data/`。
+#[must_use]
 pub fn default_work_dir_in(exe_dir: &Path) -> PathBuf {
     exe_dir.join("duthub-data")
 }
@@ -120,9 +122,7 @@ pub fn resolve_portable_work_dir_in(
         .into_iter()
         .flatten()
         .map(str::trim)
-        .find(|path| !path.is_empty())
-        .map(|path| exe_dir.join(path))
-        .unwrap_or_else(|| exe_dir.to_path_buf())
+        .find(|path| !path.is_empty()).map_or_else(|| exe_dir.to_path_buf(), |path| exe_dir.join(path))
 }
 
 /// Resolve the desktop's trusted artifact root. Settings and startup options
@@ -190,6 +190,7 @@ pub fn ensure_agent_dir(root: &Path, components: &[&str]) -> DeviceResult<PathBu
 /// DUT 稳定 id → 可安全用作目录名的键（UTF-8 字节的十六进制，避免路径字符、
 /// 保留名与大小写差异）。空/全空白 → `None`（调用方必须显式拒绝，不能回退到
 /// 固定占位名——多台空 id 会互相覆盖）。
+#[must_use]
 pub fn agent_dut_key(dut_id: &str) -> Option<String> {
     use std::fmt::Write as _;
 
@@ -213,6 +214,7 @@ pub fn agent_dut_dir(work_dir: &Path, dut_id: &str) -> DeviceResult<PathBuf> {
 
 /// 去掉 Windows verbatim 前缀（`\\?\C:\...` → `C:\...`；`\\?\UNC\server\share`
 /// → `\\server\share`），便于把路径写入日志/展示与比较。
+#[must_use]
 pub fn plain_path(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
@@ -229,6 +231,7 @@ fn settings_path(dir: &Path) -> PathBuf {
 }
 
 /// 出厂默认 settings（theme dark / language zh-CN / platform windows）。
+#[must_use]
 pub fn default_settings() -> SettingsFile {
     SettingsFile {
         version: 1,
@@ -252,18 +255,18 @@ pub fn default_settings() -> SettingsFile {
             executable: "upgrade_tool".into(),
             test_args: "--help".into(),
         }],
-        agent: Default::default(),
+        agent: crate::model::AgentSettings::default(),
         tools: ToolsSettings {
             adb_executable: "adb".into(),
             hdc_executable: "hdc".into(),
-            capture: Default::default(),
-            download: Default::default(),
+            capture: crate::model::CaptureSettings::default(),
+            download: crate::model::ToolDownloadSettings::default(),
         },
         a2a: None,
         workspace_dir: None,
         dut_storage_gib: None,
-        alerts: Default::default(),
-        agent_access: Default::default(),
+        alerts: crate::model::GlobalAlertSettings::default(),
+        agent_access: crate::agent_access::AgentAccessSettings::default(),
         serial: SerialSettings {
             highlight_rules: crate::model::default_highlight_rules(),
             ..SerialSettings::default()
@@ -399,21 +402,21 @@ pub fn hydrate_mcp_tokens(dir: &Path, settings: &mut SettingsFile) -> Vec<McpTok
     let mut warnings = Vec::new();
     let mut migrated = false;
     for cred in &mut settings.agent_access.agents {
-        if !cred.token.is_empty() {
-            match crate::keys::set_mcp_token(&cred.id, &cred.token) {
-                Ok(()) => migrated = true,
-                Err(err) => warnings.push(McpTokenHydrateWarning::MigrateFailed {
-                    credential_id: cred.id.clone(),
-                    error: err.to_string(),
-                }),
-            }
-        } else {
+        if cred.token.is_empty() {
             match crate::keys::get_mcp_token(&cred.id) {
                 Ok(Some(token)) => cred.token = token,
                 Ok(None) => warnings.push(McpTokenHydrateWarning::MissingInKeyring {
                     credential_id: cred.id.clone(),
                 }),
                 Err(err) => warnings.push(McpTokenHydrateWarning::ReadFailed {
+                    credential_id: cred.id.clone(),
+                    error: err.to_string(),
+                }),
+            }
+        } else {
+            match crate::keys::set_mcp_token(&cred.id, &cred.token) {
+                Ok(()) => migrated = true,
+                Err(err) => warnings.push(McpTokenHydrateWarning::MigrateFailed {
                     credential_id: cred.id.clone(),
                     error: err.to_string(),
                 }),
@@ -462,8 +465,7 @@ fn save_config_atomic(
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     ));
     let file = OpenOptions::new()
         .write(true)
@@ -477,8 +479,8 @@ fn save_config_atomic(
     let written = {
         let mut file = file;
         file.write_all(encoded.as_bytes())
-            .and_then(|_| file.flush())
-            .and_then(|_| file.sync_all())
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
     };
     written.map_err(|e| DeviceError::Invalid(e.to_string()))?;
     std::fs::rename(pending.as_path(), path)
@@ -489,6 +491,7 @@ fn save_config_atomic(
 
 /// Probe whether `dir` can be created and written to using an auto-deleted
 /// unique temporary file (safe under concurrent callers).
+#[must_use]
 pub fn dir_writable(dir: &Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
@@ -503,13 +506,14 @@ fn duts_path(dir: &Path) -> PathBuf {
 }
 
 /// 新配置从空的 DUT 列表开始。
+#[must_use]
 pub fn default_duts() -> DutsFile {
     DutsFile {
         version: 1,
         hosts: Vec::new(),
         relay_boards: Vec::new(),
-        alerts_by_dut: Default::default(),
-        garbled_by_dut: Default::default(),
+        alerts_by_dut: std::collections::BTreeMap::new(),
+        garbled_by_dut: std::collections::BTreeMap::new(),
         duts: Vec::new(),
     }
 }
@@ -594,7 +598,10 @@ mod tests {
         let raw = std::fs::read_to_string(settings_path(dir.path())).unwrap();
         let exported: SettingsFile = serde_json::from_str(&raw).unwrap();
         assert!(!raw.contains(token));
-        assert!(exported.agent_access.agents.is_empty());
+        assert_eq!(
+            exported.agent_access.agents,
+            Vec::<crate::agent_access::AgentCredential>::new()
+        );
         assert!(exported.agent_access.enabled);
         assert_eq!(
             exported.agent_access.listeners,
@@ -611,14 +618,14 @@ mod tests {
         assert!(settings_path(&dir).is_file());
         assert_eq!(load_settings(&dir).unwrap(), default_settings());
         let duts = load_duts(&dir).unwrap().unwrap();
-        assert!(duts.duts.is_empty());
+        assert_eq!(duts.duts, Vec::<crate::model::DutConfig>::new());
         let [relay] = duts.relay_boards.as_slice() else {
             panic!("expected one default CH340 board")
         };
         assert_eq!(relay.name, "ch340-relay");
         assert_eq!(relay.driver, "ch340");
         assert_eq!(relay.channel_count, 4);
-        assert!(relay.node.is_empty());
+        assert_eq!(relay.node, "");
         assert!(!default_work_dir_in(exe_dir.path()).exists());
     }
 
@@ -636,7 +643,7 @@ mod tests {
         assert_eq!(std::fs::read(&settings_file).unwrap(), original);
         assert_eq!(load_settings(&dir).unwrap(), settings);
         let initial = load_duts(&dir).unwrap().unwrap();
-        assert!(initial.duts.is_empty());
+        assert_eq!(initial.duts, Vec::<crate::model::DutConfig>::new());
         assert_eq!(initial.relay_boards.len(), 1);
         save_duts_atomic(&dir, &default_duts()).unwrap();
         initialize_config_dir(exe_dir.path()).unwrap();
@@ -662,7 +669,7 @@ mod tests {
         assert_eq!(loaded, settings);
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
             .collect();
         assert!(leftovers.is_empty(), "不应残留 .tmp");
@@ -684,13 +691,13 @@ mod tests {
                 reference_similarity: None,
                 split_logs: false,
             },
-            adb: Default::default(),
+            adb: crate::model::AdbConfig::default(),
             relay: crate::model::RelayConfig::Disabled,
             mcp: crate::model::McpConfig::StreamableHttp {
                 url: "http://127.0.0.1:8787/mcp".into(),
             },
-            a2a: Default::default(),
-            flash: Default::default(),
+            a2a: crate::model::DutA2aConfig::default(),
+            flash: crate::model::FlashConfig::default(),
             media: crate::model::DutMediaConfig {
                 hdmi: crate::model::CaptureInput {
                     enabled: None,
@@ -712,7 +719,7 @@ mod tests {
                 },
                 ..Default::default()
             },
-            heartbeat: Default::default(),
+            heartbeat: crate::model::HeartbeatConfig::default(),
         };
         let plain_dut = crate::model::DutConfig {
             id: "dut-plain".into(),
@@ -726,22 +733,22 @@ mod tests {
                 reference_similarity: None,
                 split_logs: false,
             },
-            adb: Default::default(),
+            adb: crate::model::AdbConfig::default(),
             relay: crate::model::RelayConfig::Disabled,
             mcp: crate::model::McpConfig::StreamableHttp {
                 url: "http://127.0.0.1:8787/mcp".into(),
             },
-            a2a: Default::default(),
-            flash: Default::default(),
-            media: Default::default(),
-            heartbeat: Default::default(),
+            a2a: crate::model::DutA2aConfig::default(),
+            flash: crate::model::FlashConfig::default(),
+            media: crate::model::DutMediaConfig::default(),
+            heartbeat: crate::model::HeartbeatConfig::default(),
         };
         let duts = crate::model::DutsFile {
             version: 1,
             hosts: vec![],
             relay_boards: vec![],
-            alerts_by_dut: Default::default(),
-            garbled_by_dut: Default::default(),
+            alerts_by_dut: std::collections::BTreeMap::new(),
+            garbled_by_dut: std::collections::BTreeMap::new(),
             duts: vec![media_dut.clone(), plain_dut],
         };
         save_duts_atomic(&dir, &duts).unwrap();
@@ -757,7 +764,7 @@ mod tests {
         let loaded = load_duts(&dir).unwrap().expect("duts.json 应存在");
         assert_eq!(loaded.duts.len(), 2);
         assert_eq!(loaded.duts[0], media_dut, "media 绑定必须原样往返");
-        assert_eq!(loaded.duts[1].media, Default::default());
+        assert_eq!(loaded.duts[1].media, crate::model::DutMediaConfig::default());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -769,7 +776,7 @@ mod tests {
         assert!(result.is_err());
         let backups: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| e.path().to_string_lossy().contains("corrupt"))
             .collect();
         assert_eq!(backups.len(), 1, "损坏文件必须保留备份");

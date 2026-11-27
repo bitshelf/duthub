@@ -17,6 +17,14 @@ pub struct DutQuota {
     meters: Mutex<HashMap<String, Arc<Mutex<Meter>>>>,
 }
 
+impl std::fmt::Debug for DutQuota {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DutQuota")
+            .field("limit_bytes", &self.limit())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Default)]
 struct Meter {
     measured_at: Option<Instant>,
@@ -25,6 +33,7 @@ struct Meter {
 }
 
 impl DutQuota {
+    #[must_use]
     pub fn new(bytes: u64) -> Arc<Self> {
         Arc::new(Self {
             bytes: AtomicU64::new(bytes),
@@ -85,7 +94,7 @@ impl DutQuota {
             .clone();
         let owner = owner.try_clone()?;
         let file = {
-            let mut usage = meter.lock().unwrap();
+            let mut usage = crate::util::lock_unpoisoned(&meter);
             if !usage.active.insert(path.to_owned()) {
                 return Err(ErrorKind::AlreadyExists.into());
             }
@@ -213,6 +222,14 @@ pub struct QuotaFile {
     quota: Arc<DutQuota>,
 }
 
+impl std::fmt::Debug for QuotaFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuotaFile")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl QuotaFile {
     pub fn is_empty(&self) -> io::Result<bool> {
         Ok(self.file.metadata()?.len() == 0)
@@ -221,7 +238,7 @@ impl QuotaFile {
 
 impl Write for QuotaFile {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let mut meter = self.meter.lock().unwrap();
+        let mut meter = crate::util::lock_unpoisoned(&self.meter);
         meter.make_room(&self.owner, buffer.len() as u64, self.quota.limit())?;
         let written = self.file.write(buffer)?;
         meter.used = meter.used.saturating_add(written as u64);
@@ -235,7 +252,7 @@ impl Write for QuotaFile {
 
 impl Drop for QuotaFile {
     fn drop(&mut self) {
-        let mut meter = self.meter.lock().unwrap();
+        let mut meter = crate::util::lock_unpoisoned(&self.meter);
         meter.active.remove(&self.path);
         if self
             .file

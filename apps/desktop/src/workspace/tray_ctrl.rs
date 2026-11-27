@@ -1,4 +1,4 @@
-use super::*;
+use super::{Workbench, Context, FluentBuilder, InteractiveElement, AlertSource, Window, Styled, AppContext, SharedString, LifecycleEvent, run_close_plan, LifecycleState, LifecyclePhase, i18n, LifecycleAction, Ordering, Duration, HiddenAlertEnv, HiddenAlertAction, AlertPresentation, SNAPSHOT_INTERVAL_MS};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -22,9 +22,7 @@ impl Workbench {
                     .file
                     .duts
                     .iter()
-                    .find(|dut| dut.id == dut_id)
-                    .map(|dut| (dut.name.clone(), source.named_label(&dut.media).to_owned()))
-                    .unwrap_or_else(|| (dut_id.clone(), source.label().to_owned()));
+                    .find(|dut| dut.id == dut_id).map_or_else(|| (dut_id.clone(), source.label().to_owned()), |dut| (dut.name.clone(), source.named_label(&dut.media).to_owned()));
                 let (title, alert_detail) =
                     crate::alerts::media_disconnect_alert_texts(&dut_name, &source_label, &detail);
                 if let Ok(mut center) = self.alerts.lock() {
@@ -59,16 +57,16 @@ impl Workbench {
                 duthub_desktop::capture_ui::MonitorAction::None
                 | duthub_desktop::capture_ui::MonitorAction::ShowDockedPlaceholder => {}
                 duthub_desktop::capture_ui::MonitorAction::OpenFloatWindow => {
-                    self.open_float_window(cx)
+                    self.open_float_window(cx);
                 }
                 duthub_desktop::capture_ui::MonitorAction::CloseFloatWindow => {
-                    self.close_float_window(cx)
+                    self.close_float_window(cx);
                 }
                 duthub_desktop::capture_ui::MonitorAction::FocusMainWindow => {
-                    self.focus_main_window(cx)
+                    self.focus_main_window(cx);
                 }
                 duthub_desktop::capture_ui::MonitorAction::StopPreview => {
-                    self.release_monitor(None, cx)
+                    self.release_monitor(None, cx);
                 }
                 // `steps()` expands the composites into the atomic actions above.
                 duthub_desktop::capture_ui::MonitorAction::CloseFloatWindowAndFocusMain
@@ -157,9 +155,7 @@ impl Workbench {
             .file
             .duts
             .iter()
-            .find(|dut| &dut.id == dut_id)
-            .map(|dut| dut.name.clone())
-            .unwrap_or_else(|| dut_id.clone());
+            .find(|dut| &dut.id == dut_id).map_or_else(|| dut_id.clone(), |dut| dut.name.clone());
         let source_name = self
             .duts
             .saved_media(dut_id)
@@ -478,8 +474,7 @@ impl Workbench {
         let events = self
             .tray
             .as_ref()
-            .map(duthub_desktop::tray::TrayHandle::drain_events)
-            .unwrap_or_default();
+            .map_or_default(duthub_desktop::tray::TrayHandle::drain_events);
         let changed = !events.is_empty();
         for event in events {
             let event = match event {
@@ -546,7 +541,7 @@ impl Workbench {
         false
     }
 
-    /// 50 ms tick: relay board events → AlertCenter (offline) or toast
+    /// 50 ms tick: relay board events → `AlertCenter` (offline) or toast
     /// (recovered / unobservable). The probe thread never touches either.
     pub(super) fn drain_relay_events(&mut self) -> bool {
         let mut changed = false;

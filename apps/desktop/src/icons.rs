@@ -1,4 +1,4 @@
-//! 图标资产（1:1 移植自原型 SVG sprite）+ gpui AssetSource。
+//! 图标资产（1:1 移植自原型 SVG sprite）+ gpui `AssetSource`。
 
 use std::borrow::Cow;
 
@@ -32,7 +32,7 @@ pub fn icon(name: &str) -> Svg {
     svg().path(format!("icons/{name}.svg"))
 }
 
-/// kit Icon 包装：复用 sprite 资产路径（经全局 AssetSource 解析），可进 kit Button 等容器。
+/// kit Icon 包装：复用 sprite 资产路径（经全局 `AssetSource` 解析），可进 kit Button 等容器。
 pub fn kit_icon(name: &str) -> gpui_kit::component::Icon {
     gpui_kit::component::Icon::empty().path(format!("icons/{name}.svg"))
 }

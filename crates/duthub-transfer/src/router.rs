@@ -61,6 +61,18 @@ pub struct TransferState {
     pub verify_gate: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
+impl std::fmt::Debug for TransferState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransferState")
+            .field("authorizer_configured", &self.authorizer.is_some())
+            .field("store", &self.store)
+            .field("config", &self.config)
+            .field("base", &self.base)
+            .field("dut_id", &self.dut_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The guard itself; Salvo hoops must be `Clone + Send + Sync`.
 #[derive(Clone)]
 pub(crate) struct TransferGuard(pub Arc<TransferState>);
@@ -468,7 +480,7 @@ async fn authorize_resource(
 async fn complete(state: &TransferState, res: &mut Response, id: &str) {
     if !matches!(
         res.status_code,
-        Some(StatusCode::CREATED) | Some(StatusCode::NO_CONTENT)
+        Some(StatusCode::CREATED | StatusCode::NO_CONTENT)
     ) {
         return;
     }
@@ -495,22 +507,18 @@ async fn complete(state: &TransferState, res: &mut Response, id: &str) {
         }
         // The record is ours. If it cannot be read back, the upload cannot be
         // trusted, so fail closed instead of publishing it unverified.
-        Some(record) => match record
+        Some(record) => if let Some(declared) = record
             .as_deref()
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(Checksum::from_metadata)
-        {
-            Some(declared) => declared,
-            None => {
-                discard(state, id, "stored checksum record is unreadable".to_owned()).await;
-                render_rejection(
-                    res,
-                    Rejection::VerificationFailed(
-                        "stored checksum record is unreadable".to_owned(),
-                    ),
-                );
-                return;
-            }
+            .and_then(Checksum::from_metadata) { declared } else {
+            discard(state, id, "stored checksum record is unreadable".to_owned()).await;
+            render_rejection(
+                res,
+                Rejection::VerificationFailed(
+                    "stored checksum record is unreadable".to_owned(),
+                ),
+            );
+            return;
         },
     };
     let Ok(marker) = state.store.verified_marker(id) else {

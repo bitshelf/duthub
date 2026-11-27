@@ -30,6 +30,7 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, SessionStatus::Stopped | SessionStatus::Failed(_))
     }
@@ -84,10 +85,13 @@ impl TranscriptEntry {
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 #[derive(Debug)]
@@ -113,6 +117,7 @@ impl Default for SessionView {
 }
 
 impl SessionView {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             status: Mutex::new(SessionStatus::Stopped),
@@ -257,14 +262,13 @@ impl SessionView {
     /// 追加内存 + 文件记录；文件到 8 MiB 后停写并只补一条 System 注记。
     pub fn push_with_log(&self, entry: TranscriptEntry, log: &mut TranscriptLog) {
         match log.append(&entry) {
-            AppendOutcome::Written | AppendOutcome::Capped => {}
             AppendOutcome::Failed(error) if !log.failure_noted => {
                 log.failure_noted = true;
                 self.push_entry(TranscriptEntry::system(format!(
                     "transcript 文件写入失败，后续只保留内存记录: {error}"
                 )));
             }
-            AppendOutcome::Failed(_) => {}
+            AppendOutcome::Written | AppendOutcome::Capped | AppendOutcome::Failed(_) => {}
         }
         self.push_entry(entry);
         if log.cap_noted {
@@ -297,6 +301,7 @@ pub struct TranscriptLog {
 
 impl TranscriptLog {
     /// 打开（追加）transcript；I/O 失败降级为只记内存，不阻塞会话。
+    #[must_use]
     pub fn open(path: &Path) -> Self {
         let (file, failure_note) = match OpenOptions::new().create(true).append(true).open(path) {
             Ok(file) => (Some(file), None),
@@ -373,10 +378,12 @@ impl TranscriptLog {
         }
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    #[must_use]
     pub fn is_capped(&self) -> bool {
         self.capped
     }

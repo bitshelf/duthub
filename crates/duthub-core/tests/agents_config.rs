@@ -137,7 +137,7 @@ fn corrupt_file_is_backed_up_and_load_fails_closed() {
     assert!(!agents_path(&dir).exists(), "损坏文件必须被移走");
     let backups = std::fs::read_dir(&dir)
         .unwrap()
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| {
             entry
                 .file_name()
@@ -199,7 +199,7 @@ fn corrupt_bindings_fail_closed_with_backup() {
     assert!(load_agent_bindings(&dir).is_err());
     let backups = std::fs::read_dir(&dir)
         .unwrap()
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| {
             entry
                 .file_name()

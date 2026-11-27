@@ -211,7 +211,10 @@ fn flash_stops_once_the_cap_is_reached_without_a_reason() {
 #[test]
 // The limits are compile-time constants; clippy's constant-assertion lint
 // fires here but the whole point is a static policy check.
-#[allow(clippy::assertions_on_constants)]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "static policy check verifying compile-time flash limit constants"
+)]
 fn flash_policy_stays_within_the_agreed_limits() {
     // The design caps blinking at 30 s and alternates on whole half-periods.
     assert!(FLASH_MAX_MS <= 30_000);

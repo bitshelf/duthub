@@ -1,6 +1,6 @@
 //! MCP HTTP 认证/授权/租约端到端（方案 N8；docs/SECURITY.md）：
 //! 401 统一拒绝 / 无授权 DUT 写拒绝（UNAUTHORIZED）/ 无租约写拒绝（LeaseRequired/Missing）/
-//! 过期租约写拒绝（LeaseRequired/LEASE_EXPIRED）/ 有效租约流放行（归属 + generation）。
+//! `过期租约写拒绝（LeaseRequired/LEASE_EXPIRED`）/ 有效租约流放行（归属 + generation）。
 //!
 //! 全内存构造（不落盘，坑 #25 e2e 红线）：AuthSvc 走真实 axum Router + 随机回环端口；
 //! 工具层直接调 `#[tool]` 方法（rmcp 提取器直接构造）。
@@ -23,7 +23,7 @@ use duthub_mcp::state::{
 };
 
 /// 记录型测试状态源：写工具记录收到的写身份；控制权四件套直连真实租约管理器
-/// （与 RuntimeMcpState 同逻辑）。
+/// （与 `RuntimeMcpState` 同逻辑）。
 struct RecordingState {
     lease: Arc<ControlLeaseManager>,
     approval: duthub_core::ApprovalManager,
@@ -119,7 +119,7 @@ impl McpState for RecordingState {
                 dut_id: dut_id.to_owned(),
                 name: "OtherDut".into(),
                 source: "idle".into(),
-                serial: Default::default(),
+                serial: SerialBindInfo::default(),
                 adb_serial: None,
                 relay: None,
                 mcp_label: None,
@@ -440,7 +440,7 @@ fn expired_lease_write_rejected() {
 }
 
 /// 有效租约流放行：acquire → 写（归属当前凭据 + generation 复核）→ release；
-/// 期间 GUI 侧（本地管理员）的另一个凭据不能使用该租约（NOT_HOLDER）。
+/// 期间 GUI `侧（本地管理员）的另一个凭据不能使用该租约（NOT_HOLDER`）。
 #[test]
 fn valid_lease_flow_admits_and_fences() {
     let (ctx, _token) = access_ctx(true, Duration::from_secs(120));
@@ -678,6 +678,8 @@ async fn stateless_http_discovery_and_tools_use_json_and_require_bearer() {
 
 #[tokio::test]
 async fn valid_bearer_reads_only_its_dut_and_cannot_dispatch_writes() {
+    use std::io::Write;
+
     use rmcp::model::{CallToolRequestParams, ClientConfig};
     use rmcp::service::serve_client;
     use rmcp::transport::streamable_http_client::{
@@ -686,7 +688,6 @@ async fn valid_bearer_reads_only_its_dut_and_cannot_dispatch_writes() {
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (ctx, token) = access_ctx(true, Duration::from_secs(120));
-    use std::io::Write;
     let root = tempfile::tempdir().unwrap();
     let mut state = RecordingState::new(ctx.lease.clone());
     Arc::get_mut(&mut state).unwrap().artifact_root = Some(root.path().to_owned());
@@ -936,7 +937,7 @@ fn shared_token_cannot_reacquire_an_active_lease() {
     assert!(ctx.lease.acquire("dut-1", &other, None).is_ok());
 }
 
-/// 最小 HTTP/1.1 JSON-RPC 客户端（std TcpStream + tokio），返回状态码（与可选 body）。
+/// 最小 HTTP/1.1 JSON-RPC 客户端（std `TcpStream` + tokio），返回状态码（与可选 body）。
 async fn post_json(addr: std::net::SocketAddr, auth: Option<&str>, body: &str) -> u16 {
     post_json_with_body(addr, auth, body).await.0
 }
@@ -1106,7 +1107,7 @@ async fn dut_bound_listener_http_scope_and_default_dut() {
 }
 
 /// `skill_export` 授权（W1 / T17）：零 grant 的 HTTP 凭据被拒绝，有任意 DUT
-/// read 授权的凭据可读；stdio LocalAdmin 的放行由 server 单测覆盖。
+/// read 授权的凭据可读；stdio `LocalAdmin` 的放行由 server 单测覆盖。
 #[tokio::test]
 async fn skill_export_requires_a_read_grant_over_http() {
     use rmcp::model::{CallToolRequestParams, ClientConfig};

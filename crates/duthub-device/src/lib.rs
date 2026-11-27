@@ -3,6 +3,8 @@
 //! 门面 `DeviceService` 提供同步 API（GPUI/TUI 线程直接调用）；
 //! 内部持有独立 tokio runtime，每个会话一个独占 task（读写同 task）。
 
+#![forbid(unsafe_code)]
+
 pub mod boot_reference;
 pub mod bus;
 pub mod control;
@@ -81,8 +83,18 @@ pub struct DeviceService {
     garble_enabled: Arc<Mutex<std::collections::HashMap<String, bool>>>,
 }
 
+impl std::fmt::Debug for DeviceService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceService")
+            .field("logs_dir", &self.logs_dir)
+            .field("demo_delay_ms", &self.demo_delay_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DeviceService {
     /// Construct a `DeviceService` with its own background Tokio runtime.
+    #[must_use]
     pub fn custom(bus_capacity: usize, logs_dir: PathBuf, demo_delay_ms: u64) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -98,6 +110,7 @@ impl DeviceService {
     }
 
     /// Construct a `DeviceService` sharing an externally owned Tokio runtime handle.
+    #[must_use]
     pub fn with_runtime(
         handle: tokio::runtime::Handle,
         bus_capacity: usize,
@@ -135,12 +148,14 @@ impl DeviceService {
         }
     }
 
+    #[must_use]
     pub fn with_log_archives(mut self, enabled: bool) -> Self {
         self.archive_saving = Some(Arc::new(AtomicBool::new(enabled)));
         self
     }
 
     /// 会话日志开关（串口设置页 `serial.sessionLogDisabled` 反值）。
+    #[must_use]
     pub fn with_session_logging(self, enabled: bool) -> Self {
         self.session_log_enabled.store(enabled, Ordering::Release);
         self
@@ -148,6 +163,7 @@ impl DeviceService {
 
     /// 终端回滚缓冲行数（串口设置页 `serial.scrollbackRows`；下限 100）。
     /// Retain the requested history and limit the size of each live frame.
+    #[must_use]
     pub fn with_scrollback(self, rows: usize) -> Self {
         self.configure_scrollback(Some(rows));
         self
@@ -193,10 +209,10 @@ impl DeviceService {
     }
 
     /// 会话日志开关即时生效：活动会话的写线程同步开关；新会话按构造值。
-    /// 总线事件（MCP serial_read / UI 注记）不受影响——只关文件落盘。
+    /// 总线事件（MCP `serial_read` / UI 注记）不受影响——只关文件落盘。
     pub fn set_session_logging(&self, enabled: bool) {
         let writers: Vec<Arc<Mutex<SessionLogWriter>>> = {
-            let registry = self.registry.lock().unwrap();
+            let registry = duthub_core::util::lock_unpoisoned(&self.registry);
             registry
                 .session_ids()
                 .iter()
@@ -235,6 +251,7 @@ impl DeviceService {
         }
     }
 
+    #[must_use]
     pub fn with_portable_archives(
         mut self,
         root: PathBuf,
@@ -246,13 +263,17 @@ impl DeviceService {
         self.with_log_archives(enabled)
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "public API used by desktop callers"
+    )]
     pub fn configure_serial_log(
         &self,
         dut_id: &str,
         options: SerialLogOptions<'_>,
     ) -> DeviceResult<()> {
         let (logs, sender) = {
-            let registry = self.registry.lock().unwrap();
+            let registry = duthub_core::util::lock_unpoisoned(&self.registry);
             let Some(handle) = registry.get(dut_id) else {
                 return Ok(());
             };
@@ -267,14 +288,14 @@ impl DeviceService {
                 })
                 .map_err(|_| DeviceError::Invalid("日志写线程已退出".into()))
         } else {
-            logs.lock().unwrap().set_log_mode(options.split, reference)
+            duthub_core::util::lock_unpoisoned(&logs).set_log_mode(options.split, reference)
         }
     }
 
     pub fn apply_boot_reference(&self, dut_id: &str, path: &std::path::Path) -> DeviceResult<()> {
         let reference = boot_reference::BootReference::load(path)
             .map_err(|error| DeviceError::Invalid(error.to_string()))?;
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
             return Ok(());
         };
@@ -283,7 +304,7 @@ impl DeviceService {
                 .send(crate::demo::LogMsg::SetBootReference(reference))
                 .map_err(|_| DeviceError::Invalid("日志写线程已退出".into()))
         } else {
-            let mut writer = handle.logs.lock().unwrap();
+            let mut writer = duthub_core::util::lock_unpoisoned(&handle.logs);
             writer.flush_rx_prefix()?;
             writer.set_boot_reference(Some(reference));
             Ok(())
@@ -292,7 +313,7 @@ impl DeviceService {
 
     pub fn log_control_boundary(&self, dut_id: &str, label: &str, split: bool) -> DeviceResult<()> {
         let (logs, log_tx) = {
-            let registry = self.registry.lock().unwrap();
+            let registry = duthub_core::util::lock_unpoisoned(&self.registry);
             let handle = registry.get(dut_id).ok_or(DeviceError::NotFound)?;
             (handle.logs.clone(), handle.log_tx.clone())
         };
@@ -300,32 +321,29 @@ impl DeviceService {
         if split {
             // Complete the durable boundary after earlier RX work and before
             // the control service dispatches a power operation.
-            match log_tx {
-                Some(tx) => {
-                    let (ack, rx) = std::sync::mpsc::channel();
-                    if tx
-                        .send(crate::demo::LogMsg::MarkSync {
-                            line: line.clone(),
-                            ack,
-                        })
-                        .is_ok()
-                    {
-                        rx.recv().map_err(|_| {
-                            DeviceError::Invalid("日志写线程已退出，分段未确认".into())
-                        })?
-                    } else {
-                        // Writer thread gone: inline mark + companion rec record.
-                        let mut writer = logs.lock().unwrap();
-                        writer.power_mark(&line)
-                    }
-                }
-                None => {
-                    let mut writer = logs.lock().unwrap();
+            if let Some(tx) = log_tx {
+                let (ack, rx) = std::sync::mpsc::channel();
+                if tx
+                    .send(crate::demo::LogMsg::MarkSync {
+                        line: line.clone(),
+                        ack,
+                    })
+                    .is_ok()
+                {
+                    rx.recv().map_err(|_| {
+                        DeviceError::Invalid("日志写线程已退出，分段未确认".into())
+                    })?
+                } else {
+                    // Writer thread gone: inline mark + companion rec record.
+                    let mut writer = duthub_core::util::lock_unpoisoned(&logs);
                     writer.power_mark(&line)
                 }
+            } else {
+                let mut writer = duthub_core::util::lock_unpoisoned(&logs);
+                writer.power_mark(&line)
             }
         } else {
-            let mut writer = logs.lock().unwrap();
+            let mut writer = duthub_core::util::lock_unpoisoned(&logs);
             let result = writer.append_text(&line);
             let _ = writer.append_rec(crate::rec::RecKind::Note, line.as_bytes());
             result
@@ -333,12 +351,14 @@ impl DeviceService {
     }
 
     /// 接线控制租约管理器（builder）。接管写入通道 admit 与 GUI 会话自动租约。
+    #[must_use]
     pub fn with_lease_authority(mut self, lease: Arc<ControlLeaseManager>) -> Self {
         self.lease = Some(lease);
         self
     }
 
     /// 接线审计接收端（写入通道 deny 审计；租约事件审计由管理器自带）。
+    #[must_use]
     pub fn with_audit_sink(mut self, audit: Arc<AuditSink>) -> Self {
         self.audit = Some(audit);
         self
@@ -379,12 +399,12 @@ impl DeviceService {
         self.bus.last_seq(&format!("sess-{dut_id}"))
     }
 
-    /// Write a storage-only boundary. An unopened session returns NotFound.
+    /// Write a storage-only boundary. An unopened session returns `NotFound`.
     pub fn log_mark(&self, dut_id: &str, label: &str) -> DeviceResult<()> {
         if self.archive_saving.is_some() {
             return self.log_control_boundary(dut_id, label, true);
         }
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
             return Err(DeviceError::NotFound);
         };
@@ -401,7 +421,7 @@ impl DeviceService {
     /// （日志读方 / 测试在会话未关闭时需要确定性的落盘点用）。
     pub fn flush_session_logs(&self, dut_id: &str) {
         let tx = {
-            let registry = self.registry.lock().unwrap();
+            let registry = duthub_core::util::lock_unpoisoned(&self.registry);
             registry.get(dut_id).and_then(|h| h.log_tx.clone())
         };
         if let Some(tx) = tx {
@@ -427,7 +447,7 @@ impl DeviceService {
         }
     }
 
-    /// 打开会话；同端口互斥（Busy）。返回 session_id（`sess-<dut>`）。
+    /// 打开会话；同端口互斥（Busy）。返回 `session_id`（`sess-<dut>`）。
     pub fn open_session(
         &self,
         dut_id: &str,
@@ -460,6 +480,10 @@ impl DeviceService {
         )
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "public API used by desktop callers"
+    )]
     pub fn open_named_session_with_log_options(
         &self,
         dut_id: &str,
@@ -470,7 +494,7 @@ impl DeviceService {
         options: SerialLogOptions<'_>,
     ) -> DeviceResult<String> {
         let reference = options.load_reference(dut_id);
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = duthub_core::util::lock_unpoisoned(&self.registry);
         if registry.is_reserved(dut_id) {
             return Err(DeviceError::Busy);
         }
@@ -504,7 +528,7 @@ impl DeviceService {
         let logs = Arc::new(Mutex::new(writer));
         // 会话日志开关（串口设置页）：按构造值初始化写线程开关
         if !self.session_log_enabled.load(Ordering::Acquire) {
-            logs.lock().unwrap().set_enabled(false);
+            duthub_core::util::lock_unpoisoned(&logs).set_enabled(false);
         }
         self.bus.drop_session(&session_id);
         let bus = self.bus.clone();
@@ -554,7 +578,7 @@ impl DeviceService {
                 self.runtime.spawn(async move {
                     let _ = join.await;
                     let final_seq = {
-                        let mut registry = registry.lock().unwrap();
+                        let mut registry = duthub_core::util::lock_unpoisoned(&registry);
                         if registry.finish(&dut_id, actor).is_none() {
                             return;
                         }
@@ -580,7 +604,7 @@ impl DeviceService {
     /// Request closure. The actor releases its port and lease after it exits.
     #[tracing::instrument(name = "serial.close", skip(self), fields(dut_id, ok))]
     pub fn close_session(&self, dut_id: &str) -> DeviceResult<()> {
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.begin_close(dut_id) else {
             tracing::warn!(dut_id, "serial.close not found");
             return Err(DeviceError::NotFound);
@@ -602,17 +626,17 @@ impl DeviceService {
     ///
     /// 多行文本先归一为 CR 分隔（P2-034）：CRLF 折叠为 CR、单个 LF 替换为 CR，
     /// 裸 LF 直传会让设备 shell 行编辑回显错乱、.log `[TX]` 注记跨行续行无前缀。
-    /// 行尾追加策略（[`LineEnding`]）只作用于末尾，不受影响。write_bytes 与
+    /// 行尾追加策略（[`LineEnding`]）`只作用于末尾，不受影响。write_bytes` 与
     /// GUI 键盘/粘贴路径不做此归一（粘贴路径在 UI 层自带归一）。
     ///
     /// `writer` 声明写入者身份，写入通道内租约复核（[D] 入口点，registry 锁内、
-    /// try_send 前）：GUI 自动持有租约（人类在场）、Agent 凭 lease 通过、
+    /// `try_send` 前）：GUI 自动持有租约（人类在场）、Agent 凭 lease 通过、
     /// System（心跳）放行——例外见 [`duthub_core::lease::WriteIdentity`]。
     #[tracing::instrument(name = "serial.write", skip(self, text), fields(dut_id, len = text.len(), ok))]
     pub fn write_line(&self, dut_id: &str, writer: WriteIdentity, text: &str) -> DeviceResult<()> {
         // P2-034：CRLF → CR，再清掉残留的单个 LF（顺序保证不产生 \r\r\n 混排）
         let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-        self.enqueue_line(dut_id, writer, |lease| SessionCommand::Write {
+        self.enqueue_line(dut_id, &writer, |lease| SessionCommand::Write {
             text: normalized,
             lease,
         })
@@ -624,7 +648,7 @@ impl DeviceService {
         writer: WriteIdentity,
         batch: Arc<heartbeat::HeartbeatBatch>,
     ) -> DeviceResult<()> {
-        self.enqueue_line(dut_id, writer, |lease| {
+        self.enqueue_line(dut_id, &writer, |lease| {
             SessionCommand::WriteHeartbeatBatch {
                 text: batch.wire_text(),
                 batch,
@@ -636,15 +660,15 @@ impl DeviceService {
     fn enqueue_line(
         &self,
         dut_id: &str,
-        writer: WriteIdentity,
+        writer: &WriteIdentity,
         command: impl FnOnce(Option<WriteCtx>) -> SessionCommand,
     ) -> DeviceResult<()> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
             return Err(DeviceError::NotFound);
         };
         // [D] 入口复核（授权→租约→generation 的租约+代数部分；授权在 MCP 层）
-        let lease = self.admit(dut_id, &writer)?;
+        let lease = self.admit(dut_id, writer)?;
         handle.cmd_tx.try_send(command(lease)).map_err(|e| match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => DeviceError::Busy,
             tokio::sync::mpsc::error::TrySendError::Closed(_) => DeviceError::Disconnected,
@@ -653,7 +677,7 @@ impl DeviceService {
 
     #[tracing::instrument(name = "serial.set_baud", skip(self), fields(dut_id, baud, ok))]
     pub fn set_baud(&self, dut_id: &str, baud: u32) -> DeviceResult<()> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
             return Err(DeviceError::NotFound);
         };
@@ -665,7 +689,7 @@ impl DeviceService {
 
     /// 会话级行尾策略（H1.2）：无 / \n / \r\n，随后的写入按该策略生效。
     pub fn set_line_ending(&self, dut_id: &str, ending: LineEnding) -> DeviceResult<()> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
             return Err(DeviceError::NotFound);
         };
@@ -678,13 +702,17 @@ impl DeviceService {
     /// 原始字节直写（PuTTY 键盘路径）：不做行尾追加、不发 [TX] 回显。
     /// UI 键盘输入（字符 / Enter \r / Backspace 0x7f）走这条路径。
     /// 租约复核与 [`Self::write_line`] 同规则（[D] 入口 + [E] actor 双点）。
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "public API used by desktop callers"
+    )]
     pub fn write_bytes(
         &self,
         dut_id: &str,
         writer: WriteIdentity,
         bytes: &[u8],
     ) -> DeviceResult<()> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
             return Err(DeviceError::NotFound);
         };
@@ -701,7 +729,7 @@ impl DeviceService {
             })
     }
 
-    /// [D] 入口租约复核（写入唯一通道，try_send 前、registry 锁内）。
+    /// [D] `入口租约复核（写入唯一通道，try_send` 前、registry 锁内）。
     /// 未接线租约时返回 Ok(None)（既有路径零改动）。
     /// 拒绝 → 审计 write.deny + `DeviceError::Lease`（GUI 优先无条件生效）。
     fn admit(&self, dut_id: &str, writer: &WriteIdentity) -> Result<Option<WriteCtx>, DeviceError> {
@@ -760,7 +788,7 @@ impl DeviceService {
     /// 终端网格重设尺寸（窗口 resize → real 会话 term.resize(cols, rows)）。
     /// 会话不存在时静默忽略（会话打开后的下一帧会重发）。
     pub fn resize_terminal(&self, dut_id: &str, cols: usize, rows: usize) -> DeviceResult<()> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
             return Err(DeviceError::NotFound);
         };
@@ -772,7 +800,7 @@ impl DeviceService {
 
     /// 恢复当前会话的本地终端仿真状态。
     pub fn reset_terminal(&self, dut_id: &str) -> DeviceResult<()> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let handle = registry.get(dut_id).ok_or(DeviceError::NotFound)?;
         handle
             .cmd_tx
@@ -788,7 +816,7 @@ impl DeviceService {
         dut_id: &str,
         skip: usize,
     ) -> DeviceResult<tokio::sync::oneshot::Receiver<crate::term::TerminalHistoryPage>> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let handle = registry.get(dut_id).ok_or(DeviceError::NotFound)?;
         let (reply, receiver) = tokio::sync::oneshot::channel();
         handle
@@ -802,9 +830,9 @@ impl DeviceService {
     }
 
     /// 手动重连（H1.4）：唤醒退避等待立即重试。连接正常时为无害唤醒
-    /// （notify_one 存许可，下一次断线退避立即返回一次）。
+    /// （`notify_one` 存许可，下一次断线退避立即返回一次）。
     pub fn manual_reconnect(&self, dut_id: &str) -> DeviceResult<()> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let handle = registry.get(dut_id).ok_or(DeviceError::NotFound)?;
         handle.reconnect_notify.notify_one();
         Ok(())
@@ -812,7 +840,7 @@ impl DeviceService {
 
     /// 全部活跃会话摘要（UI tab 渲染用）。
     pub fn sessions(&self) -> Vec<SessionSummary> {
-        let registry = self.registry.lock().unwrap();
+        let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         registry
             .session_ids()
             .into_iter()
@@ -828,7 +856,7 @@ impl DeviceService {
     }
 
     pub fn session_source(&self, dut_id: &str) -> Option<&'static str> {
-        match self.registry.lock().unwrap().get(dut_id).map(|h| h.kind) {
+        match duthub_core::util::lock_unpoisoned(&self.registry).get(dut_id).map(|h| h.kind) {
             Some(SessionKind::Demo) => Some("demo"),
             Some(SessionKind::Real) => Some("device"),
             None => None,
@@ -851,7 +879,7 @@ impl DeviceService {
 
     /// `.rec` segments of a session's structured record log, oldest first.
     /// Normal mode: `logs_dir/sess-{dut_id}.rec(.N)`. Archive modes locate the
-    /// DUT folder by stable dut_id (owner-file match — the folder name follows
+    /// DUT folder by stable `dut_id` (owner-file match — the folder name follows
     /// the archived DUT name and may differ from any display name), then
     /// collect both layouts (portable `logs/NAME-*.rec`, flat
     /// `dut-<hex>-*.rec`).
@@ -859,13 +887,12 @@ impl DeviceService {
         if self.archive_saving.is_none() {
             return crate::rec::list_rec_segments(&self.logs_dir, &format!("sess-{dut_id}"));
         }
-        let entries = match std::fs::read_dir(&self.logs_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Vec::new(),
+        let Ok(entries) = std::fs::read_dir(&self.logs_dir) else {
+            return Vec::new();
         };
         let mut folder = None;
         for entry in entries.flatten() {
-            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().to_string();
@@ -887,7 +914,9 @@ impl DeviceService {
             let prefix = duthub_core::log_archive::archive_prefix(dut_id);
             for entry in entries.flatten() {
                 let file_name = entry.file_name().to_string_lossy().to_string();
-                let owned = file_name.ends_with(".rec")
+                let owned = std::path::Path::new(&file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rec"))
                     && (dir.ends_with("logs") || file_name.starts_with(&prefix));
                 if owned {
                     found.push(entry.path());
@@ -907,6 +936,7 @@ pub struct SessionSummary {
     pub port: String,
 }
 
+#[derive(Debug)]
 pub struct SerialLogOptions<'a> {
     pub split: bool,
     pub reference: Option<&'a std::path::Path>,
@@ -968,7 +998,7 @@ mod tests {
                         out.push(text);
                     }
                 }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                 Err(_) => break,
             }
         }
@@ -979,15 +1009,15 @@ mod tests {
     fn open_twice_on_same_port_is_busy() {
         let service = test_service("busy");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         let err = service
-            .open_session("dut-b", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-b", "COM3", 115_200, SessionKind::Demo)
             .unwrap_err();
         assert!(matches!(err, DeviceError::Busy));
         // 不同端口可开
         service
-            .open_session("dut-b", "COM5", 115200, SessionKind::Demo)
+            .open_session("dut-b", "COM5", 115_200, SessionKind::Demo)
             .unwrap();
     }
 
@@ -995,11 +1025,11 @@ mod tests {
     fn same_dut_cannot_open_twice() {
         let service = test_service("dupdut");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         assert!(
             service
-                .open_session("dut-a", "COM7", 115200, SessionKind::Demo)
+                .open_session("dut-a", "COM7", 115_200, SessionKind::Demo)
                 .is_err()
         );
     }
@@ -1009,13 +1039,13 @@ mod tests {
         let service = test_service("close");
         let _rx = service.subscribe();
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         service.close_session("dut-a").unwrap();
         // A different DUT can take the port only after the original actor exits.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            match service.open_session("dut-b", "COM3", 115200, SessionKind::Demo) {
+            match service.open_session("dut-b", "COM3", 115_200, SessionKind::Demo) {
                 Ok(_) => break,
                 Err(DeviceError::Busy) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(5));
@@ -1045,7 +1075,7 @@ mod tests {
         let service = test_service("write");
         let mut rx = service.subscribe();
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         std::thread::sleep(Duration::from_millis(120)); // 启动日志
         let _ = absorb_texts(&mut rx);
@@ -1071,7 +1101,7 @@ mod tests {
     fn logs_are_written_to_disk() {
         let service = test_service("logs");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         service
@@ -1094,7 +1124,7 @@ mod tests {
         let service = test_service("tx-echo");
         let _rx = service.subscribe();
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         service
@@ -1140,13 +1170,13 @@ mod tests {
         service.close_session("dut-a").ok();
     }
 
-    /// P2-034：多行 write_line 归一为 CR 分隔——线上 payload 的行分隔符为 CR
+    /// P2-034：多行 `write_line` 归一为 CR 分隔——线上 payload 的行分隔符为 CR
     /// （末尾行尾仍按行尾策略追加），.log 的 [TX] 注记单行化、无裸续行。
     #[test]
     fn write_line_normalizes_newlines_to_cr() {
         let service = test_service("multiline");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         service
@@ -1185,12 +1215,12 @@ mod tests {
         );
     }
 
-    /// H1.4：手动重连——存在会话时无害唤醒（demo 驱动无等待者），不存在时 NotFound。
+    /// H1.4：手动重连——存在会话时无害唤醒（demo 驱动无等待者），不存在时 `NotFound`。
     #[test]
     fn manual_reconnect_is_wakeup_not_error() {
         let service = test_service("reconnect");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         service.manual_reconnect("dut-a").unwrap();
         std::thread::sleep(Duration::from_millis(60));
@@ -1209,7 +1239,7 @@ mod tests {
     fn log_mark_stays_on_disk_and_out_of_the_serial_stream() {
         let service = test_service("mark");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         assert!(matches!(
             service.log_mark("dut-missing", "x"),
@@ -1250,7 +1280,7 @@ mod tests {
         DeviceService::custom(64, dir, 0).with_session_logging(session_logging)
     }
 
-    /// 写入一行并轮询等待 demo 响应（RX，emit_raw）落盘——flush 屏障保证
+    /// 写入一行并轮询等待 demo `响应（RX，emit_raw）落盘——flush` 屏障保证
     /// 确定性的落盘点：响应入盘意味着此前入队的日志消息全部写完。
     fn write_until_on_disk(service: &DeviceService, dut: &str, line: &str, expect: &str) {
         service.write_line(dut, WriteIdentity::gui(), line).unwrap();
@@ -1268,14 +1298,14 @@ mod tests {
         panic!("写入内容未在 2s 内落盘: {expect}");
     }
 
-    /// LOG-5 MarkSync 同步路径（排空语义）：RX 先入队 → log_control_boundary
+    /// LOG-5 `MarkSync` 同步路径（排空语义）：RX 先入队 → `log_control_boundary`
     /// (split=true) 同步返回 → mark 行必须落在已入队 RX 之后，并切段开启新段。
     /// 同步返回由「unwrap 后立刻读盘、无 sleep」锁定。
     #[test]
     fn log_control_boundary_drains_pending_rx_before_mark() {
         let service = test_service("boundary-drain");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         // RX 先入队：demo shell 响应（emit_raw → 总线 + 写线程队列）
         write_until_on_disk(&service, "dut-a", "probe-before-mark", "Executed (demo)");
@@ -1300,14 +1330,14 @@ mod tests {
     fn log_control_boundary_reports_sync_error_at_rotation_cap() {
         let service = test_service("boundary-cap");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         let mut attempts = 0usize;
         let err = loop {
             attempts += 1;
             assert!(attempts <= 64, "分段必须在上限处失败而不是无限成功");
             match service.log_control_boundary("dut-a", &format!("seg-{attempts}"), true) {
-                Ok(()) => continue,
+                Ok(()) => {}
                 Err(err) => break err,
             }
         };
@@ -1331,24 +1361,24 @@ mod tests {
         service.close_session("dut-a").ok();
     }
 
-    /// LOG-4 DeviceService 扇出接线（漏改时门禁不会变红的那半段）：开关同步
+    /// LOG-4 `DeviceService` 扇出接线（漏改时门禁不会变红的那半段）：开关同步
     /// 生效到全部活动会话写线程——关闭期间两会话 .log/.bin 逐字节不变而总线
-    /// SerialChunk 照常；重开后同文件续写。
+    /// `SerialChunk` 照常；重开后同文件续写。
     #[test]
     fn session_logging_toggle_fans_out_to_active_sessions() {
         let service = test_service("log-fanout");
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         service
-            .open_session("dut-b", "COM5", 115200, SessionKind::Demo)
+            .open_session("dut-b", "COM5", 115_200, SessionKind::Demo)
             .unwrap();
         write_until_on_disk(&service, "dut-a", "probe-on-a", "Executed (demo)");
         write_until_on_disk(&service, "dut-b", "probe-on-b", "Executed (demo)");
-        let log_a_before = std::fs::read(service.logs_dir().join("sess-dut-a.log")).unwrap();
-        let bin_a_before = std::fs::read(service.logs_dir().join("sess-dut-a.bin")).unwrap();
-        let log_b_before = std::fs::read(service.logs_dir().join("sess-dut-b.log")).unwrap();
-        let bin_b_before = std::fs::read(service.logs_dir().join("sess-dut-b.bin")).unwrap();
+        let first_log_before = std::fs::read(service.logs_dir().join("sess-dut-a.log")).unwrap();
+        let first_bin_before = std::fs::read(service.logs_dir().join("sess-dut-a.bin")).unwrap();
+        let second_log_before = std::fs::read(service.logs_dir().join("sess-dut-b.log")).unwrap();
+        let second_bin_before = std::fs::read(service.logs_dir().join("sess-dut-b.bin")).unwrap();
 
         // 关闭：扇出到两个活动会话——文件逐字节不变，总线事件照常
         service.set_session_logging(false);
@@ -1377,22 +1407,22 @@ mod tests {
         service.flush_session_logs("dut-b");
         assert_eq!(
             std::fs::read(service.logs_dir().join("sess-dut-a.log")).unwrap(),
-            log_a_before,
+            first_log_before,
             "关闭后 dut-a .log 不得新增内容"
         );
         assert_eq!(
             std::fs::read(service.logs_dir().join("sess-dut-a.bin")).unwrap(),
-            bin_a_before,
+            first_bin_before,
             "关闭后 dut-a .bin 不得新增内容"
         );
         assert_eq!(
             std::fs::read(service.logs_dir().join("sess-dut-b.log")).unwrap(),
-            log_b_before,
+            second_log_before,
             "关闭后 dut-b .log 不得新增内容"
         );
         assert_eq!(
             std::fs::read(service.logs_dir().join("sess-dut-b.bin")).unwrap(),
-            bin_b_before,
+            second_bin_before,
             "关闭后 dut-b .bin 不得新增内容"
         );
 
@@ -1415,7 +1445,7 @@ mod tests {
     fn new_sessions_initialize_from_session_logging_flag() {
         let service = test_service_with("log-init", false);
         service
-            .open_session("dut-a", "COM3", 115200, SessionKind::Demo)
+            .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
         service
             .write_line("dut-a", WriteIdentity::gui(), "probe-while-disabled")
@@ -1442,7 +1472,7 @@ mod tests {
         // 全局重开：活动会话（dut-a）与后续新建会话（dut-b）都按 true 生效
         service.set_session_logging(true);
         service
-            .open_session("dut-b", "COM5", 115200, SessionKind::Demo)
+            .open_session("dut-b", "COM5", 115_200, SessionKind::Demo)
             .unwrap();
         write_until_on_disk(&service, "dut-b", "probe-after-enable", "Executed (demo)");
         let text = std::fs::read_to_string(service.logs_dir().join("sess-dut-b.log")).unwrap();

@@ -250,7 +250,7 @@ fn spawn_count(counter: &Path) -> usize {
 }
 
 /// Where the fake agent's spawn marker must live: inside the DUT's writable
-/// sandbox cell. Since ADR-12 the Agent runs under a WRITE_RESTRICTED token, so
+/// sandbox cell. Since ADR-12 the Agent runs under a `WRITE_RESTRICTED` token, so
 /// a counter next to the script (outside the cell) is denied by the kernel —
 /// the fixture has to write where the real Agent may write.
 fn sandbox_counter(work: &Path, dut: &str, mode: &str) -> PathBuf {
@@ -318,8 +318,7 @@ fn restart_only_after_ready() {
         "重启用尽后必须 Failed：{:?} stderr={}",
         status_of(&host, "dut-crash"),
         host.view("dut-crash")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     assert_eq!(
         spawn_count(&crash_counter),
@@ -399,8 +398,7 @@ fn stop_cancels_pending_restart_without_new_spawn() {
         "会话未就绪：{:?} stderr={}",
         status_of(&host, "dut-stop"),
         host.view("dut-stop")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     // After the fake exits, the worker settles in Stopped and then resets to
     // Starting while it waits out the 1s backoff.

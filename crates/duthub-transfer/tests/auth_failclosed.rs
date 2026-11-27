@@ -274,9 +274,8 @@ async fn transfer_dir_rejections_fail_at_construction() {
             transfer_dir: Some(bad.to_string()),
             ..test_config(tmp.path())
         };
-        let error = match duthub_transfer::TransferServer::new_in(tmp.path(), config, None) {
-            Err(error) => error,
-            Ok(_) => panic!("expected a config error for {bad:?}"),
+        let Err(error) = duthub_transfer::TransferServer::new_in(tmp.path(), config, None) else {
+            panic!("expected a config error for {bad:?}");
         };
         assert!(
             matches!(error, duthub_transfer::TransferError::Config(_)),

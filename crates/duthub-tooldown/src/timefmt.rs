@@ -16,8 +16,7 @@ pub(crate) fn unix_secs_to_rfc3339(secs: i64) -> String {
 pub(crate) fn now_rfc3339_utc() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs().cast_signed());
     unix_secs_to_rfc3339(secs)
 }
 
@@ -30,8 +29,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(31); // [1, 31]
+    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(12); // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 

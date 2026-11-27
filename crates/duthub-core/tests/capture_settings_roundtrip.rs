@@ -14,8 +14,7 @@ fn manifest_dir() -> PathBuf {
     // Runtime read: `env!` bakes an absolute path that goes stale when the
     // directory is renamed (cargo fingerprints do not include it).
     std::env::var("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+        .map_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
 }
 
 /// Minimal settings.json in the same shape as `docs/examples/settings.json`

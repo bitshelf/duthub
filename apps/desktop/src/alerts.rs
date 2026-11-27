@@ -1,9 +1,9 @@
 //! 异常弹窗提醒中心（需求⑤+④）：AlertItem 队列 + 按 source 去重/抑制。
 //!
-//! - 来源事件（接入点在 workspace.rs / mcp_runtime.rs）：
+//! - 来源事件（接入点在 workspace.rs / `mcp_runtime.rs`）：
 //!   * [`AlertSource::Heartbeat`]：心跳丢联（连续 N 次无响应，HeartbeatService 告警）
 //!   * [`AlertSource::Serial`]：serial 会话 task 死亡 / 首开失败（驱动"[serial] 打开 … 失败"行）
-//!   * [`AlertSource::Control`]：ControlService 动作失败（GUI 继电器往返 / MCP power/reset/power_key）
+//!   * [`AlertSource::Control`]：`ControlService` 动作失败（GUI 继电器往返 / MCP `power/reset/power_key`）
 //!   * [`AlertSource::Agent`]：Agent 运行完成或异常（Done / Stopped，初步分析待人工确认）
 //!   * [`AlertSource::Relay`]: board-level offline monitor for shared relay boards
 //!     (`duts.json.relayBoards`; the alert subject is the board id, not a DUT).
@@ -22,7 +22,7 @@
 //! 持久化：每 DUT 的 enabled 与抑制列表存 duts.json `alertsByDut`
 //! （`duthub_core::model::AlertSettings`）；全局抑制列表存 settings.json
 //! `alerts.suppressedSources`（`duthub_core::model::GlobalAlertSettings`）。
-//! AlertCenter 是这两份配置的运行时镜像。
+//! `AlertCenter` 是这两份配置的运行时镜像。
 //!
 //! # Port surface (`docs/design/TRAY_ALERT_DESIGN.md` §12)
 //!
@@ -71,7 +71,7 @@ pub enum AlertSource {
     Heartbeat,
     /// serial 会话 task 死亡 / 首开失败
     Serial,
-    /// ControlService 动作失败（继电器/PDU 写动作）
+    /// `ControlService` 动作失败（继电器/PDU 写动作）
     Control,
     /// 烧录工具检查失败。
     Flash,
@@ -217,8 +217,7 @@ fn now_unix_ms() -> u64 {
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// 弹窗内的时间显示：相对当下（<1 分钟「刚刚」、<1 小时「N 分钟前」、
@@ -251,8 +250,7 @@ impl AlertCenter {
     pub fn enabled_for(&self, dut_id: &str) -> bool {
         self.by_dut
             .get(dut_id)
-            .map(|settings| settings.enabled)
-            .unwrap_or(true)
+            .is_none_or(|settings| settings.enabled)
     }
 
     /// Suppression for this subject (`dut_id == ""` naturally falls back to
@@ -328,7 +326,8 @@ impl AlertCenter {
             return Err(ReportRejection::Suppressed);
         }
         if let Some(last) = self.last_accepted.get(&(dut_id.to_owned(), source))
-            && now_ms.saturating_sub(*last) < DEDUP_WINDOW.as_millis() as u64
+            && now_ms.saturating_sub(*last)
+                < u64::try_from(DEDUP_WINDOW.as_millis()).unwrap_or(u64::MAX)
         {
             return Err(ReportRejection::Duplicate);
         }
@@ -464,7 +463,7 @@ impl AlertCenter {
     /// 当前抑制列表的稳定 key（回写 settings）。
     /// Kept as the runtime mirror of the global list: the settings page renders
     /// `settings.alerts.suppressed_sources` directly, so no product caller
-    /// reads this yet (it is part of the AlertCenter API contract).
+    /// reads this yet (it is part of the `AlertCenter` API contract).
     #[allow(dead_code)]
     pub fn suppressed_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = self
@@ -544,7 +543,7 @@ impl AlertCenter {
 // 来源接入点：驱动/引擎输出 → (title, detail) 的纯映射（单测覆盖）
 // ---------------------------------------------------------------------------
 
-/// 接入点①：心跳丢联告警（HeartbeatService::drain_alerts）→ 提醒文案。
+/// `接入点①：心跳丢联告警（HeartbeatService::drain_alerts`）→ 提醒文案。
 pub fn heartbeat_alert_texts(dut_label: &str, message: &str) -> (String, String) {
     (
         crate::i18n::label("heartbeatLostAlert").into(),
@@ -1259,17 +1258,17 @@ mod tests {
         assert_eq!(center.suppressed_keys(), vec!["agentNotice".to_string()]);
         // An empty list clears the mirror (import of a file without suppression).
         center.set_suppressed_sources(&[]);
-        assert!(center.suppressed_keys().is_empty());
+        assert_eq!(center.suppressed_keys(), Vec::<String>::new());
     }
 
     #[test]
     fn relay_and_notice_texts_are_localized_pairs() {
         let (title, detail) = relay_board_alert_texts("板卡 A", "串口已消失");
-        assert!(!title.is_empty());
+        assert_ne!(title, "");
         assert!(detail.contains("板卡 A"));
         assert!(detail.contains("串口已消失"));
         let (title, detail) = agent_notice_alert_texts(None, "构建完成");
-        assert!(!title.is_empty());
+        assert_ne!(title, "");
         assert_eq!(detail, "构建完成");
         let (title, _) = agent_notice_alert_texts(Some("自定义标题"), "x");
         assert_eq!(title, "自定义标题");

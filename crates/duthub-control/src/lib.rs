@@ -3,13 +3,15 @@
 //! 当前唯一实现：CH340 类 4 字节协议继电器（[`ch340`] 协议 +
 //! [`driver::Ch340RelayDriver`]）。
 //! 单一实现时由桌面端启动时直接构造并注入共用设备操作入口
-//! （duthub-device::control::ControlService），不增加转发层或后端选择逻辑。
+//! （`duthub-device::control::ControlService），不增加转发层或后端选择逻辑`。
 //!
 //! 模块：
 //! - [`ch340`]：4 字节协议（帧构造 / 回显分类 / STATUS 扫描），纯函数可独立测试；
 //! - [`driver`]：[`driver::RelayDriver`] trait + CH340 实现（单 task 独占串口句柄，
 //!   错误统一 [`duthub_core::DeviceError`]）+ [`duthub_core::ControlBackend`] 适配
-//!   （power=通道通断，reset=脉冲，power_key=短/长脉冲）。
+//!   （`power=通道通断，reset=脉冲，power_key=短/长脉冲`）。
+
+#![forbid(unsafe_code)]
 
 pub mod ch340;
 pub mod driver;
@@ -68,13 +70,14 @@ mod real_probe_tests {
     ///    ON→STATUS 确认吸合→OFF→STATUS 确认恢复，全程记录进 [`ChannelTestReport`]。
     ///
     /// 任何一步异常即 fail（测试侧不静默重试，由调用方 escalate 决策）。
-    /// ControlService 是同步门面（内部 block_on）：用普通 `#[test]`，驱动 task 都在其
+    /// `ControlService` 是同步门面（内部 `block_on`）：用普通 `#[test]`，驱动 task 都在其
     /// 内部 runtime 上派生（见 driver.rs 测试注释）。
     #[test]
     #[ignore = "真实硬件继电器往返：显式运行（单通道 1 ON→STATUS→OFF，已获用户授权）"]
     fn relay_live_roundtrip() {
         use duthub_core::model::{
-            DutConfig, FlashConfig, McpConfig, RelayChannels, RelayConfig, SerialConfig,
+            AdbConfig, DutA2aConfig, DutConfig, DutMediaConfig, FlashConfig, HeartbeatConfig,
+            McpConfig, RelayChannels, RelayConfig, SerialConfig,
         };
         use duthub_core::{ApprovalManager, ControlBackend};
         use duthub_device::control::ControlService;
@@ -95,7 +98,7 @@ mod real_probe_tests {
                 reference_similarity: None,
                 split_logs: false,
             },
-            adb: Default::default(),
+            adb: AdbConfig::default(),
             relay: RelayConfig::UsbSerial {
                 host: "local".into(),
                 node: "COM25".into(),
@@ -111,10 +114,10 @@ mod real_probe_tests {
             mcp: McpConfig::StreamableHttp {
                 url: "http://127.0.0.1:8797/mcp".into(),
             },
-            a2a: Default::default(),
+            a2a: DutA2aConfig::default(),
             flash: FlashConfig::default(),
-            media: Default::default(),
-            heartbeat: Default::default(),
+            media: DutMediaConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
         });
 
         // 0) 只读 STATUS 枚举（无需审批）

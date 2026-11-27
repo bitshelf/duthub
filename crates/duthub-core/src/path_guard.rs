@@ -13,6 +13,7 @@ use std::path::Path;
 /// Covers `CON`, `PRN`, `AUX`, `NUL`, `COM0`..=`COM9`, `LPT0`..=`LPT9`, and
 /// the Windows superscript forms `COM¹`/`COM²`/`COM³`/`LPT¹`/`LPT²`/`LPT³`
 /// as well as padded stems like `"CON .txt"`.
+#[must_use]
 pub fn is_windows_reserved_name(component: &str) -> bool {
     let stem = component
         .split('.')
@@ -40,12 +41,14 @@ pub fn is_windows_reserved_name(component: &str) -> bool {
 
 /// Returns `true` if a single path segment contains an NTFS Alternate Data
 /// Stream separator (`:`).
+#[must_use]
 pub fn has_windows_ads(component: &str) -> bool {
     component.contains(':')
 }
 
 /// Returns `true` if `raw` looks like a Windows UNC or device namespace path
 /// (`\\server\share`, `//server/share`, `\\?\...`, `\\.\...`).
+#[must_use]
 pub fn is_unc_or_device_path(raw: &str) -> bool {
     let trimmed = raw.trim();
     trimmed.starts_with(r"\\") || trimmed.starts_with("//")

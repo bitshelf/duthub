@@ -62,10 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let work_root = dir
-        .as_deref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or(exe_dir);
+    let work_root = dir.as_deref().map_or(exe_dir, std::path::PathBuf::from);
     let server = TransferServer::new_in(
         work_root,
         TransferConfig {

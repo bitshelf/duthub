@@ -15,6 +15,7 @@ use crate::error::{DeviceError, DeviceResult};
 pub struct DutId(pub String);
 
 impl DutId {
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -105,10 +106,10 @@ pub trait ControlBackend: Send + Sync {
     async fn power(&self, target: &ControlTarget, on: bool) -> DeviceResult<()>;
     /// 复位脉冲（仅继电器类驱动支持；PDU 不伪造 Reset）。
     async fn reset(&self, target: &ControlTarget) -> DeviceResult<()>;
-    /// 电源按键脉冲（long_press=长按强制断电；仅继电器类驱动支持）。
+    /// `电源按键脉冲（long_press=长按强制断电；仅继电器类驱动支持`）。
     async fn power_key(&self, target: &ControlTarget, long_press: bool) -> DeviceResult<()>;
 
-    /// 继电器逐通道状态查询（只读，OP_STATUS 逐通道轮询）。返回应答 STATUS 的
+    /// `继电器逐通道状态查询（只读，OP_STATUS` 逐通道轮询）。返回应答 STATUS 的
     /// `(通道号, 是否吸合)` 列表；板卡不回答 STATUS 时为空表。仅继电器类驱动
     /// 实现；PDU 等其他后端默认 [`DeviceError::Unsupported`]。
     async fn channel_status(&self, _address: &str) -> DeviceResult<Vec<(u8, bool)>> {

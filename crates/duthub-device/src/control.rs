@@ -74,7 +74,8 @@ pub type PowerBoundarySink = Arc<dyn Fn(&str, &str) -> DeviceResult<()> + Send +
 pub const ACTION_CHANNEL_TEST: &str = "control.test";
 
 impl ControlAction {
-    /// 审批动作名（与 docs/API_CONTRACT.md 一致）。
+    /// 审批动作名（与 `docs/API_CONTRACT.md` 一致）。
+    #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
             ControlAction::Power { .. } => "control.power",
@@ -87,6 +88,7 @@ impl ControlAction {
     }
 
     /// 动作的分段标记文本（`[mark] {label}` 的 label 部分）。
+    #[must_use]
     pub fn mark_label(&self) -> &'static str {
         match self {
             ControlAction::Power { on: true } => "继电器 power ON",
@@ -101,6 +103,7 @@ impl ControlAction {
     }
 
     /// 参数绑定串：签发与消费必须产出完全一致的 JSON。
+    #[must_use]
     pub fn args_json(&self) -> String {
         match self {
             ControlAction::Power { on } => serde_json::json!({ "on": on }).to_string(),
@@ -118,26 +121,13 @@ impl ControlAction {
     }
 }
 
-/// 授权阶段的错误（与 `ApprovalError` 一一对应，供 MCP 映射提示语）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Authorization and execution errors for the shared control entry point.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ControlEntryError {
-    Approval(ApprovalError),
-    Device(DeviceError),
-}
-
-impl std::fmt::Display for ControlEntryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ControlEntryError::Approval(err) => write!(f, "{}", err.message()),
-            ControlEntryError::Device(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl From<DeviceError> for ControlEntryError {
-    fn from(err: DeviceError) -> Self {
-        ControlEntryError::Device(err)
-    }
+    #[error("{0}")]
+    Approval(#[from] ApprovalError),
+    #[error("{0}")]
+    Device(#[from] DeviceError),
 }
 
 /// 共用设备操作入口。`dut_configs` 由宿主（桌面端每帧刷新）注册，
@@ -154,10 +144,18 @@ pub struct ControlService {
     runtime: crate::RuntimeOwner,
     relay_writes: std::sync::RwLock<()>,
     /// 控制租约复核（方案 M10：approval 校验前插 admit，不通过不消费令牌）。
-    /// 与 DeviceService 写入通道共用同一 `ControlLeaseManager` 实例。
+    /// 与 `DeviceService` 写入通道共用同一 `ControlLeaseManager` 实例。
     lease: Option<Arc<ControlLeaseManager>>,
     /// 审计（control.execute / control.deny）。
     audit: Option<Arc<AuditSink>>,
+}
+
+impl std::fmt::Debug for ControlService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlService")
+            .field("has_backend", &self.backend.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ControlService {
@@ -200,12 +198,14 @@ impl ControlService {
 
     /// 接线控制租约复核（builder）。GUI 按钮路径走 [`Self::execute_by_id`]（Gui
     /// 身份）；MCP 路径走 [`Self::execute_by_id_as`]（Agent 身份）。
+    #[must_use]
     pub fn with_lease_authority(mut self, lease: Arc<ControlLeaseManager>) -> Self {
         self.lease = Some(lease);
         self
     }
 
     /// 接线审计接收端（control.execute / control.deny）。
+    #[must_use]
     pub fn with_audit_sink(mut self, audit: Arc<AuditSink>) -> Self {
         self.audit = Some(audit);
         self
@@ -298,12 +298,12 @@ impl ControlService {
     }
 
     /// 动作收尾：向日志写 `[mark] {label}`（成功/失败同写，失败带原因）。
-    fn emit_action_mark(&self, dut_id: &str, label: &str, outcome: Result<(), &DeviceError>) {
-        self.emit_control_mark(self.log_sink.get(), dut_id, label, outcome);
+    fn emit_action_mark<T>(&self, dut_id: &str, label: &str, outcome: Result<&T, &DeviceError>) {
+        Self::emit_control_mark(self.log_sink.get(), dut_id, label, outcome);
     }
 
-    fn emit_power_outcome(&self, dut_id: &str, label: &str, outcome: Result<(), &DeviceError>) {
-        self.emit_control_mark(
+    fn emit_power_outcome<T>(&self, dut_id: &str, label: &str, outcome: Result<&T, &DeviceError>) {
+        Self::emit_control_mark(
             self.power_outcome.get().or_else(|| self.log_sink.get()),
             dut_id,
             label,
@@ -311,16 +311,15 @@ impl ControlService {
         );
     }
 
-    fn emit_control_mark(
-        &self,
+    fn emit_control_mark<T>(
         sink: Option<&LogMarkSink>,
         dut_id: &str,
         label: &str,
-        outcome: Result<(), &DeviceError>,
+        outcome: Result<&T, &DeviceError>,
     ) {
         if let Some(sink) = sink {
             let text = match outcome {
-                Ok(()) => label.to_string(),
+                Ok(_) => label.to_string(),
                 Err(err) => format!("{label} 失败: {err}"),
             };
             sink(dut_id, &text);
@@ -329,11 +328,11 @@ impl ControlService {
 
     /// 注册/更新 DUT 配置（入口据此校验绑定与解析地址）。
     pub fn register_dut(&self, dut: DutConfig) {
-        self.dut_configs.lock().unwrap().insert(dut.id.clone(), dut);
+        duthub_core::util::lock_unpoisoned(&self.dut_configs).insert(dut.id.clone(), dut);
     }
 
     pub fn unregister_dut(&self, dut_id: &str) {
-        self.dut_configs.lock().unwrap().remove(dut_id);
+        duthub_core::util::lock_unpoisoned(&self.dut_configs).remove(dut_id);
     }
 
     /// 按 DUT ID 执行（GUI 按钮路径，Gui 身份：人类在场）。
@@ -510,9 +509,9 @@ impl ControlService {
             }
         });
         if is_power {
-            self.emit_power_outcome(&dut.id, label, outcome.as_ref().map(|_| ()));
+            self.emit_power_outcome(&dut.id, label, outcome.as_ref());
         } else {
-            self.emit_action_mark(&dut.id, label, outcome.as_ref().map(|_| ()));
+            self.emit_action_mark(&dut.id, label, outcome.as_ref());
         }
         self.finish_control(&dut.id, &admission, action_name, outcome.is_ok());
         outcome.map_err(ControlEntryError::from)
@@ -673,9 +672,9 @@ impl ControlService {
         let outcome = opened.and(closed);
         let label = format!("继电器按住测试 CH{channel}");
         if supply {
-            self.emit_power_outcome(dut_id, &label, outcome.as_ref().map(|_| ()));
+            self.emit_power_outcome(dut_id, &label, outcome.as_ref());
         } else {
-            self.emit_action_mark(dut_id, &label, outcome.as_ref().map(|_| ()));
+            self.emit_action_mark(dut_id, &label, outcome.as_ref());
         }
         self.finish_control(dut_id, &admission, operation, outcome.is_ok());
         outcome.map_err(ControlEntryError::from)
@@ -693,7 +692,7 @@ impl ControlService {
         self.channel_test_as(dut_id, channel, approval_token, &WriteIdentity::gui())
     }
 
-    /// 继电器单通道往返测试（显式身份）：MCP relay_test 传 Agent 身份。
+    /// 继电器单通道往返测试（显式身份）：MCP `relay_test` 传 Agent 身份。
     pub fn channel_test_as(
         &self,
         dut_id: &str,
@@ -742,7 +741,7 @@ impl ControlService {
             .block_on(async move { backend.channel_test(&node, channel).await });
         // 往返测试（relay_test）同样挂分段标记：ON→STATUS→OFF 的结论进日志
         let label = format!("继电器 relay_test CH{channel}");
-        self.emit_action_mark(&dut.id, &label, outcome.as_ref().map(|_| ()));
+        self.emit_action_mark(&dut.id, &label, outcome.as_ref());
         self.finish_control(&dut.id, &admission, ACTION_CHANNEL_TEST, outcome.is_ok());
         outcome.map_err(ControlEntryError::from)
     }
@@ -758,6 +757,12 @@ impl ControlService {
 pub struct ControlRelayProbe {
     control: Arc<ControlService>,
     channels: Mutex<HashMap<String, u8>>,
+}
+
+impl std::fmt::Debug for ControlRelayProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlRelayProbe").finish_non_exhaustive()
+    }
 }
 
 impl ControlRelayProbe {
@@ -965,7 +970,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use duthub_core::model::{
-        FlashConfig, McpConfig, PduOutlets, RelayChannels, SerialConfig, SnmpConfig,
+        AdbConfig, DutA2aConfig, DutMediaConfig, FlashConfig, HeartbeatConfig, McpConfig,
+        PduOutlets, RelayChannels, SerialConfig, SnmpConfig,
     };
     use std::sync::Mutex as StdMutex;
 
@@ -973,9 +979,9 @@ mod tests {
     struct MockBackend {
         calls: StdMutex<Vec<String>>,
         fail_power: Option<bool>,
-        /// channel_status 按地址返回的通道表（未配置的地址报 Unsupported）。
+        /// `channel_status` 按地址返回的通道表（未配置的地址报 Unsupported）。
         status_map: StdMutex<HashMap<String, Vec<(u8, bool)>>>,
-        /// channel_test 按「地址:通道」返回的报告（未配置的键报 Unsupported）。
+        /// `channel_test` 按「地址:通道」返回的报告（未配置的键报 Unsupported）。
         test_reports: StdMutex<HashMap<String, ChannelTestReport>>,
     }
 
@@ -1085,7 +1091,7 @@ mod tests {
                 reference_similarity: None,
                 split_logs: false,
             },
-            adb: Default::default(),
+            adb: AdbConfig::default(),
             relay: RelayConfig::UsbSerial {
                 host: "local".into(),
                 node: "COM7".into(),
@@ -1101,10 +1107,10 @@ mod tests {
             mcp: McpConfig::StreamableHttp {
                 url: "http://127.0.0.1:8787/mcp".into(),
             },
-            a2a: Default::default(),
+            a2a: DutA2aConfig::default(),
             flash: FlashConfig::default(),
-            media: Default::default(),
-            heartbeat: Default::default(),
+            media: DutMediaConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
         }
     }
 

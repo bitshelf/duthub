@@ -28,6 +28,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -362,7 +363,7 @@ pub fn parse_claude_event(line: &str) -> Option<CliEvent> {
                 .map(str::to_owned);
             let mut text = subtype.clone().unwrap_or_else(|| "event".to_owned());
             if let Some(model) = value.get("model").and_then(Value::as_str) {
-                text.push_str(&format!(" · model={model}"));
+                let _ = write!(text, " · model={model}");
             }
             let mut mcp_errors = Vec::new();
             if let Some(servers) = value.get("mcp_servers").and_then(Value::as_array) {
@@ -387,29 +388,30 @@ pub fn parse_claude_event(line: &str) -> Option<CliEvent> {
                         }
                     })
                     .collect();
-                text.push_str(&format!(" · MCP [{}]", labels.join(", ")));
+                let _ = write!(text, " · MCP [{}]", labels.join(", "));
             }
             if let Some(tools) = value.get("tools").and_then(Value::as_array) {
                 // 2.1.204 emits strings, but tolerate `{ "name": ... }` objects
                 // so the live gate is not tied to one serialization shape.
                 let names: Vec<&str> = tools.iter().filter_map(tool_name).collect();
-                text.push_str(&format!(" · tools={}", names.len()));
+                let _ = write!(text, " · tools={}", names.len());
                 let duthub: Vec<&str> = names
                     .iter()
                     .copied()
                     .filter(|name| is_duthub_tool_name(name))
                     .collect();
                 if !duthub.is_empty() {
-                    text.push_str(&format!(
+                    let _ = write!(
+                        text,
                         " · duthub 工具 {} 个: {}",
                         duthub.len(),
                         duthub.join(", ")
-                    ));
+                    );
                 }
             }
             mcp_errors.extend(parse_mcp_server_errors(value.get("mcp_server_errors")));
             if !mcp_errors.is_empty() {
-                text.push_str(&format!(" · MCP 错误: {}", mcp_errors.join("; ")));
+                let _ = write!(text, " · MCP 错误: {}", mcp_errors.join("; "));
             }
             Some(CliEvent::System {
                 subtype,
@@ -524,8 +526,7 @@ pub fn parse_claude_event(line: &str) -> Option<CliEvent> {
             let permission_denials = value
                 .get("permission_denials")
                 .and_then(Value::as_array)
-                .map(|entries| entries.iter().map(describe_permission_denial).collect())
-                .unwrap_or_default();
+                .map_or_default(|entries| entries.iter().map(describe_permission_denial).collect());
             Some(CliEvent::Result {
                 subtype,
                 session_id,
@@ -609,9 +610,7 @@ fn describe_mcp_error(value: &Value) -> String {
         .and_then(Value::as_str);
     let detail = value
         .get("error")
-        .or_else(|| value.get("message"))
-        .map(summarize_json)
-        .unwrap_or_else(|| summarize_json(value));
+        .or_else(|| value.get("message")).map_or_else(|| summarize_json(value), summarize_json);
     match name {
         Some(name) => format!("{name}: {detail}"),
         None => detail,
@@ -636,11 +635,10 @@ fn describe_permission_denial(value: &Value) -> String {
         .unwrap_or("");
     let input = value
         .get("tool_input")
-        .map(|input| truncate_chars(&summarize_json(input), 300))
-        .unwrap_or_default();
+        .map_or_default(|input| truncate_chars(&summarize_json(input), 300));
     let mut text = tool.to_owned();
     if !id.is_empty() {
-        text.push_str(&format!("（{id}）"));
+        let _ = write!(text, "（{id}）");
     }
     if !input.is_empty() {
         text.push(' ');
@@ -674,10 +672,10 @@ fn is_duthub_tool_name(name: &str) -> bool {
 /// The worker only returns `Err` for fatal setup failures; a failed turn is
 /// recorded in the transcript and leaves the session `Ready` for a retry.
 pub(crate) fn run_cli_worker(
-    context: CliWorkerContext,
-    rx: Receiver<WorkerCommand>,
+    context: &CliWorkerContext,
+    rx: &Receiver<WorkerCommand>,
 ) -> Result<(), String> {
-    let result = run_cli_session(&context, &rx);
+    let result = run_cli_session(context, rx);
     if let Err(error) = &result {
         let message = redact_secrets(error, &[]);
         if context.stop_flag.load(Ordering::Relaxed) {
@@ -862,11 +860,9 @@ fn run_cli_session(context: &CliWorkerContext, rx: &Receiver<WorkerCommand>) -> 
                 }
                 context.dirty.store(true, Ordering::Relaxed);
             }
-            Ok(WorkerCommand::Stop) => break,
+            Ok(WorkerCommand::Stop) | Err(TryRecvError::Disconnected) => break,
             // Idle cancel has nothing to abort.
-            Ok(WorkerCommand::Cancel) => {}
-            Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => {}
+            Ok(WorkerCommand::Cancel) | Err(TryRecvError::Empty) => {}
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -919,7 +915,7 @@ fn run_cli_turn(
         turn.mcp_url,
         resume.as_deref(),
     )?;
-    plan.stdin_prompt = turn.prompt.to_owned();
+    turn.prompt.clone_into(&mut plan.stdin_prompt);
     // envKeys values are loaded by `resolve_cli_launch`; the MCP token is
     // appended here and never placed in argv or the MCP config file.
     let mut env: Vec<(String, String)> = turn
@@ -986,8 +982,7 @@ fn run_cli_turn(
                     "CLI stdout 单行超过 {MAX_STDOUT_LINE} 字节，已丢弃"
                 )),
             ),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
         }
 
         if last_stderr_poll.elapsed() >= STDERR_POLL_INTERVAL {
@@ -1005,7 +1000,9 @@ fn run_cli_turn(
             return Ok(TurnOutcome::Completed { saw_result: true });
         }
         let idle = now_ms().saturating_sub(turn.context.last_activity_ms.load(Ordering::Relaxed));
-        if !saw_result && idle >= PROMPT_HANG_TIMEOUT.as_millis() as u64 {
+        if !saw_result
+            && idle >= u64::try_from(PROMPT_HANG_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+        {
             process.kill();
             turn.context.view.set_stderr_tail(process.stderr_tail());
             return Err("CLI 一轮超过 10 分钟无任何输出，已终止本轮".to_owned());
@@ -1368,10 +1365,13 @@ fn code_text(code: Option<i32>) -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,7 +1453,7 @@ impl CliProcess {
             let secrets = secrets.clone();
             std::thread::Builder::new()
                 .name("duthub-cli-stdout".into())
-                .spawn(move || read_stdout(stdout, tx, secrets))
+                .spawn(move || read_stdout(stdout, &tx, &secrets))
         };
         if let Err(error) = stdout_thread {
             drop(process);
@@ -1463,7 +1463,7 @@ impl CliProcess {
             let stderr_state = stderr_state.clone();
             std::thread::Builder::new()
                 .name("duthub-cli-stderr".into())
-                .spawn(move || read_stderr(stderr, stderr_state))
+                .spawn(move || read_stderr(stderr, &stderr_state))
         };
         if let Err(error) = stderr_thread {
             drop(process);
@@ -1569,11 +1569,11 @@ impl StderrState {
     }
 }
 
-fn read_stdout(stdout: impl Read, tx: SyncSender<CliLine>, secrets: Vec<String>) {
+fn read_stdout(stdout: impl Read, tx: &SyncSender<CliLine>, secrets: &[String]) {
     let mut reader = BufReader::new(stdout);
     loop {
         match read_bounded_line(&mut reader, MAX_STDOUT_LINE) {
-            Ok(LineChunk::Eof) => break,
+            Ok(LineChunk::Eof) | Err(_) => break,
             Ok(LineChunk::Overflow) => {
                 if tx.send(CliLine::Overflow).is_err() {
                     break;
@@ -1581,24 +1581,22 @@ fn read_stdout(stdout: impl Read, tx: SyncSender<CliLine>, secrets: Vec<String>)
             }
             Ok(LineChunk::Line(bytes)) => {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
-                let text = redact_secrets(text.trim_end_matches(['\r', '\n']), &secrets);
+                let text = redact_secrets(text.trim_end_matches(['\r', '\n']), secrets);
                 if !text.trim().is_empty() && tx.send(CliLine::Line(text)).is_err() {
                     break;
                 }
             }
-            Err(_) => break,
         }
     }
 }
 
-fn read_stderr(stderr: impl Read, state: Arc<Mutex<StderrState>>) {
+fn read_stderr(stderr: impl Read, state: &Mutex<StderrState>) {
     let mut stderr = stderr;
     let mut chunk = [0u8; 4096];
     loop {
         match stderr.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(read) => state.lock().unwrap().push(&chunk[..read]),
-            Err(_) => break,
         }
     }
 }
@@ -1666,9 +1664,7 @@ fn resolve_sandboxed_argv(plan: &CliPlan) -> Result<(PathBuf, Vec<OsString>), St
                     ));
                 }
             }
-            let system_root = std::env::var_os("SystemRoot")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            let system_root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
             let cmd_exe = system_root.join("System32").join("cmd.exe");
             let mut args = Vec::with_capacity(plan.args.len() + 4);
             args.push(OsString::from("/D"));

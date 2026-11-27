@@ -29,6 +29,7 @@ pub enum Algorithm {
 
 impl Algorithm {
     /// Resolve an `Upload-Checksum` algorithm token (case-insensitive).
+    #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
             "blake3" => Some(Self::Blake3),
@@ -38,6 +39,7 @@ impl Algorithm {
     }
 
     /// Token as it appears on the wire.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Blake3 => "blake3",
@@ -63,11 +65,13 @@ pub struct Checksum {
 }
 
 /// Why an `Upload-Checksum` value cannot be honored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChecksumError {
     /// Not shaped like `<algorithm> <hex digest>`.
+    #[error("malformed Upload-Checksum header")]
     Malformed,
     /// The algorithm is not one this receiver can verify.
+    #[error("unsupported checksum algorithm: {0}")]
     Unsupported(String),
 }
 
@@ -90,11 +94,13 @@ impl Checksum {
     }
 
     /// Wire form persisted in the upload metadata: `<algorithm>:<digest>`.
+    #[must_use]
     pub fn to_metadata(&self) -> String {
         format!("{}:{}", self.algorithm.as_str(), self.digest)
     }
 
     /// Inverse of [`Self::to_metadata`]; `None` for anything else.
+    #[must_use]
     pub fn from_metadata(value: &str) -> Option<Self> {
         let (algorithm, digest) = value.split_once(':')?;
         let checksum = Self::parse_header(&format!("{algorithm} {digest}")).ok()?;
@@ -130,7 +136,12 @@ impl Checksum {
 
 /// Lowercase hex.
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 #[cfg(test)]

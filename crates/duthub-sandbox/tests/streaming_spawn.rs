@@ -208,7 +208,7 @@ fn drop_terminates_the_whole_tree() {
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0) > 0 {
+        if std::fs::metadata(&marker).map_or(0, |m| m.len()) > 0 {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -221,9 +221,9 @@ fn drop_terminates_the_whole_tree() {
     // Dropping the handle terminates the whole MXC Job tree.
     drop(process);
     std::thread::sleep(Duration::from_millis(300));
-    let after_drop = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    let after_drop = std::fs::metadata(&marker).map_or(0, |m| m.len());
     std::thread::sleep(Duration::from_millis(700));
-    let later = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    let later = std::fs::metadata(&marker).map_or(0, |m| m.len());
     assert_eq!(
         after_drop, later,
         "grandchild kept writing after SandboxedProcess::Drop ({after_drop} -> {later})"
