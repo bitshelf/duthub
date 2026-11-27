@@ -682,7 +682,7 @@ mod tests {
             a2a: duthub_core::model::DutA2aConfig::default(),
             flash: duthub_core::model::FlashConfig::default(),
             media: duthub_core::model::DutMediaConfig::default(),
-            heartbeat: duthub_core::model::HeartbeatConfig::default(),
+            heartbeat: duthub_core::heartbeat::HeartbeatConfig::default(),
         }
     }
 
@@ -723,7 +723,10 @@ mod tests {
         );
         // A DUT bound to a board that is not in the watch set is ignored.
         let without_b1 = vec![board("b2", "COM26", "CH340")];
-        assert_eq!(board_probe_channels(&without_b1, &duts), [] as [(std::string::String, u8); 0]);
+        assert_eq!(
+            board_probe_channels(&without_b1, &duts),
+            [] as [(std::string::String, u8); 0]
+        );
         // Legacy per-DUT serial relay / PDU / disabled bindings never map.
         let legacy = vec![
             dut(RelayConfig::UsbSerial {
@@ -741,6 +744,9 @@ mod tests {
             }),
             dut(RelayConfig::Disabled),
         ];
-        assert_eq!(board_probe_channels(&boards, &legacy), [] as [(std::string::String, u8); 0]);
+        assert_eq!(
+            board_probe_channels(&boards, &legacy),
+            [] as [(std::string::String, u8); 0]
+        );
     }
 }

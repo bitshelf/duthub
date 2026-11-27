@@ -8,6 +8,20 @@ pub use cap_std::fs::{Dir, OpenOptions};
 
 const OWNER: &str = ".duthub-dut-id";
 
+/// Canonical top-level category subdirectories inside each DUT artifact folder.
+pub const DUT_CATEGORY_DIRS: &[&str] =
+    &["image", "TEST", "压力&老化", "串口日志", "misc", "feedback"];
+/// Category subdirectory for firmware images.
+pub const IMAGE_DIR: &str = "image";
+/// Category subdirectory for serial logs.
+pub const SERIAL_LOGS_DIR: &str = "串口日志";
+/// Legacy serial logs subdirectory (read-only compatibility for existing captures).
+pub const LEGACY_LOGS_DIR: &str = "logs";
+/// Category subdirectory for Agent usage feedback records.
+pub const FEEDBACK_DIR: &str = "feedback";
+/// Maximum size in bytes of a single Agent feedback file.
+pub const MAX_FEEDBACK_BYTES: usize = 64 * 1024;
+
 pub(crate) fn plain(metadata: &cap_std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -101,14 +115,36 @@ pub fn create_new(dir: &Dir, filename: &str) -> io::Result<std::fs::File> {
 }
 
 /// Resolve an existing regular file strictly inside an owned DUT directory
-/// (either `<dut>/<file_id>` or `<dut>/images/data/<file_id>`), rejecting any
-/// traversal, absolute path, reparse point/junction, or cross-DUT folder.
+/// (`<dut>/image/<file_id>`, `<dut>/<file_id>`, or legacy `<dut>/images/data/<file_id>`),
+/// rejecting any traversal, absolute path, reparse point/junction, or cross-DUT folder.
 pub fn resolve_owned_file(
     root: &Path,
     dut_id: &str,
     name: &str,
     file_id: &str,
 ) -> io::Result<PathBuf> {
+    let folder = name_component(name)?;
+    let dir = open(root, dut_id, folder, false)?;
+    // Allow explicit `<category>/<filename>` (e.g. `image/update.img`) as well as bare filenames.
+    if let Some((subdir, filename)) = file_id.split_once('/') {
+        let subdir = name_component(subdir)?;
+        let filename = name_component(filename)?;
+        if filename == OWNER {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "cannot access ownership marker",
+            ));
+        }
+        let child = open_plain_subdir(&dir, subdir)?;
+        let meta = child.symlink_metadata(filename)?;
+        if !meta.is_file() || !plain(&meta) {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "target must be a plain file inside the DUT directory",
+            ));
+        }
+        return Ok(root.join(folder).join(subdir).join(filename));
+    }
     let filename = name_component(file_id)?;
     if filename == OWNER {
         return Err(io::Error::new(
@@ -116,8 +152,17 @@ pub fn resolve_owned_file(
             "cannot access ownership marker",
         ));
     }
-    let folder = name_component(name)?;
-    let dir = open(root, dut_id, folder, false)?;
+    if let Ok(image_dir) = open_plain_subdir(&dir, IMAGE_DIR)
+        && let Ok(meta) = image_dir.symlink_metadata(filename)
+    {
+        if !meta.is_file() || !plain(&meta) {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "target must be a plain file inside DUT image directory",
+            ));
+        }
+        return Ok(root.join(folder).join(IMAGE_DIR).join(filename));
+    }
     if let Ok(meta) = dir.symlink_metadata(filename) {
         if !meta.is_file() || !plain(&meta) {
             return Err(io::Error::new(
@@ -203,11 +248,77 @@ pub fn open_archive(root: &Path, dut_id: &str, original_name: &str) -> io::Resul
 }
 
 pub fn open_dut_for_write(root: &Path, dut_id: &str, name: &str) -> io::Result<(String, Dir)> {
-    existing_or_create(root, dut_id, name)
+    let (folder, dir) = existing_or_create(root, dut_id, name)?;
+    ensure_category_dirs(&dir)?;
+    Ok((folder, dir))
+}
+
+/// Ensure all canonical category subdirectories exist as plain folders inside an owned DUT directory.
+pub fn ensure_category_dirs(dir: &Dir) -> io::Result<()> {
+    for category in DUT_CATEGORY_DIRS {
+        let _ = open_subdir_for_write(dir, category)?;
+    }
+    Ok(())
+}
+
+/// Write a new Agent feedback document strictly inside `<dut>/feedback/<filename>`.
+pub fn write_feedback_file(
+    root: &Path,
+    dut_id: &str,
+    name: &str,
+    filename: &str,
+    content: &[u8],
+) -> io::Result<(String, PathBuf)> {
+    if content.len() > MAX_FEEDBACK_BYTES {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "feedback content exceeds maximum size",
+        ));
+    }
+    let filename = name_component(filename)?;
+    if filename == OWNER {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "cannot overwrite ownership marker",
+        ));
+    }
+    let (folder, dir) = open_dut_for_write(root, dut_id, name)?;
+    let feedback_dir = open_subdir_for_write(&dir, FEEDBACK_DIR)?;
+    let mut file = create_new(&feedback_dir, filename)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok((
+        format!("{FEEDBACK_DIR}/{filename}"),
+        root.join(folder).join(FEEDBACK_DIR).join(filename),
+    ))
+}
+
+/// Write a new workspace-level Agent feedback document strictly inside `<root>/feedback/<filename>`.
+pub fn write_global_feedback_file(
+    root: &Path,
+    filename: &str,
+    content: &[u8],
+) -> io::Result<(String, PathBuf)> {
+    if content.len() > MAX_FEEDBACK_BYTES {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "feedback content exceeds maximum size",
+        ));
+    }
+    let filename = name_component(filename)?;
+    let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
+    let feedback_dir = open_subdir_for_write(&root_dir, FEEDBACK_DIR)?;
+    let mut file = create_new(&feedback_dir, filename)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok((
+        format!("{FEEDBACK_DIR}/{filename}"),
+        root.join(FEEDBACK_DIR).join(filename),
+    ))
 }
 
 pub fn open_logs_for_write(dir: &Dir) -> io::Result<Dir> {
-    open_subdir_for_write(dir, "logs")
+    open_subdir_for_write(dir, SERIAL_LOGS_DIR)
 }
 
 /// Create a single named child of an owned DUT directory and reject redirected paths.
@@ -242,7 +353,11 @@ pub fn log_sequence(name: &str) -> Option<u64> {
 }
 
 pub(crate) fn open_logs(dir: &Dir) -> io::Result<Dir> {
-    open_plain_subdir(dir, "logs")
+    open_plain_subdir(dir, SERIAL_LOGS_DIR)
+}
+
+pub(crate) fn open_legacy_logs(dir: &Dir) -> io::Result<Dir> {
+    open_plain_subdir(dir, LEGACY_LOGS_DIR)
 }
 
 fn open_plain_subdir(dir: &Dir, name: &str) -> io::Result<Dir> {
@@ -410,8 +525,14 @@ mod tests {
         let (_, screenshot) = create_file(root.path(), "dut-a", "Original", "frame.png").unwrap();
         assert_eq!(screenshot, root.path().join("RK3576/frame.png"));
         assert!(!root.path().join("Original").exists());
-        let (bytes, next, eof) =
-            read_file(root.path(), "dut-a", "RK3576", "logs/boot.log", 0).unwrap();
+        let (bytes, next, eof) = read_file(
+            root.path(),
+            "dut-a",
+            "RK3576",
+            &format!("{SERIAL_LOGS_DIR}/boot.log"),
+            0,
+        )
+        .unwrap();
         assert_eq!((bytes.as_slice(), next, eof), (b"boot".as_slice(), 4, true));
         for path in [
             "../outside",
@@ -421,5 +542,48 @@ mod tests {
         ] {
             assert!(read_file(root.path(), "dut-a", "RK3576", path, 0).is_err());
         }
+    }
+
+    #[test]
+    fn canonical_category_dirs_image_resolution_and_feedback_writes_work() {
+        let root = tempfile::tempdir().unwrap();
+        let (folder, dir) = open_dut_for_write(root.path(), "dut-cat", "BoardA").unwrap();
+        assert_eq!(folder, "BoardA");
+        for category in DUT_CATEGORY_DIRS {
+            assert!(
+                root.path().join("BoardA").join(category).is_dir(),
+                "missing category dir: {category}"
+            );
+        }
+        let img_dir = open_subdir_for_write(&dir, IMAGE_DIR).unwrap();
+        create_new(&img_dir, "update.img")
+            .unwrap()
+            .write_all(b"img")
+            .unwrap();
+        let resolved = resolve_owned_file(root.path(), "dut-cat", "BoardA", "update.img").unwrap();
+        assert_eq!(
+            resolved,
+            root.path()
+                .join("BoardA")
+                .join(IMAGE_DIR)
+                .join("update.img")
+        );
+        let resolved_rel =
+            resolve_owned_file(root.path(), "dut-cat", "BoardA", "image/update.img").unwrap();
+        assert_eq!(resolved_rel, resolved);
+
+        let (file_id, path) = write_feedback_file(
+            root.path(),
+            "dut-cat",
+            "BoardA",
+            "20261127-note.md",
+            b"# feedback\n",
+        )
+        .unwrap();
+        assert_eq!(file_id, "feedback/20261127-note.md");
+        assert!(path.is_file());
+        assert!(
+            write_feedback_file(root.path(), "dut-cat", "BoardA", "../escape.md", b"x").is_err()
+        );
     }
 }

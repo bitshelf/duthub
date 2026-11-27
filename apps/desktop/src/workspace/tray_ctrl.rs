@@ -1,4 +1,8 @@
-use super::{Workbench, Context, FluentBuilder, InteractiveElement, AlertSource, Window, Styled, AppContext, SharedString, LifecycleEvent, run_close_plan, LifecycleState, LifecyclePhase, i18n, LifecycleAction, Ordering, Duration, HiddenAlertEnv, HiddenAlertAction, AlertPresentation, SNAPSHOT_INTERVAL_MS};
+use super::{
+    AlertPresentation, AlertSource, AppContext, Context, Duration, HiddenAlertAction,
+    HiddenAlertEnv, LifecycleAction, LifecycleEvent, LifecyclePhase, LifecycleState, Ordering,
+    SNAPSHOT_INTERVAL_MS, SharedString, Window, Workbench, i18n, run_close_plan,
+};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -22,7 +26,11 @@ impl Workbench {
                     .file
                     .duts
                     .iter()
-                    .find(|dut| dut.id == dut_id).map_or_else(|| (dut_id.clone(), source.label().to_owned()), |dut| (dut.name.clone(), source.named_label(&dut.media).to_owned()));
+                    .find(|dut| dut.id == dut_id)
+                    .map_or_else(
+                        || (dut_id.clone(), source.label().to_owned()),
+                        |dut| (dut.name.clone(), source.named_label(&dut.media).to_owned()),
+                    );
                 let (title, alert_detail) =
                     crate::alerts::media_disconnect_alert_texts(&dut_name, &source_label, &detail);
                 if let Ok(mut center) = self.alerts.lock() {
@@ -55,7 +63,9 @@ impl Workbench {
         for step in action.steps() {
             match *step {
                 duthub_desktop::capture_ui::MonitorAction::None
-                | duthub_desktop::capture_ui::MonitorAction::ShowDockedPlaceholder => {}
+                | duthub_desktop::capture_ui::MonitorAction::ShowDockedPlaceholder
+                | duthub_desktop::capture_ui::MonitorAction::CloseFloatWindowAndFocusMain
+                | duthub_desktop::capture_ui::MonitorAction::StopPreviewAndCloseFloatWindow => {}
                 duthub_desktop::capture_ui::MonitorAction::OpenFloatWindow => {
                     self.open_float_window(cx);
                 }
@@ -68,9 +78,6 @@ impl Workbench {
                 duthub_desktop::capture_ui::MonitorAction::StopPreview => {
                     self.release_monitor(None, cx);
                 }
-                // `steps()` expands the composites into the atomic actions above.
-                duthub_desktop::capture_ui::MonitorAction::CloseFloatWindowAndFocusMain
-                | duthub_desktop::capture_ui::MonitorAction::StopPreviewAndCloseFloatWindow => {}
             }
         }
         cx.notify();
@@ -155,7 +162,8 @@ impl Workbench {
             .file
             .duts
             .iter()
-            .find(|dut| &dut.id == dut_id).map_or_else(|| dut_id.clone(), |dut| dut.name.clone());
+            .find(|dut| &dut.id == dut_id)
+            .map_or_else(|| dut_id.clone(), |dut| dut.name.clone());
         let source_name = self
             .duts
             .saved_media(dut_id)
@@ -265,7 +273,7 @@ impl Workbench {
             LifecycleEvent::CloseRequested,
         );
         let weak = cx.weak_entity();
-        cx.defer(move |cx| run_close_plan(&weak, plan, transition, cx));
+        cx.defer(move |cx| run_close_plan(&weak, plan, &transition, cx));
         false
     }
 
@@ -602,11 +610,9 @@ impl Workbench {
                         })
                         .map(|dut| dut.id.clone())
                         .collect();
-                    if let Ok(mut center) = self.alerts.lock() {
-                        center.clear_dedup_for(&event.board_id, AlertSource::Relay);
-                        for dut_id in bound_duts {
-                            center.clear_dedup_for(&dut_id, AlertSource::Relay);
-                        }
+                    self.resolve_alert_for(&event.board_id, AlertSource::Relay);
+                    for dut_id in bound_duts {
+                        self.resolve_alert_for(&dut_id, AlertSource::Relay);
                     }
                     self.notify_toast(crate::i18n::message(
                         "relayRecoveredToast",
@@ -724,9 +730,7 @@ impl Workbench {
                     dut_name,
                     source_label,
                 } => {
-                    if let Ok(mut center) = self.alerts.lock() {
-                        center.clear_dedup_for(&dut_id, AlertSource::Media);
-                    }
+                    self.resolve_alert_for(&dut_id, AlertSource::Media);
                     self.notify_toast(crate::i18n::message(
                         "mediaRecoveredToast",
                         &[("dut", &dut_name), ("source", &source_label)],
@@ -756,9 +760,7 @@ impl Workbench {
                     tool,
                     serial,
                 } => {
-                    if let Ok(mut center) = self.alerts.lock() {
-                        center.clear_dedup_for(&dut_id, AlertSource::UsbDebug);
-                    }
+                    self.resolve_alert_for(&dut_id, AlertSource::UsbDebug);
                     self.notify_toast(crate::i18n::message(
                         "usbDebugRecoveredToast",
                         &[("dut", &dut_name), ("tool", &tool), ("serial", &serial)],
@@ -769,10 +771,35 @@ impl Workbench {
         changed
     }
 
+    /// Resolve pending alerts for `(dut_id, source)` and request auto-dismissal
+    /// if the currently open alert dialog belongs to this exact `(dut_id, source)`.
+    pub(super) fn resolve_alert_for(&mut self, dut_id: &str, source: AlertSource) {
+        if let Ok(mut center) = self.alerts.lock() {
+            center.clear_dedup_for(dut_id, source);
+            center.drop_source_for(dut_id, source);
+        }
+        if self.alert_dialog_open
+            && self
+                .active_alert_dialog
+                .as_ref()
+                .is_some_and(|(active_dut, active_source)| {
+                    active_dut == dut_id && *active_source == source
+                })
+        {
+            self.dismiss_active_alert_dialog = true;
+        }
+    }
+
     /// 50 ms tick: hidden-state alert presentation (balloon + icon flash).
     /// The router is the only owner of that state; `latest()` is read-only.
     pub(super) fn alert_present_tick(&mut self) -> bool {
         if self.tray.is_none() {
+            return false;
+        }
+        if self.settings.alerts.mute_taskbar_alerts {
+            if self.alert_router.flash_started().is_some() {
+                return self.stop_alert_flash();
+            }
             return false;
         }
         let now = crate::alerts::now_ms();
@@ -855,10 +882,9 @@ impl Workbench {
                 );
                 for action in transition.actions {
                     match action {
-                        LifecycleAction::PresentAlert {
-                            presentation,
-                            count,
-                        } => changed |= self.present_hidden_alert(presentation, count),
+                        LifecycleAction::PresentAlert { presentation, .. } => {
+                            changed |= self.present_hidden_alert(presentation);
+                        }
                         LifecycleAction::StartFlash => changed |= self.start_alert_flash(now),
                         other => debug_assert!(false, "unexpected alert action: {other:?}"),
                     }
@@ -872,14 +898,8 @@ impl Workbench {
     /// Presents the newest queued alert as a tray balloon.
     ///
     /// The visible-window case is rendered by `render_root` next frame and
-    /// never reaches this path. The balloon body is the alert detail (the
-    /// title only stands in when the detail is empty), capped at 200
-    /// characters; the level drives the shell icon.
-    pub(super) fn present_hidden_alert(
-        &mut self,
-        presentation: AlertPresentation,
-        count: u64,
-    ) -> bool {
+    /// never reaches this path. Windows adds the app name around one event line.
+    pub(super) fn present_hidden_alert(&mut self, presentation: AlertPresentation) -> bool {
         debug_assert!(matches!(
             presentation,
             AlertPresentation::BalloonAndFlash | AlertPresentation::BalloonOnly
@@ -887,24 +907,7 @@ impl Workbench {
         let Some(summary) = self.alerts.lock().ok().and_then(|center| center.latest()) else {
             return false;
         };
-        let source_label = summary.source.label();
-        let detail = summary.detail.trim();
-        let title_base = if summary.title.trim().is_empty() {
-            crate::i18n::message("trayAlertTitle", &[("count", &count.to_string())])
-        } else {
-            summary.title.trim().to_owned()
-        };
-        let title = if count > 1 && !summary.title.trim().is_empty() {
-            format!("{title_base} (+{})", count - 1)
-        } else {
-            title_base
-        };
-        let body = if detail.is_empty() {
-            source_label.to_owned()
-        } else {
-            format!("{source_label} · {detail}")
-        };
-        let body: String = body.chars().take(200).collect();
+        let body = crate::alerts::alert_headline(summary.source, &summary.title, &summary.detail);
         let level = match summary.level {
             crate::alerts::AlertLevel::Info => duthub_desktop::tray::TrayNotifyLevel::Info,
             crate::alerts::AlertLevel::Warning => duthub_desktop::tray::TrayNotifyLevel::Warning,
@@ -913,8 +916,12 @@ impl Workbench {
         // Critical (device-level) alerts must still show during Windows quiet
         // time; the coordinator builds the request with the quiet-time policy.
         let critical = summary.source != AlertSource::AgentNotice;
-        let notification =
-            duthub_desktop::tray_lifecycle::balloon_notification(title, body, level, critical);
+        let notification = duthub_desktop::tray_lifecycle::balloon_notification(
+            String::new(),
+            body,
+            level,
+            critical,
+        );
         if let Some(tray) = self.tray.as_ref() {
             tray.notify_balloon(&notification);
         }
@@ -934,7 +941,7 @@ impl Workbench {
     }
 
     /// Stops the blinking episode and restores the normal icon.
-    pub(super) fn stop_alert_flash(&mut self) -> bool {
+    pub(crate) fn stop_alert_flash(&mut self) -> bool {
         if let Some(tray) = self.tray.as_ref() {
             tray.stop_taskbar_flash();
             duthub_desktop::tray_lifecycle::run_tray_actions(tray, &[LifecycleAction::StopFlash]);

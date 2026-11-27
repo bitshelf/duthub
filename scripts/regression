@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# duthub 统一回归门槛（docs/README.md）
+# duthub regression gate (docs/README.md)
 # Local checks do not open the desktop window unless requested.
 set -euo pipefail
 usage="Usage: scripts/regression [--desktop-self-test]"
@@ -38,8 +38,8 @@ fi
 echo "[1/$steps] cargo fmt --check"
 cargo fmt --all --check
 
-echo "[2/$steps] cargo clippy --workspace --all-targets -- -D warnings"
-cargo clippy --workspace --all-targets -- -D warnings
+echo "[2/$steps] cargo clippy --workspace --all-targets --all-features -- -D warnings"
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo "[3/$steps] cargo test --workspace"
 cargo test --workspace --quiet

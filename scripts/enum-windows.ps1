@@ -1,4 +1,4 @@
-# 枚举可见顶层窗口：标题 + 进程名（诊断用）
+# List visible top-level windows with their titles and process names.
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;

@@ -1,15 +1,17 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use duthub_agent::{TestRequest, TestResponse};
-use duthub_core::model::{ModelProvider, ProviderModel};
+use duthub_core::model::{ModelCapabilities, ModelInputModalities, ModelProvider, ProviderModel};
 use duthub_core::{Provider, model_provider_credential_id};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable, WindowExt};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AppContext, Context, Div, Entity, Focusable, InteractiveElement, ParentElement,
+    AppContext, Context, Div, Entity, Focusable, InteractiveElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
 
@@ -23,6 +25,7 @@ pub(crate) struct Catalog {
     draft: Option<Draft>,
     notice: Option<String>,
     tests: HashMap<(String, String, Probe), uuid::Uuid>,
+    fetching_models: HashMap<String, uuid::Uuid>,
 }
 
 impl Catalog {
@@ -139,7 +142,8 @@ fn save_provider(
     if name.is_empty() {
         return Err(label("enterProviderName").into());
     }
-    let base_url = duthub_agent::validate_model_base(draft.base.read(cx).value().as_ref())?;
+    let base_url = duthub_agent::validate_model_base(draft.base.read(cx).value().as_ref())
+        .map_err(|error| error.to_string())?;
     let key = draft.key.read(cx).value().trim().to_owned();
     let protocol = draft.protocol;
     let initial_model = draft.model.read(cx).value().trim().to_owned();
@@ -175,10 +179,7 @@ fn save_provider(
             protocol,
             enabled: true,
             models: (!initial_model.is_empty())
-                .then_some(ProviderModel {
-                    id: initial_model,
-                    enabled: true,
-                })
+                .then_some(ProviderModel::new(initial_model, true))
                 .into_iter()
                 .collect(),
         }),
@@ -282,8 +283,12 @@ fn start_probe(
             .map_err(|error| error.to_string())?;
         runtime.block_on(async {
             match probe {
-                Probe::Api => duthub_agent::test_model_api(&task).await,
-                Probe::Model => duthub_agent::test_model_connection(&task).await,
+                Probe::Api => duthub_agent::test_model_api(&task)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Probe::Model => duthub_agent::test_model_connection(&task)
+                    .await
+                    .map_err(|error| error.to_string()),
             }
         })
     });
@@ -420,8 +425,10 @@ fn render_provider_form(
         .find(|provider| provider.id == id)
         .cloned();
     let protocols = [
-        (Provider::Compatible, "Chat Completions (/chat/completions)"),
-        (Provider::Anthropic, "Messages (/v1/messages)"),
+        (Provider::Compatible, "OpenAI Chat Completions"),
+        (Provider::OpenaiResponses, "OpenAI Responses"),
+        (Provider::Anthropic, "Anthropic Messages"),
+        (Provider::Gemini, "Gemini API"),
     ];
     let selection = protocols
         .iter()
@@ -575,6 +582,287 @@ fn render_provider_form(
         .child(body)
 }
 
+fn format_context_badge(tokens: u64) -> String {
+    match tokens {
+        n if n >= 1_000_000 && n.is_multiple_of(1_000_000) => format!("{}M", n / 1_000_000),
+        n if n >= 1_000_000 => {
+            let tenths = (n + 50_000) / 100_000;
+            format!("{}.{}M", tenths / 10, tenths % 10)
+        }
+        n if n >= 1_000 => format!("{}K", n / 1_000),
+        n => n.to_string(),
+    }
+}
+
+fn start_fetch_models(
+    w: &mut Workbench,
+    provider_id: &str,
+    window: &mut Window,
+    cx: &mut Context<Workbench>,
+) {
+    let Some(provider) = w
+        .settings
+        .agent
+        .providers
+        .iter()
+        .find(|entry| entry.id == provider_id)
+        .cloned()
+    else {
+        return;
+    };
+    if w.provider_models.fetching_models.contains_key(&provider.id) {
+        return;
+    }
+    let api_key = match duthub_core::get_key(&credential(&provider)) {
+        Ok(Some(key)) if !key.trim().is_empty() => key,
+        Ok(_) => {
+            w.provider_models.notice = Some(label("providerEndpointNeedsKey").to_owned());
+            cx.notify();
+            return;
+        }
+        Err(error) => {
+            w.provider_models.notice = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+    };
+    let req = TestRequest {
+        provider: provider.protocol,
+        base_url: provider.base_url.clone(),
+        model: String::new(),
+        api_key,
+        prompt: String::new(),
+    };
+    let token = uuid::Uuid::new_v4();
+    let pid = provider.id.clone();
+    w.provider_models.fetching_models.insert(pid.clone(), token);
+    w.provider_models.notice = None;
+    cx.notify();
+    let worker = cx.background_executor().spawn(async move {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async {
+            duthub_agent::fetch_available_models(&req)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    });
+    cx.spawn_in(window, async move |view, cx| {
+        let result = worker.await;
+        let _ = cx.update(|window, cx| {
+            let _ = view.update(cx, |w, cx| {
+                if w.provider_models.fetching_models.get(&pid) != Some(&token) {
+                    return;
+                }
+                w.provider_models.fetching_models.remove(&pid);
+                match result {
+                    Ok(models) if models.is_empty() => {
+                        w.provider_models.notice = Some(label("fetchModelsEmpty").to_owned());
+                    }
+                    Ok(models) => {
+                        show_fetched_models_dialog(w, &pid, models, w.p, window, cx);
+                    }
+                    Err(error) => {
+                        w.provider_models.notice = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+    })
+    .detach();
+}
+
+fn show_fetched_models_dialog(
+    w: &Workbench,
+    provider_id: &str,
+    discovered: Vec<String>,
+    p: &'static Palette,
+    window: &mut Window,
+    cx: &mut Context<Workbench>,
+) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+    let existing: BTreeSet<String> = w
+        .settings
+        .agent
+        .providers
+        .iter()
+        .find(|entry| entry.id == provider_id)
+        .map_or_else(BTreeSet::new, |entry| {
+            entry.models.iter().map(|m| m.id.clone()).collect()
+        });
+    let selected = Rc::new(RefCell::new(BTreeSet::<String>::new()));
+    let provider = provider_id.to_owned();
+    let view = cx.entity();
+    window.open_dialog(cx, move |dialog, _, _| {
+        let mut list = div()
+            .id("fetched-models-list")
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .max_h(px(360.))
+            .overflow_y_scroll();
+        for (idx, model_id) in discovered.iter().enumerate() {
+            let already = existing.contains(model_id);
+            let checked = already || selected.borrow().contains(model_id);
+            let sel = selected.clone();
+            let mid = model_id.clone();
+            list = list.child(
+                div()
+                    .id(("fetched-model-row", idx))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(7.))
+                    .bg(if checked { p.hover } else { p.bg })
+                    .border_1()
+                    .border_color(if checked { p.accent } else { p.line })
+                    .when(!already, |row| {
+                        row.cursor_pointer().on_click(move |_, window, _| {
+                            let mut set = sel.borrow_mut();
+                            if !set.remove(&mid) {
+                                set.insert(mid.clone());
+                            }
+                            window.refresh();
+                        })
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .w(px(14.))
+                                    .h(px(14.))
+                                    .rounded(px(3.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .border_1()
+                                    .border_color(if checked { p.accent } else { p.border })
+                                    .bg(if checked { p.accent } else { p.bg })
+                                    .when(checked, |box_el| {
+                                        box_el.child(
+                                            crate::icons::kit_icon("check")
+                                                .size(px(10.))
+                                                .text_color(p.accent_contrast),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .font_family(crate::theme::MONO_FONT)
+                                    .text_size(px(12.))
+                                    .text_color(if already { p.muted } else { p.text })
+                                    .child(SharedString::from(model_id.clone())),
+                            ),
+                    )
+                    .when(already, |row| {
+                        row.child(subtle(label("fetchModelsAlreadyAdded"), p))
+                    }),
+            );
+        }
+        let chosen_count = selected.borrow().len();
+        let view_save = view.clone();
+        let provider_save = provider.clone();
+        let sel_save = selected.clone();
+        dialog.title(label("fetchModelsTitle")).child(list).footer(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .id("cancel-fetched-models")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .min_h(px(32.))
+                        .px(px(14.))
+                        .rounded(px(8.))
+                        .bg(p.raised)
+                        .border_1()
+                        .border_color(p.border)
+                        .text_size(px(13.))
+                        .text_color(p.text)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(p.hover))
+                        .child(label("cancel"))
+                        .on_click(|_, window, cx| {
+                            window.close_dialog(cx);
+                        }),
+                )
+                .child(
+                    div()
+                        .id("confirm-fetched-models")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .min_h(px(32.))
+                        .px(px(14.))
+                        .rounded(px(8.))
+                        .bg(p.accent)
+                        .text_size(px(13.))
+                        .font_weight(gpui_kit::FontWeight(700.0))
+                        .text_color(p.accent_contrast)
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.9))
+                        .child(SharedString::from(if chosen_count > 0 {
+                            format!("{} ({chosen_count})", label("fetchModelsAddSelected"))
+                        } else {
+                            label("fetchModelsAddSelected").to_owned()
+                        }))
+                        .on_click(move |_, window, cx| {
+                            let picks: Vec<String> = sel_save.borrow().iter().cloned().collect();
+                            if picks.is_empty() {
+                                window.close_dialog(cx);
+                                return;
+                            }
+                            view_save.update(cx, |w, cx| {
+                                let added = picks.len();
+                                let res = change_provider(w, &provider_save, |entry| {
+                                    for mid in &picks {
+                                        if !entry.models.iter().any(|m| &m.id == mid) {
+                                            entry.models.push(ProviderModel::new(mid, true));
+                                        }
+                                    }
+                                    Ok(())
+                                });
+                                match res {
+                                    Ok(()) => {
+                                        w.provider_models.notice = Some(crate::i18n::message(
+                                            "fetchModelsAdded",
+                                            &[("count", &added.to_string())],
+                                        ));
+                                        window.close_dialog(cx);
+                                    }
+                                    Err(err) => {
+                                        w.provider_models.notice = Some(err);
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        }),
+                ),
+        )
+    });
+}
+
 fn model_list(
     w: &Workbench,
     provider: &ModelProvider,
@@ -582,22 +870,47 @@ fn model_list(
     cx: &mut Context<Workbench>,
 ) -> Div {
     let provider_id = provider.id.clone();
+    let fetch_pid = provider.id.clone();
+    let fetching = w.provider_models.fetching_models.contains_key(&provider.id);
     let header = div()
         .flex()
         .items_center()
         .justify_between()
+        .gap(px(8.))
         .child(label("providerModelList"))
         .child(
-            btn(
-                "add-provider-model",
-                label("addProviderModel"),
-                &BtnVariant::Tiny,
-                p,
-            )
-            .icon(crate::icons::kit_icon("plus").size(px(14.)))
-            .on_click(cx.listener(move |_, _, window, cx| {
-                edit_model_dialog(&provider_id, None, p, window, cx);
-            })),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    btn(
+                        "fetch-provider-models",
+                        if fetching {
+                            label("fetchingAvailableModels")
+                        } else {
+                            label("fetchAvailableModels")
+                        },
+                        &BtnVariant::Tiny,
+                        p,
+                    )
+                    .disabled(fetching)
+                    .on_click(cx.listener(move |w, _, window, cx| {
+                        start_fetch_models(w, &fetch_pid, window, cx);
+                    })),
+                )
+                .child(
+                    btn(
+                        "add-provider-model",
+                        label("addProviderModel"),
+                        &BtnVariant::Tiny,
+                        p,
+                    )
+                    .icon(crate::icons::kit_icon("plus").size(px(14.)))
+                    .on_click(cx.listener(move |w, _, window, cx| {
+                        edit_model_dialog(w, &provider_id, None, p, window, cx);
+                    })),
+                ),
         );
     let mut rows = div()
         .border_1()
@@ -633,8 +946,8 @@ fn model_list(
         actions = actions.child(
             icon_btn(format!("edit-provider-model-{index}"), "pencil", p)
                 .tooltip(label("editProviderModel"))
-                .on_click(cx.listener(move |_, _, window, cx| {
-                    edit_model_dialog(&id, Some(&model_id), p, window, cx);
+                .on_click(cx.listener(move |w, _, window, cx| {
+                    edit_model_dialog(w, &id, Some(&model_id), p, window, cx);
                 })),
         );
         let id = provider.id.clone();
@@ -676,6 +989,52 @@ fn model_list(
                     cx.notify();
                 })),
         );
+        let mut left = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_family(crate::theme::MONO_FONT)
+                    .text_color(if model.enabled { p.text } else { p.muted })
+                    .child(model.id.clone()),
+            );
+        if let Some(ctx_tokens) = model.context_window.filter(|v| *v > 0) {
+            left = left.child(
+                div()
+                    .flex_none()
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded(px(5.))
+                    .bg(p.raised)
+                    .border_1()
+                    .border_color(p.border)
+                    .text_size(px(10.5))
+                    .font_family(crate::theme::MONO_FONT)
+                    .text_color(p.muted)
+                    .child(SharedString::from(format_context_badge(ctx_tokens))),
+            );
+        }
+        if model.input_modalities.supports_vision() {
+            left = left.child(
+                div()
+                    .flex_none()
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded(px(999.))
+                    .bg(p.raised)
+                    .border_1()
+                    .border_color(p.border)
+                    .text_size(px(10.5))
+                    .text_color(p.muted)
+                    .child(label("modelVisionBadge")),
+            );
+        }
         rows = rows.child(
             div()
                 .flex()
@@ -683,18 +1042,9 @@ fn model_list(
                 .justify_between()
                 .gap(px(8.))
                 .px(px(10.))
-                .py(px(3.))
+                .py(px(5.))
                 .when(index > 0, |row| row.border_t_1().border_color(p.line))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .font_family(crate::theme::MONO_FONT)
-                        .text_color(if model.enabled { p.text } else { p.muted })
-                        .child(model.id.clone()),
-                )
+                .child(left)
                 .child(actions),
         );
     }
@@ -707,7 +1057,76 @@ fn model_list(
         .when(!provider.models.is_empty(), |list| list.child(rows))
 }
 
+#[derive(Clone)]
+struct ModelDialogState {
+    advanced_open: bool,
+    modalities: ModelInputModalities,
+    capabilities: ModelCapabilities,
+    reasoning_levels: Vec<String>,
+    error: Option<String>,
+}
+
+type ToggleCallback = Box<dyn Fn(&mut Window)>;
+
+fn check_pill(
+    id: &'static str,
+    title: &'static str,
+    checked: bool,
+    locked: bool,
+    p: &'static Palette,
+    on_toggle: Option<ToggleCallback>,
+) -> gpui_kit::Stateful<Div> {
+    let mut el = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(px(7.))
+        .bg(if checked { p.raised } else { p.bg })
+        .border_1()
+        .border_color(if checked { p.accent } else { p.border })
+        .text_size(px(12.))
+        .text_color(if locked { p.muted } else { p.text })
+        .child(
+            div()
+                .w(px(14.))
+                .h(px(14.))
+                .rounded(px(3.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_1()
+                .border_color(if checked { p.accent } else { p.border })
+                .bg(if checked { p.accent } else { p.bg })
+                .when(checked, |b| {
+                    b.child(
+                        crate::icons::kit_icon("check")
+                            .size(px(10.))
+                            .text_color(p.accent_contrast),
+                    )
+                }),
+        )
+        .child(title);
+    if locked {
+        el = el.child(
+            crate::icons::kit_icon("lock")
+                .size(px(11.))
+                .text_color(p.muted),
+        );
+    }
+    if let Some(handler) = on_toggle {
+        el = el.cursor_pointer().on_click(move |_, window, _| {
+            handler(window);
+            window.refresh();
+        });
+    }
+    el
+}
+
 fn edit_model_dialog(
+    w: &Workbench,
     provider: &str,
     model: Option<&str>,
     p: &'static Palette,
@@ -717,74 +1136,498 @@ fn edit_model_dialog(
     if window.has_active_dialog(cx) {
         return;
     }
-    let title = label(if model.is_some() {
+    let existing = model.and_then(|mid| {
+        w.settings
+            .agent
+            .providers
+            .iter()
+            .find(|entry| entry.id == provider)
+            .and_then(|entry| entry.models.iter().find(|m| m.id == mid))
+            .cloned()
+    });
+    let title = label(if existing.is_some() {
         "editProviderModel"
     } else {
         "addProviderModel"
     });
-    let input = cx.new(|cx| {
+    let id_input = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(label("enterModelName"))
-            .default_value(model.unwrap_or_default().to_owned())
+            .default_value(existing.as_ref().map_or_else(String::new, |m| m.id.clone()))
     });
-    let focus = input.clone();
-    let error = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let ctx_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("1000000")
+            .default_value(
+                existing
+                    .as_ref()
+                    .and_then(|m| m.context_window)
+                    .map_or_else(String::new, |v| v.to_string()),
+            )
+    });
+    let max_out_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("128000")
+            .default_value(
+                existing
+                    .as_ref()
+                    .and_then(|m| m.max_output_tokens)
+                    .map_or_else(String::new, |v| v.to_string()),
+            )
+    });
+    let level_input = cx
+        .new(|cx| InputState::new(window, cx).placeholder(label("modelReasoningLevelPlaceholder")));
+    let params_default = existing
+        .as_ref()
+        .and_then(|m| m.reasoning_params.as_ref())
+        .and_then(|v| serde_json::to_string_pretty(v).ok())
+        .unwrap_or_default();
+    let params_input = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .placeholder(label("modelReasoningParamsPlaceholder"))
+            .default_value(params_default)
+    });
+    let state = Rc::new(RefCell::new(ModelDialogState {
+        advanced_open: existing.as_ref().is_some_and(|m| {
+            !m.input_modalities.is_default()
+                || !m.capabilities.is_default()
+                || !m.reasoning_levels.is_empty()
+                || m.reasoning_params.is_some()
+        }),
+        modalities: existing
+            .as_ref()
+            .map_or_else(ModelInputModalities::default, |m| {
+                m.input_modalities.clone()
+            }),
+        capabilities: existing
+            .as_ref()
+            .map_or_else(ModelCapabilities::default, |m| m.capabilities.clone()),
+        reasoning_levels: existing
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.reasoning_levels.clone()),
+        error: None,
+    }));
+    let focus = id_input.clone();
     let provider = provider.to_owned();
     let previous = model.map(str::to_owned);
     let view = cx.entity();
     window.open_dialog(cx, move |dialog, _, _| {
-        let view = view.clone();
-        let provider = provider.clone();
-        let previous = previous.clone();
-        let draft = input.clone();
-        let reason = error.borrow().clone();
-        let error = error.clone();
-        dialog
-            .title(title)
-            .child(Input::new(&input).id("provider-model-id").w_full())
-            .child(
-                div().children(
-                    reason.map(|reason| div().pt(px(6.)).text_color(p.red).child(reason)),
-                ),
-            )
-            .footer(
-                // Hand-drawn button inside Dialog overlay (gpui-kit Button loses text in dialogs).
-                div().flex().justify_end().child(
+        let snapshot = state.borrow().clone();
+        let mut content = div()
+            .id("edit-model-dialog-scroll")
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .max_h(px(460.))
+            .overflow_y_scroll()
+            .child(field(
+                label("agentModelName"),
+                Input::new(&id_input)
+                    .id("provider-model-id")
+                    .w_full()
+                    .bg(p.bg),
+                None,
+                p,
+            ))
+            .child(field(
+                label("modelContextWindow"),
+                Input::new(&ctx_input)
+                    .id("provider-model-context")
+                    .w_full()
+                    .bg(p.bg),
+                None,
+                p,
+            ))
+            .child(field(
+                label("modelMaxOutputTokens"),
+                Input::new(&max_out_input)
+                    .id("provider-model-max-output")
+                    .w_full()
+                    .bg(p.bg),
+                None,
+                p,
+            ));
+
+        let adv_state = state.clone();
+        content = content.child(
+            div()
+                .id("toggle-model-advanced")
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .py(px(4.))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .text_color(p.text)
+                .child(
+                    crate::icons::kit_icon(if snapshot.advanced_open {
+                        "chevron-down"
+                    } else {
+                        "chevron-right"
+                    })
+                    .size(px(14.))
+                    .text_color(p.muted),
+                )
+                .child(label("modelAdvancedConfig"))
+                .on_click(move |_, window, _| {
+                    let mut st = adv_state.borrow_mut();
+                    st.advanced_open = !st.advanced_open;
+                    window.refresh();
+                }),
+        );
+
+        if snapshot.advanced_open {
+            let st_img = state.clone();
+            let st_vid = state.clone();
+            let st_pdf = state.clone();
+            let modalities_row = div()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .child(check_pill(
+                    "mod-text",
+                    label("modelModalityText"),
+                    true,
+                    true,
+                    p,
+                    None,
+                ))
+                .child(check_pill(
+                    "mod-image",
+                    label("modelModalityImage"),
+                    snapshot.modalities.image,
+                    false,
+                    p,
+                    Some(Box::new(move |_| {
+                        let mut st = st_img.borrow_mut();
+                        st.modalities.image = !st.modalities.image;
+                    })),
+                ))
+                .child(check_pill(
+                    "mod-video",
+                    label("modelModalityVideo"),
+                    snapshot.modalities.video,
+                    false,
+                    p,
+                    Some(Box::new(move |_| {
+                        let mut st = st_vid.borrow_mut();
+                        st.modalities.video = !st.modalities.video;
+                    })),
+                ))
+                .child(check_pill(
+                    "mod-pdf",
+                    label("modelModalityPdf"),
+                    snapshot.modalities.pdf,
+                    false,
+                    p,
+                    Some(Box::new(move |_| {
+                        let mut st = st_pdf.borrow_mut();
+                        st.modalities.pdf = !st.modalities.pdf;
+                    })),
+                ));
+
+            let state_structured = state.clone();
+            let state_web_search = state.clone();
+            let state_mid_system = state.clone();
+            let caps_row = div()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .child(check_pill(
+                    "cap-structured",
+                    label("modelCapStructuredOutput"),
+                    snapshot.capabilities.structured_output,
+                    false,
+                    p,
+                    Some(Box::new(move |_| {
+                        let mut st = state_structured.borrow_mut();
+                        st.capabilities.structured_output = !st.capabilities.structured_output;
+                    })),
+                ))
+                .child(check_pill(
+                    "cap-websearch",
+                    label("modelCapWebSearch"),
+                    snapshot.capabilities.web_search,
+                    false,
+                    p,
+                    Some(Box::new(move |_| {
+                        let mut st = state_web_search.borrow_mut();
+                        st.capabilities.web_search = !st.capabilities.web_search;
+                    })),
+                ))
+                .child(check_pill(
+                    "cap-midsystem",
+                    label("modelCapMidSystem"),
+                    snapshot.capabilities.mid_conversation_system,
+                    false,
+                    p,
+                    Some(Box::new(move |_| {
+                        let mut st = state_mid_system.borrow_mut();
+                        st.capabilities.mid_conversation_system =
+                            !st.capabilities.mid_conversation_system;
+                    })),
+                ));
+
+            let mut levels_row = div().flex().flex_wrap().items_center().gap(px(6.));
+            for (idx, level) in snapshot.reasoning_levels.iter().enumerate() {
+                let st_rm = state.clone();
+                let lvl = level.clone();
+                levels_row = levels_row.child(
                     div()
-                        .id("save-provider-model")
+                        .id(("reasoning-level-chip", idx))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .px(px(9.))
+                        .py(px(4.))
+                        .rounded(px(7.))
+                        .bg(p.raised)
+                        .border_1()
+                        .border_color(p.border)
+                        .font_family(crate::theme::MONO_FONT)
+                        .text_size(px(12.))
+                        .text_color(p.text)
+                        .cursor_pointer()
+                        .hover(|s| s.border_color(p.red))
+                        .child(SharedString::from(level.clone()))
+                        .child(
+                            crate::icons::kit_icon("x")
+                                .size(px(11.))
+                                .text_color(p.muted),
+                        )
+                        .on_click(move |_, window, _| {
+                            st_rm.borrow_mut().reasoning_levels.retain(|l| l != &lvl);
+                            window.refresh();
+                        }),
+                );
+            }
+            let st_add = state.clone();
+            let lvl_input_add = level_input.clone();
+            levels_row = levels_row
+                .child(
+                    div().w(px(130.)).child(
+                        Input::new(&level_input)
+                            .id("model-reasoning-level-input")
+                            .bg(p.bg),
+                    ),
+                )
+                .child(
+                    div()
+                        .id("add-reasoning-level")
                         .flex()
                         .items_center()
                         .justify_center()
-                        .min_h(px(32.0))
-                        .px(px(14.0))
-                        .rounded(px(8.0))
-                        .bg(p.accent)
-                        .text_size(px(13.0))
-                        .font_weight(gpui_kit::FontWeight(700.0))
-                        .text_color(p.accent_contrast)
+                        .w(px(28.))
+                        .h(px(28.))
+                        .rounded(px(7.))
+                        .bg(p.raised)
+                        .border_1()
+                        .border_color(p.border)
                         .cursor_pointer()
-                        .hover(|s| s.opacity(0.9))
-                        .child(label("save"))
+                        .hover(|s| s.bg(p.hover))
+                        .child(
+                            crate::icons::kit_icon("plus")
+                                .size(px(13.))
+                                .text_color(p.text),
+                        )
                         .on_click(move |_, window, cx| {
-                            view.update(cx, |w, cx| {
-                                let value = draft.read(cx).value();
-                                match save_model_entry(
-                                    w,
-                                    &provider,
-                                    previous.as_deref(),
-                                    value.trim(),
-                                ) {
-                                    Ok(()) => window.close_dialog(cx),
-                                    Err(reason) => {
-                                        *error.borrow_mut() = Some(reason);
-                                        window.refresh();
-                                    }
+                            let next = lvl_input_add.read(cx).value().trim().to_owned();
+                            if !next.is_empty() {
+                                let mut st = st_add.borrow_mut();
+                                if !st.reasoning_levels.contains(&next) {
+                                    st.reasoning_levels.push(next);
                                 }
-                                cx.notify();
-                            });
+                                lvl_input_add.update(cx, |inp, cx| inp.set_value("", window, cx));
+                                window.refresh();
+                            }
                         }),
+                );
+
+            content = content
+                .child(field(
+                    label("modelInputModalities"),
+                    modalities_row,
+                    None,
+                    p,
+                ))
+                .child(field(label("modelCapabilities"), caps_row, None, p))
+                .child(field(label("modelReasoningLevels"), levels_row, None, p))
+                .child(field(
+                    label("modelReasoningParams"),
+                    Textarea::new(&params_input)
+                        .w_full()
+                        .h(px(96.))
+                        .bg(p.bg)
+                        .font_family(crate::theme::MONO_FONT)
+                        .text_size(px(12.)),
+                    None,
+                    p,
+                ));
+        }
+
+        if let Some(reason) = snapshot.error {
+            content = content.child(
+                div()
+                    .pt(px(4.))
+                    .text_size(px(12.))
+                    .text_color(p.red)
+                    .child(reason),
+            );
+        }
+
+        let st_reset = state.clone();
+        let ctx_reset = ctx_input.clone();
+        let max_reset = max_out_input.clone();
+        let lvl_reset = level_input.clone();
+        let params_reset = params_input.clone();
+
+        let view_save = view.clone();
+        let provider_save = provider.clone();
+        let previous_save = previous.clone();
+        let id_save = id_input.clone();
+        let ctx_save = ctx_input.clone();
+        let max_save = max_out_input.clone();
+        let params_save = params_input.clone();
+        let st_save = state.clone();
+
+        dialog.title(title).child(content).footer(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .child(
+                    div()
+                        .id("reset-provider-model-form")
+                        .text_size(px(12.5))
+                        .text_color(p.muted)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(p.text))
+                        .child(label("modelResetForm"))
+                        .on_click(move |_, window, cx| {
+                            ctx_reset.update(cx, |inp, cx| inp.set_value("", window, cx));
+                            max_reset.update(cx, |inp, cx| inp.set_value("", window, cx));
+                            lvl_reset.update(cx, |inp, cx| inp.set_value("", window, cx));
+                            params_reset.update(cx, |inp, cx| inp.set_value("", window, cx));
+                            let mut st = st_reset.borrow_mut();
+                            st.modalities = ModelInputModalities::default();
+                            st.capabilities = ModelCapabilities::default();
+                            st.reasoning_levels.clear();
+                            st.error = None;
+                            window.refresh();
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .id("cancel-provider-model")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .min_h(px(32.0))
+                                .px(px(14.0))
+                                .rounded(px(8.0))
+                                .bg(p.raised)
+                                .border_1()
+                                .border_color(p.border)
+                                .text_size(px(13.0))
+                                .text_color(p.text)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(p.hover))
+                                .child(label("cancel"))
+                                .on_click(|_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("save-provider-model")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .min_h(px(32.0))
+                                .px(px(14.0))
+                                .rounded(px(8.0))
+                                .bg(p.accent)
+                                .text_size(px(13.0))
+                                .font_weight(gpui_kit::FontWeight(700.0))
+                                .text_color(p.accent_contrast)
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.9))
+                                .child(label("save"))
+                                .on_click(move |_, window, cx| {
+                                    let id_val = id_save.read(cx).value().trim().to_owned();
+                                    let ctx_raw = ctx_save.read(cx).value().trim().to_owned();
+                                    let max_raw = max_save.read(cx).value().trim().to_owned();
+                                    let params_raw = params_save.read(cx).value().trim().to_owned();
+                                    let parse_opt_u64 = |raw: &str| -> Result<Option<u64>, String> {
+                                        if raw.is_empty() {
+                                            return Ok(None);
+                                        }
+                                        raw.parse::<u64>()
+                                            .ok()
+                                            .filter(|v| *v > 0)
+                                            .map(Some)
+                                            .ok_or_else(|| label("modelInvalidNumber").to_owned())
+                                    };
+                                    let parsed = (|| -> Result<ProviderModel, String> {
+                                        let context_window = parse_opt_u64(&ctx_raw)?;
+                                        let max_output_tokens = parse_opt_u64(&max_raw)?;
+                                        let reasoning_params = if params_raw.is_empty() {
+                                            None
+                                        } else {
+                                            let val: serde_json::Value = serde_json::from_str(
+                                                &params_raw,
+                                            )
+                                            .map_err(|_| label("modelInvalidJson").to_owned())?;
+                                            if !val.is_object() {
+                                                return Err(label("modelInvalidJson").to_owned());
+                                            }
+                                            Some(val)
+                                        };
+                                        let st = st_save.borrow();
+                                        Ok(ProviderModel {
+                                            id: id_val,
+                                            enabled: true,
+                                            context_window,
+                                            max_output_tokens,
+                                            input_modalities: st.modalities.clone(),
+                                            capabilities: st.capabilities.clone(),
+                                            reasoning_levels: st.reasoning_levels.clone(),
+                                            reasoning_params,
+                                        })
+                                    })();
+                                    match parsed {
+                                        Ok(entry) => {
+                                            view_save.update(cx, |w, cx| {
+                                                match save_model_entry(
+                                                    w,
+                                                    &provider_save,
+                                                    previous_save.as_deref(),
+                                                    entry,
+                                                ) {
+                                                    Ok(()) => window.close_dialog(cx),
+                                                    Err(reason) => {
+                                                        st_save.borrow_mut().error = Some(reason);
+                                                        window.refresh();
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        }
+                                        Err(reason) => {
+                                            st_save.borrow_mut().error = Some(reason);
+                                            window.refresh();
+                                        }
+                                    }
+                                }),
+                        ),
                 ),
-            )
+        )
     });
     window.defer(cx, move |window, cx| {
         focus.read(cx).focus_handle(cx).focus(window, cx);
@@ -795,9 +1638,9 @@ fn save_model_entry(
     w: &mut Workbench,
     provider: &str,
     previous: Option<&str>,
-    model: &str,
+    mut model: ProviderModel,
 ) -> Result<(), String> {
-    if model.is_empty() {
+    if model.id.is_empty() {
         return Err(label("enterModelName").into());
     }
     let mut candidate = w.settings.clone();
@@ -808,7 +1651,7 @@ fn save_model_entry(
         .find(|entry| entry.id == provider)
         .ok_or_else(|| label("saveProviderFirst").to_owned())?
         .models;
-    if previous != Some(model) && models.iter().any(|entry| entry.id == model) {
+    if previous != Some(model.id.as_str()) && models.iter().any(|entry| entry.id == model.id) {
         return Err(label("duplicateProviderModel").into());
     }
     if let Some(previous) = previous {
@@ -816,17 +1659,15 @@ fn save_model_entry(
             .iter_mut()
             .find(|entry| entry.id == previous)
             .ok_or_else(|| label("enterModelName").to_owned())?;
-        model.clone_into(&mut entry.id);
+        model.enabled = entry.enabled;
+        *entry = model.clone();
         if agent.active_provider_id.as_deref() == Some(provider)
             && agent.active_model_id.as_deref() == Some(previous)
         {
-            agent.active_model_id = Some(model.to_owned());
+            agent.active_model_id = Some(model.id);
         }
     } else {
-        models.push(ProviderModel {
-            id: model.to_owned(),
-            enabled: true,
-        });
+        models.push(model);
     }
     w.save_model_catalog(candidate)?;
     w.provider_models
@@ -835,8 +1676,9 @@ fn save_model_entry(
     Ok(())
 }
 
-/// Agent 页下半部分：goose 运行时（版本/模型/外部路径/三行徽标）→ A2A 协作 →
-/// Agent 接入配置（自设置页迁入）。
+/// In the lower half of the agent page: Goose runtime settings (version/model/external path/three
+/// logos) → A2A collaboration → Agent connection configuration (settings imported from the
+/// self-setup page).
 fn agent_config_sections(
     page: Div,
     w: &mut Workbench,

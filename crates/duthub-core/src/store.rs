@@ -1,7 +1,7 @@
-//! settings.json 原子读写（`docs/SECURITY.md` #9：临时文件 + fsync + rename）。
+//! Read and write settings atomically using a temporary file, sync, and rename.
 //!
-//! 配置目录（settings.json / duts.json）固定在可执行文件同级的 `.duthub/`。
-//! 工作目录独立解析，承载日志、采集和运行时快照。
+//! Keep `settings.json` and `duts.json` in `.duthub/` beside the executable.
+//! Resolve the work directory separately for logs, captures, and runtime snapshots.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -17,7 +17,7 @@ pub use crate::util::{sha256_file, sha256_hex};
 
 const CONFIG_DIR: &str = ".duthub";
 
-/// 可执行文件所在目录（路径解析锚点）。
+/// Directory containing the executable, used as the base for relative paths.
 pub fn exe_dir() -> DeviceResult<PathBuf> {
     let exe = std::env::current_exe().map_err(|e| DeviceError::Invalid(e.to_string()))?;
     exe.parent()
@@ -62,7 +62,7 @@ pub fn config_dir_in(exe_dir: &Path) -> PathBuf {
     exe_dir.join(CONFIG_DIR)
 }
 
-/// 创建配置目录并补齐缺失的默认文件，保留已存在的配置。
+/// Create the configuration directory and initialize any missing files with defaults.
 pub fn initialize_config_dir(exe_dir: &Path) -> DeviceResult<PathBuf> {
     ensure_plain_child_dir(exe_dir, CONFIG_DIR)?;
     let dir = config_dir_in(exe_dir);
@@ -106,7 +106,7 @@ fn create_default_config(
         .map_err(|error| DeviceError::Invalid(format!("无法初始化 {}: {error}", path.display())))
 }
 
-/// 默认运行产物目录 = exe 同级 `duthub-data/`。
+/// Default runtime output directory, `duthub-data/` beside the executable.
 #[must_use]
 pub fn default_work_dir_in(exe_dir: &Path) -> PathBuf {
     exe_dir.join("duthub-data")
@@ -122,7 +122,8 @@ pub fn resolve_portable_work_dir_in(
         .into_iter()
         .flatten()
         .map(str::trim)
-        .find(|path| !path.is_empty()).map_or_else(|| exe_dir.to_path_buf(), |path| exe_dir.join(path))
+        .find(|path| !path.is_empty())
+        .map_or_else(|| exe_dir.to_path_buf(), |path| exe_dir.join(path))
 }
 
 /// Resolve the desktop's trusted artifact root. Settings and startup options
@@ -173,8 +174,8 @@ fn ensure_plain_child_dir(root: &Path, component: &str) -> DeviceResult<()> {
         .map_err(|error| DeviceError::Invalid(format!("目录 {component} 不安全或不可用: {error}")))
 }
 
-/// 逐级创建并校验 `root` 下的普通目录链（cap-std 能力边界；junction/symlink
-/// 一律拒绝）。返回最终目录的普通路径。
+/// Create and validate a directory chain within the capability root.
+/// Reject junctions and symlinks and return the path to the final ordinary directory.
 pub fn ensure_agent_dir(root: &Path, components: &[&str]) -> DeviceResult<PathBuf> {
     let mut current = root.to_path_buf();
     for component in components {
@@ -187,9 +188,9 @@ pub fn ensure_agent_dir(root: &Path, components: &[&str]) -> DeviceResult<PathBu
     Ok(current)
 }
 
-/// DUT 稳定 id → 可安全用作目录名的键（UTF-8 字节的十六进制，避免路径字符、
-/// 保留名与大小写差异）。空/全空白 → `None`（调用方必须显式拒绝，不能回退到
-/// 固定占位名——多台空 id 会互相覆盖）。
+/// Encode the stable DUT ID as UTF-8 hex to avoid path characters, reserved names, and case collisions.
+/// Empty and whitespace-only IDs return `None`. The caller must reject them.
+/// A single placeholder directory would conflate multiple such IDs.
 #[must_use]
 pub fn agent_dut_key(dut_id: &str) -> Option<String> {
     use std::fmt::Write as _;
@@ -205,15 +206,15 @@ pub fn agent_dut_key(dut_id: &str) -> Option<String> {
     Some(key)
 }
 
-/// Agent 工作目录中的每 DUT 目录：`<work_dir>/agent/dut/<key>`。
+/// Per-DUT Agent directory at `<work_dir>/agent/dut/<key>`.
 pub fn agent_dut_dir(work_dir: &Path, dut_id: &str) -> DeviceResult<PathBuf> {
     let key =
         agent_dut_key(dut_id).ok_or_else(|| DeviceError::Invalid("DUT id 不能为空".into()))?;
     ensure_agent_dir(work_dir, &["agent", "dut", &key])
 }
 
-/// 去掉 Windows verbatim 前缀（`\\?\C:\...` → `C:\...`；`\\?\UNC\server\share`
-/// → `\\server\share`），便于把路径写入日志/展示与比较。
+/// Strip the Windows verbatim drive or UNC prefix from a path.
+/// Use the ordinary form for display, logging, and comparison.
 #[must_use]
 pub fn plain_path(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
@@ -230,7 +231,7 @@ fn settings_path(dir: &Path) -> PathBuf {
     dir.join("settings.json")
 }
 
-/// 出厂默认 settings（theme dark / language zh-CN / platform windows）。
+/// Factory settings use the dark theme, Simplified Chinese, and Windows.
 #[must_use]
 pub fn default_settings() -> SettingsFile {
     SettingsFile {
@@ -274,9 +275,9 @@ pub fn default_settings() -> SettingsFile {
     }
 }
 
-/// 加载 settings；文件缺失返回默认；损坏则改名备份后返回默认（不覆盖原文件）。
+/// Load settings, use defaults for a missing file, and back up corrupt settings before falling back.
 ///
-/// 加载后对烧录预设做 id 归一化（旧配置无 `id` → 按名称生成稳定 id）。
+/// Assign stable IDs derived from preset names to flash presets from older files.
 pub fn load_settings(dir: &Path) -> DeviceResult<SettingsFile> {
     let path = settings_path(dir);
     let raw = match std::fs::read_to_string(&path) {
@@ -316,14 +317,14 @@ fn seed_default_highlight_rules(settings: &mut SettingsFile) {
     }
 }
 
-/// 为烧录预设补齐稳定 `id`（slug + 去重），保证同一预设跨启动 id 不变。
+/// Fill missing flash preset IDs with unique slugs that remain stable across restarts.
 pub fn normalize_preset_ids(presets: &mut [FlashToolPreset]) {
     for preset in presets.iter_mut() {
         if preset.id.is_empty() {
             preset.id = preset_slug(&preset.name);
         }
     }
-    // 去重：同名/同 slug 时追加序号（稳定顺序 = 列表顺序）
+    // Resolve duplicate names or slugs with suffixes in list order.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for preset in presets.iter_mut() {
         let mut candidate = preset.id.clone();
@@ -475,7 +476,7 @@ fn save_config_atomic(
     let pending = DropGuard::new(temp, |temp| {
         let _ = std::fs::remove_file(temp);
     });
-    // Windows 必须先关闭文件句柄，再重命名或在失败时清理。
+    // Close the handle before renaming or cleaning up the file on Windows.
     let written = {
         let mut file = file;
         file.write_all(encoded.as_bytes())
@@ -505,7 +506,7 @@ fn duts_path(dir: &Path) -> PathBuf {
     dir.join("duts.json")
 }
 
-/// 新配置从空的 DUT 列表开始。
+/// Start a new configuration with an empty DUT list.
 #[must_use]
 pub fn default_duts() -> DutsFile {
     DutsFile {
@@ -518,7 +519,7 @@ pub fn default_duts() -> DutsFile {
     }
 }
 
-/// 加载 duts.json；缺失 → `None`；损坏 → 改名备份后返回错误。
+/// Load `duts.json`. Return `None` if missing or back up a corrupt file and return an error.
 pub fn load_duts(dir: &Path) -> DeviceResult<Option<crate::model::DutsFile>> {
     let path = duts_path(dir);
     let raw = match std::fs::read_to_string(&path) {
@@ -538,7 +539,7 @@ pub fn load_duts(dir: &Path) -> DeviceResult<Option<crate::model::DutsFile>> {
     }
 }
 
-/// 原子保存 duts.json（temp + fsync + rename）。
+/// Save `duts.json` atomically using a temporary file, sync, and rename.
 pub fn save_duts_atomic(dir: &Path, duts: &crate::model::DutsFile) -> DeviceResult<()> {
     save_config_atomic(dir, &duts_path(dir), "duts", duts)
 }
@@ -672,7 +673,7 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "不应残留 .tmp");
+        assert!(leftovers.is_empty(), "no leftover .tmp files should remain");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -719,7 +720,7 @@ mod tests {
                 },
                 ..Default::default()
             },
-            heartbeat: crate::model::HeartbeatConfig::default(),
+            heartbeat: crate::heartbeat::HeartbeatConfig::default(),
         };
         let plain_dut = crate::model::DutConfig {
             id: "dut-plain".into(),
@@ -741,7 +742,7 @@ mod tests {
             a2a: crate::model::DutA2aConfig::default(),
             flash: crate::model::FlashConfig::default(),
             media: crate::model::DutMediaConfig::default(),
-            heartbeat: crate::model::HeartbeatConfig::default(),
+            heartbeat: crate::heartbeat::HeartbeatConfig::default(),
         };
         let duts = crate::model::DutsFile {
             version: 1,
@@ -752,19 +753,25 @@ mod tests {
             duts: vec![media_dut.clone(), plain_dut],
         };
         save_duts_atomic(&dir, &duts).unwrap();
-        // 落盘格式：media 字段为 camelCase；未配置 media 的 DUT 整段省略该字段。
+        // The wire field uses camel case and is absent for a DUT with default media settings.
         let raw = std::fs::read_to_string(dir.join("duts.json")).unwrap();
         assert!(raw.contains("\"videoSize\": \"1920x1080\""), "{raw}");
         assert!(raw.contains("\"frameRate\": \"60\""), "{raw}");
         assert_eq!(
             raw.matches("\"media\"").count(),
             1,
-            "未配置 media 的 DUT 不应序列化 media 字段: {raw}"
+            "DUT without media config must not serialize a media field: {raw}"
         );
-        let loaded = load_duts(&dir).unwrap().expect("duts.json 应存在");
+        let loaded = load_duts(&dir).unwrap().expect("duts.json should exist");
         assert_eq!(loaded.duts.len(), 2);
-        assert_eq!(loaded.duts[0], media_dut, "media 绑定必须原样往返");
-        assert_eq!(loaded.duts[1].media, crate::model::DutMediaConfig::default());
+        assert_eq!(
+            loaded.duts[0], media_dut,
+            "media bindings must round-trip losslessly"
+        );
+        assert_eq!(
+            loaded.duts[1].media,
+            crate::model::DutMediaConfig::default()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -779,7 +786,7 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|e| e.path().to_string_lossy().contains("corrupt"))
             .collect();
-        assert_eq!(backups.len(), 1, "损坏文件必须保留备份");
+        assert_eq!(backups.len(), 1, "corrupt file must be backed up");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -799,10 +806,13 @@ mod tests {
         let settings = load_settings(&dir).unwrap();
         let ids: Vec<&str> = settings.flash_tools.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids[0], "preset-upgrade_tool");
-        assert_eq!(ids[1], "preset-upgrade_tool-2", "同名预设 id 必须去重");
-        // 非 ASCII 名称 slug 化为占位（稳定）；与已有 id 去重
+        assert_eq!(
+            ids[1], "preset-upgrade_tool-2",
+            "duplicate preset names must receive deduplicated IDs"
+        );
+        // Use a stable fallback for non-ASCII names and avoid existing IDs.
         assert_eq!(ids[2], "preset");
-        // 归一化是稳定的：再次加载同文件 id 不变（旧文件无 id → slug 由 name 决定）
+        // Reopening the same legacy configuration yields the same IDs.
         let again = load_settings(&dir).unwrap();
         let ids2: Vec<&str> = again.flash_tools.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ids2);
@@ -863,7 +873,7 @@ mod tests {
     #[test]
     fn workspace_dir_setting_backward_compatible_and_roundtrips() {
         let dir = temp_dir("workspace-dir");
-        // 旧 settings.json 无 workspaceDir 字段 → None（向后兼容）
+        // Older settings can omit the work directory.
         let legacy = serde_json::json!({
             "version": 1,
             "appearance": { "theme": "dark", "language": "zh-CN", "platform": "windows" }
@@ -872,10 +882,10 @@ mod tests {
         let loaded = load_settings(&dir).unwrap();
         assert_eq!(
             loaded.workspace_dir, None,
-            "旧文件缺字段必须反序列化为 None"
+            "legacy files missing workspaceDir must deserialize as None"
         );
 
-        // 配置 workspaceDir → 往返保留
+        // An explicit work directory survives a round trip.
         let mut settings = default_settings();
         settings.workspace_dir = Some("D:/work/logs-root".into());
         save_settings_atomic(&dir, &settings).unwrap();
@@ -889,13 +899,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ------------------------- Agent 路径 / 哈希助手 -------------------------
+    // Agent path and hashing helpers
 
     #[test]
     fn agent_dut_key_rejects_blank_and_is_path_safe() {
         assert_eq!(agent_dut_key(""), None);
         assert_eq!(agent_dut_key("   \t\r\n"), None);
-        // 稳定且与原始 id 一一对应；非 ASCII / 路径字符一律编码
+        // Encoding is stable and one-to-one, including non-ASCII and path characters.
         let key = agent_dut_key("dut-a").unwrap();
         assert_eq!(key, agent_dut_key("dut-a").unwrap());
         assert_ne!(key, agent_dut_key("dut-b").unwrap());
@@ -907,7 +917,7 @@ mod tests {
                 "{raw} → {key}"
             );
         }
-        // 首尾空白被裁剪，键与 trim 后的 id 一致
+        // The key is derived from the ID after trimming outer whitespace.
         assert_eq!(agent_dut_key("  dut-a  "), agent_dut_key("dut-a"));
     }
 
@@ -915,15 +925,22 @@ mod tests {
     fn agent_dut_dir_is_created_beneath_work_dir_and_rejects_unsafe_names() {
         let root = temp_dir("agent-dut-dir");
         let dir = agent_dut_dir(&root, "dut-a").unwrap();
-        assert!(dir.is_dir(), "目录应已创建: {}", dir.display());
+        assert!(dir.is_dir(), "directory should exist: {}", dir.display());
         assert!(dir.starts_with(&root));
-        assert_eq!(dir, agent_dut_dir(&root, "dut-a").unwrap(), "重复调用幂等");
-        assert!(agent_dut_dir(&root, "").is_err(), "空 DUT id 必须拒绝");
+        assert_eq!(
+            dir,
+            agent_dut_dir(&root, "dut-a").unwrap(),
+            "repeated calls must be idempotent"
+        );
+        assert!(
+            agent_dut_dir(&root, "").is_err(),
+            "empty DUT id must be rejected"
+        );
         assert!(agent_dut_dir(&root, "  ").is_err());
-        // 路径段不能穿越（name_component 校验）
+        // Reject traversal in path components.
         assert!(ensure_agent_dir(&root, &[".."]).is_err());
         assert!(ensure_agent_dir(&root, &["C:", "x"]).is_err());
-        // 已存在的普通文件不能当目录复用
+        // An ordinary file cannot be reused as a directory.
         let blocked = root.join("blocked");
         std::fs::write(&blocked, b"not a dir").unwrap();
         assert!(ensure_agent_dir(&root, &["blocked"]).is_err());
@@ -952,7 +969,7 @@ mod tests {
 
     #[test]
     fn sha256_helpers_match_known_vector_and_file_bytes() {
-        // FIPS 180-2 已知向量：sha256("abc")
+        // Known SHA-256 test vector from FIPS 180-2.
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -983,7 +1000,7 @@ mod tests {
     #[test]
     fn load_settings_seeds_default_highlight_rules_only_when_empty() {
         let dir = tempfile::tempdir().unwrap();
-        // 旧 settings.json 无 serial 段 → 播种内置默认规则（sermcp 语义）
+        // Seed the default serial rules when legacy settings have no serial section.
         std::fs::write(
             settings_path(dir.path()),
             r#"{"version":1,"appearance":{"theme":"dark","language":"zh-CN","platform":"windows"}}"#,
@@ -995,7 +1012,7 @@ mod tests {
             crate::model::default_highlight_rules()
         );
 
-        // 已有规则 → 原样保留，绝不覆盖用户手写规则
+        // Preserve user-defined rules when a list already exists.
         let mut settings = loaded;
         settings.serial.highlight_rules = vec![crate::model::PromptRule {
             regex: "panic".into(),

@@ -1,11 +1,11 @@
-//! W3 验收（F10）：桌面租约链必须启用 GUI 会话生命周期。
+//! W3 acceptance (F10): desktop lease chain must enable GUI session lifetime.
 //!
-//! 两条断言：
-//! 1. `src/main.rs` 的共享 `ControlLeaseManager` 与 `DeviceService` 同口径调用
-//!    `.with_gui_session_lifetime()` —— 漏掉时 GUI 自动租约会被 TTL 过期，
-//!    「GUI 在场 → 拒 Agent」的防线在 TTL 之后失效（`--open-port` 直连实例）。
-//! 2. 启用该模式后，GUI 租约不随 TTL 过期、剩余时间恒为 `None`、Agent 接管保持
-//!    Busy、GUI 写入复核放行；释放后恢复 Free。
+//! Two assertions:
+//! 1. `src/main.rs` calls `.with_gui_session_lifetime()` on the shared `ControlLeaseManager`
+//!    consistent with `DeviceService` — omitting it lets automatic GUI leases expire on TTL,
+//!    breaking the GUI-present agent-rejection guard (`--open-port` direct sessions).
+//! 2. With this mode enabled, GUI leases never expire by TTL, remaining time stays `None`,
+//!    agent takeover stays Busy, GUI write admission passes, and release returns to Free.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use duthub_core::{
 };
 
 fn manifest_dir() -> PathBuf {
-    // 坑 #4：运行期读取，不能 env!（编译期烘焙绝对路径，目录改名即失效）。
+    // Read at runtime rather than env! (compile-time paths break if the directory is moved).
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
 }
 
@@ -32,13 +32,13 @@ fn main_wires_gui_session_lifetime_onto_the_shared_lease_manager() {
         .expect("read apps/desktop/src/main.rs");
     let construction = main
         .find("ControlLeaseManager::new")
-        .expect("main.rs 必须构造 ControlLeaseManager");
-    let gui_lifetime = main
-        .find(".with_gui_session_lifetime()")
-        .expect("F10：main.rs 的 ControlLeaseManager 链缺少 .with_gui_session_lifetime()");
+        .expect("main.rs must construct ControlLeaseManager");
+    let gui_lifetime = main.find(".with_gui_session_lifetime()").expect(
+        "F10: ControlLeaseManager chain in main.rs is missing .with_gui_session_lifetime()",
+    );
     assert!(
         gui_lifetime > construction,
-        "with_gui_session_lifetime 必须接在控制租约管理器构造链上"
+        "with_gui_session_lifetime must be chained onto ControlLeaseManager construction"
     );
     // main.rs injects the shared ControlLeaseManager (with GUI session lifetime)
     // directly into DeviceService via `with_lease_authority`, keeping one unified
@@ -57,29 +57,29 @@ fn gui_session_lease_survives_ttl_and_keeps_blocking_agent_takeover() {
     let grant = manager
         .acquire("dut-w3", &LeaseHolder::Gui, None)
         .expect("GUI acquire");
-    // 双保险之一：GUI 授予的到期时刻为 u64::MAX。
+    // First safeguard: GUI grant expiration timestamp is u64::MAX.
     assert_eq!(grant.expires_at_unix_ms, u64::MAX);
 
     std::thread::sleep(Duration::from_millis(80));
 
-    // status 的惰性清理不得清掉 GUI 租约；剩余时间不暴露 TTL。
+    // Lazy cleanup in status must not evict GUI leases; remaining time does not expose TTL.
     let status = manager.status("dut-w3");
     assert_eq!(status.phase, LeasePhase::Held);
     assert_eq!(status.remaining_secs, None);
 
-    // Agent 接管保持 Busy（防线在 TTL 之外仍生效）。
+    // Agent takeover stays Busy (guard remains active past TTL).
     let error = manager
         .acquire("dut-w3", &agent_holder(), None)
-        .expect_err("GUI 在场时 Agent 必须 Busy");
+        .expect_err("agent must get Busy while GUI holds the lease");
     assert!(matches!(error, LeaseError::Busy { .. }), "{error:?}");
 
-    // GUI 写入复核仍放行（admit 路径不受 TTL 影响）。
+    // GUI write admission still passes (admit path is unaffected by TTL).
     assert!(
         manager.admit_write("dut-w3", &WriteIdentity::gui()).is_ok(),
-        "GUI 写入必须放行"
+        "GUI write must be admitted"
     );
 
-    // 释放路径不变：GUI 释放后恢复 Free。
+    // Release path unchanged: GUI release returns to Free.
     manager.release_for_holder("dut-w3", &LeaseHolder::Gui);
     assert_eq!(manager.status("dut-w3").phase, LeasePhase::Free);
 }

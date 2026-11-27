@@ -172,7 +172,7 @@ mod tests {
         assert!(get_key("  ").is_err());
     }
 
-    // 真实密钥库读写集成（Windows Credential Manager；手动运行）
+    // Live credential store read/write integration (Windows Credential Manager; manual run)
     #[test]
     #[ignore = "requires live OS credential store; run manually"]
     fn credential_roundtrip() {

@@ -1,5 +1,6 @@
-//! M4.5 stdio 端到端：client 子进程方式启动 `duthub-mcp` bin（快照模式，空态），
-//! 验证 initialize / `list_tools` / 只读行为 / stdout 纯协议。
+//! M4.5 stdio end-to-end test: spawns the `duthub-mcp` binary as a child process
+//! (empty snapshot mode) and verifies initialize, `list_tools`, read-only behavior,
+//! and protocol-clean stdout.
 
 use rmcp::{
     RoleClient,
@@ -29,10 +30,10 @@ async fn call(
 ) -> Result<rmcp::model::CallToolResult, Box<rmcp::model::CallToolResult>> {
     let mut params = CallToolRequestParams::new(name.to_string());
     params = params.with_arguments(arguments.as_object().expect("obj").clone());
-    // 两种拒绝形态都归一为 Err：
-    //   a) JSON-RPC 错误（参数校验/审批失败，rmcp 宏用 invalid_params 返回）
-    //   b) isError=true 的 CallToolResult
-    //   c) MRTR 中间态（自测工具不使用）
+    // Normalize both rejection shapes to Err:
+    //   a) JSON-RPC error (parameter validation/approval failure via rmcp invalid_params)
+    //   b) CallToolResult with isError=true
+    //   c) MRTR intermediate state (unused by self-test tools)
     match client.call_tool_once(params).await {
         Err(_) => Err(Box::new(rmcp::model::CallToolResult::error(vec![]))),
         Ok(rmcp::model::CallToolResponse::Complete(result)) => {
@@ -42,7 +43,7 @@ async fn call(
                 Ok(result)
             }
         }
-        Ok(other) => panic!("MRTR 中间态: {other:?}"),
+        Ok(other) => panic!("Unexpected MRTR intermediate state: {other:?}"),
     }
 }
 
@@ -107,10 +108,10 @@ async fn stdio_discovers_and_reads_closed_dut_segments() {
 
 #[tokio::test]
 async fn stdio_end_to_end() {
-    // bin 路径：target/debug/duthub-mcp.exe（cargo test 构建同目录）
+    // Binary path: target/debug/duthub-mcp.exe (built alongside cargo test).
     let client = connect(env!("CARGO_BIN_EXE_duthub-mcp")).await;
 
-    // 1) 快照模式仍能发现拉流工具，但不会返回活动预览的地址。
+    // 1) Snapshot mode still exposes media_streams, but returns no active preview URLs.
     let tools = client.list_tools(None).await.expect("list_tools");
     eprintln!(
         "[test] tools = {:?}",
@@ -133,7 +134,7 @@ async fn stdio_end_to_end() {
         serde_json::json!({ "streams": {} })
     );
 
-    // 2) dut_list：无快照 → 空列表（bin 工作目录无 duthub-data）
+    // 2) dut_list: no snapshot -> empty list (no duthub-data in binary workdir).
     eprintln!("[test] calling dut_list...");
     let result = call(&client, "dut_list", serde_json::json!({}))
         .await
@@ -141,26 +142,27 @@ async fn stdio_end_to_end() {
     let text = first_text(&result);
     assert!(
         text.contains("\"duts\":[]") || text.contains("duts"),
-        "dut_list 响应: {text}"
+        "dut_list response: {text}"
     );
 
-    // 3) serial_write（快照模式）→ 拒绝且文案指向 HTTP 端点
+    // 3) serial_write (snapshot mode) -> rejected with guidance to use the HTTP endpoint.
     let err = call(
         &client,
         "serial_write",
         serde_json::json!({ "dutId": "x", "text": "uname", "approvalToken": "t" }),
     )
     .await;
-    // 快照模式写操作必须走拒绝路径（审批校验 Unknown 或只读限制）；
-    // JSON-RPC 错误形态下文案在 ErrorData.message（此处仅断言拒绝发生）
-    let _err = err.expect_err("快照模式写操作必须拒绝");
+    // Snapshot mode writes must be rejected (Unknown approval or read-only restriction);
+    // for JSON-RPC errors the detail is in ErrorData.message, so we only assert rejection here.
+    let _err = err.expect_err("snapshot mode write must be rejected");
 
     client.cancel().await.ok();
 }
 
-/// `需求⑥：skill_export` 工具已注册（只断言 `list_tools`，**不调用**——
-/// bin 的 `discover_data_dir` 在测试 cwd 下可能退化成仓库内 duthub-data/，
-/// 落盘副作用由 snapshot.rs/skill.rs 单测覆盖，用显式 temp 目录）。
+/// Verify `skill_export` is registered (asserts `list_tools` only without calling it,
+/// because `discover_data_dir` in the binary could fall back to the repo `duthub-data/`
+/// under test cwd; disk writes are covered by `snapshot.rs` and `skill.rs` unit tests
+/// using an explicit temp directory).
 #[tokio::test]
 async fn skill_export_tool_is_listed() {
     let client = connect(env!("CARGO_BIN_EXE_duthub-mcp")).await;
@@ -169,13 +171,13 @@ async fn skill_export_tool_is_listed() {
         .tools
         .iter()
         .find(|tool| tool.name == "skill_export")
-        .expect("skill_export 工具必须注册");
+        .expect("skill_export tool must be registered");
     assert!(
         skill
             .description
             .as_ref()
             .is_some_and(|d| d.contains("SKILL.md")),
-        "skill_export 描述应说明导出 SKILL.md"
+        "skill_export description should mention exporting SKILL.md"
     );
     client.cancel().await.ok();
 }

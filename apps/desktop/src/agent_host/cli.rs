@@ -20,7 +20,7 @@
 //! into a persistent `CLAUDE_CONFIG_DIR` (T29), probing the real locked
 //! Claude version, and product wiring (W4b).
 //!
-//! Verified against Claude Code 2.1.204 (2026-11-21): the profile flags exist,
+//! Verified against Claude Code 2.1.204: the profile flags exist,
 //! `${DUTHUB_AGENT_TOKEN}` is expanded in the HTTP header, and `claude mcp
 //! list` connects to the session listener. The real CLI currently rejects the
 //! tool list because rmcp 3.10.0 emits a non-object tool `outputSchema`; that
@@ -610,7 +610,8 @@ fn describe_mcp_error(value: &Value) -> String {
         .and_then(Value::as_str);
     let detail = value
         .get("error")
-        .or_else(|| value.get("message")).map_or_else(|| summarize_json(value), summarize_json);
+        .or_else(|| value.get("message"))
+        .map_or_else(|| summarize_json(value), summarize_json);
     match name {
         Some(name) => format!("{name}: {detail}"),
         None => detail,
@@ -1000,8 +1001,7 @@ fn run_cli_turn(
             return Ok(TurnOutcome::Completed { saw_result: true });
         }
         let idle = now_ms().saturating_sub(turn.context.last_activity_ms.load(Ordering::Relaxed));
-        if !saw_result
-            && idle >= u64::try_from(PROMPT_HANG_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+        if !saw_result && idle >= u64::try_from(PROMPT_HANG_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
         {
             process.kill();
             turn.context.view.set_stderr_tail(process.stderr_tail());
@@ -1664,7 +1664,8 @@ fn resolve_sandboxed_argv(plan: &CliPlan) -> Result<(PathBuf, Vec<OsString>), St
                     ));
                 }
             }
-            let system_root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+            let system_root = std::env::var_os("SystemRoot")
+                .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
             let cmd_exe = system_root.join("System32").join("cmd.exe");
             let mut args = Vec::with_capacity(plan.args.len() + 4);
             args.push(OsString::from("/D"));

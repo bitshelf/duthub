@@ -6,6 +6,7 @@ use thiserror::Error;
 
 /// Failure modes of [`crate::install_tool`] and its helpers.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ToolInstallError {
     /// A `ProxyConfig::Custom` URL or a proxy URL read from the environment
     /// (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`) failed to parse as

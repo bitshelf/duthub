@@ -1,19 +1,19 @@
-//! MCP 状态源抽象：ServerHandler 只依赖本 trait，不直接触碰设备服务。
+//! State interface used by MCP tools to access the live runtime or a read-only snapshot.
 
 use serde::{Deserialize, Serialize};
 
-/// DUT 摘要（dut.list）
+/// DUT summary returned by discovery.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DutSummary {
     pub dut_id: String,
     pub name: String,
-    /// demo | device | idle（未打开会话）
+    /// Session source: demo, device, or idle.
     pub source: String,
     pub port: String,
     pub baud: u32,
 }
 
-/// DUT 详情（dut.info）
+/// Detailed DUT information.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DutInfo {
     pub dut_id: String,
@@ -23,7 +23,7 @@ pub struct DutInfo {
     pub adb_serial: Option<String>,
     pub relay: Option<RelayBrief>,
     pub mcp_label: Option<String>,
-    /// 本次会话已接收行数（连接中才有）
+    /// Number of lines received in the current session, if connected.
     pub session_lines: Option<u64>,
 }
 
@@ -94,7 +94,7 @@ pub struct RelayBrief {
     pub capabilities: Vec<String>,
 }
 
-/// 终端行（serial.read）
+/// One line returned by the serial read tool.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LogLineDto {
     pub seq: u64,
@@ -105,12 +105,12 @@ pub struct LogLineDto {
 pub struct LogReadResult {
     pub dut_id: String,
     pub session_id: Option<String>,
-    /// 客户端下次续读的游标
+    /// Cursor for the next read.
     pub last_seq: u64,
     pub lines: Vec<LogLineDto>,
 }
 
-/// ADB `设备（adb.list_devices`）
+/// ADB device information.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AdbDeviceDto {
     pub serial: String,
@@ -118,7 +118,7 @@ pub struct AdbDeviceDto {
     pub model: Option<String>,
 }
 
-/// 进程执行结果（adb.shell / flash.test）
+/// Result of an executed device command or flash utility probe.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProcessResultDto {
     pub exit_code: Option<i32>,
@@ -127,7 +127,7 @@ pub struct ProcessResultDto {
     pub elapsed_ms: u64,
 }
 
-/// 审批校验错误（code 供 MCP 错误信息展示）
+/// Approval failure with a machine-readable tool error code.
 #[derive(Debug)]
 pub struct ApprovalErr {
     pub kind: duthub_core::ApprovalError,
@@ -149,7 +149,7 @@ impl ApprovalErr {
     }
 }
 
-/// 审批令牌签发结果（approval.request）
+/// Result of issuing an approval token.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ApprovalIssueResult {
     pub token: String,
@@ -158,9 +158,9 @@ pub struct ApprovalIssueResult {
     pub expires_in_secs: u64,
 }
 
-// ── 心跳检测（heartbeat.get / heartbeat.set，需求⑦） ─────────────────────────
+// Heartbeat data and operations
 
-/// 心跳配置 DTO（与 duts.json `heartbeat` 段同构）。
+/// Heartbeat configuration with the shape stored in the DUT file.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HeartbeatConfigDto {
     pub enabled: bool,
@@ -174,18 +174,18 @@ pub struct HeartbeatConfigDto {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatUpdate {
-    /// 一条命令或按换行分隔的 POSIX Shell 命令组。省略时保留现有命令。
+    /// A shell command or newline-separated command group. Omit to keep the current command.
     pub command: Option<String>,
     pub interval_secs: Option<u32>,
-    /// false 持续停止，直到明确重新启用。
+    /// False disables probes until explicitly enabled again.
     pub enabled: Option<bool>,
-    /// 暂停秒数，0 解除暂停。
+    /// Pause duration in seconds. Zero resumes probing.
     pub pause_secs: Option<u32>,
-    /// 期望响应中的字面文本，空字符串清除匹配条件。
+    /// Expected literal response text. An empty string clears the requirement.
     pub expected_response: Option<String>,
 }
 
-/// 系统信息 DTO（启发式提取；提不出的字段为 null）。
+/// System information extracted from the response. Unknown values are absent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SysInfoDto {
     pub uptime: Option<String>,
@@ -194,7 +194,7 @@ pub struct SysInfoDto {
     pub hostname: Option<String>,
 }
 
-/// 心跳状态 `DTO（last_ok=null` 表示尚未探测）。
+/// Latest heartbeat state. An absent result means no probe has completed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HeartbeatStateDto {
     pub last_ok: Option<bool>,
@@ -206,7 +206,7 @@ pub struct HeartbeatStateDto {
     pub sysinfo: SysInfoDto,
 }
 
-/// heartbeat.get / heartbeat.set 返回视图。
+/// Heartbeat configuration and latest state returned by the tools.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HeartbeatViewDto {
     pub dut_id: String,
@@ -215,7 +215,7 @@ pub struct HeartbeatViewDto {
 }
 
 impl HeartbeatViewDto {
-    /// 从 core 心跳类型映射（配置 + 最近状态）。
+    /// Convert the current core configuration and status to the tool response.
     #[must_use]
     pub fn new(
         dut_id: &str,
@@ -251,32 +251,44 @@ impl HeartbeatViewDto {
     }
 }
 
-// ── 控制租约（dut_acquire/renew/release_control / dut_control_status，方案 §6.2）──
+// Control leases and status
 
-/// `成功授予的租约凭证（dut_acquire_control` / `dut_renew_control` 返回）。
+/// Credentials returned by grant and renewal operations.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct LeaseGrantDto {
     pub lease_id: String,
     pub dut_id: String,
     pub generation: u64,
     pub expires_at_unix_ms: u64,
     pub holder: String,
+    #[serde(default)]
+    pub session_name: String,
+    #[serde(default)]
+    pub acquired_at_unix_ms: u64,
 }
 
-/// DUT `控制权状态快照（dut_control_status` 返回；GUI 面板同源）。
+/// Control status shared by the MCP tool and desktop panel.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ControlStatusDto {
     pub dut_id: String,
     /// free | held | protected | `needs_inspection`
     pub state: String,
     pub holder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquired_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occupied_secs: Option<u64>,
     pub remaining_secs: Option<u64>,
     pub generation: u64,
     pub queue_len: usize,
     pub protected_op: Option<String>,
 }
 
-/// MCP 状态源。实现方负责把工具调用桥接到设备服务 / 快照文件。
+/// The host bridges tool calls to device services or a persisted snapshot.
 pub trait McpState: Send + Sync + 'static {
     fn media_streams(&self, _dut_id: &str) -> std::collections::BTreeMap<String, String> {
         std::collections::BTreeMap::new()
@@ -308,10 +320,10 @@ pub trait McpState: Send + Sync + 'static {
     fn list_duts(&self) -> Vec<DutSummary>;
     fn dut_info(&self, dut_id: &str) -> Option<DutInfo>;
 
-    // ── 控制租约四件套（方案 §6.2；快照模式默认拒绝——仅桌面 HTTP 运行时支持）──
+    // Live control leases are available through desktop HTTP only.
 
-    /// 获取独占控制租约（INV-01：每 DUT 至多 1 个）。`wait_ms > 0` 时进入 FIFO
-    /// 等待队列（超时 → Busy）。授权（写类 Grant）由 `ServerHandler` 校验。
+    /// Acquire an exclusive lease, optionally waiting in FIFO order.
+    /// The server verifies the required grant before calling this method.
     fn dut_acquire_control(
         &self,
         _dut_id: &str,
@@ -321,37 +333,64 @@ pub trait McpState: Send + Sync + 'static {
         Err("控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 续租（TTL 重置；generation 不变）。过期/撤销 → `LeaseRequired/LEASE_EXPIRED`。
+    /// Acquire an exclusive lease while registering the caller's session name.
+    fn dut_acquire_control_with_session(
+        &self,
+        dut_id: &str,
+        holder: duthub_core::LeaseHolder,
+        _session_name: &str,
+        wait_ms: u64,
+    ) -> Result<LeaseGrantDto, String> {
+        self.dut_acquire_control(dut_id, holder, wait_ms)
+    }
+
+    /// Reset the lease TTL without advancing its generation.
     fn dut_renew_control(&self, _dut_id: &str, _lease_id: &str) -> Result<LeaseGrantDto, String> {
         Err("控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 释放租约（持有者本人；Protected 期拒 → `DUT_PROTECTED`）。
+    /// Release a lease owned by the caller. Protected operations reject release.
     fn dut_release_control(&self, _dut_id: &str, _lease_id: &str) -> Result<(), String> {
         Err("控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 控制权状态快照（只读）。
+    /// Return a read-only control status snapshot.
     fn dut_control_status(&self, _dut_id: &str) -> Result<ControlStatusDto, String> {
         Err("控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 读取会话日志（seq > `since_seq，最多` limit 条）
+    /// Read up to the limit of log entries after the supplied sequence number.
     fn serial_read(&self, dut_id: &str, since_seq: u64, limit: usize) -> Option<LogReadResult>;
+    /// Return the latest rendered VT100 screen text for this DUT, if available.
+    fn serial_screen(&self, _dut_id: &str) -> Option<String> {
+        None
+    }
     fn log_archive_dir(&self) -> Option<std::path::PathBuf> {
         None
     }
     fn dut_artifact_root(&self) -> Option<std::path::PathBuf> {
         None
     }
-    /// 向会话写入一行（租约复核在 `ServerHandler` 完成，identity 透传给
-    /// device 写入通道做 [D]/[E] 双点复核）
+    /// Write one line to the session.
+    /// The device rechecks the server-supplied identity at admission and execution.
     fn serial_write(
         &self,
         dut_id: &str,
         text: &str,
         writer: duthub_core::lease::WriteIdentity,
     ) -> Result<(), String>;
+    /// Write raw control/keyboard bytes without line-ending normalization.
+    fn serial_write_raw(
+        &self,
+        dut_id: &str,
+        bytes: &[u8],
+        writer: duthub_core::lease::WriteIdentity,
+    ) -> Result<(), String> {
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            "raw non-UTF-8 serial write is unavailable on this state source".to_string()
+        })?;
+        self.serial_write(dut_id, text, writer)
+    }
 
     fn adb_list(&self) -> Vec<AdbDeviceDto>;
     fn discover_adb_devices(&self) -> Result<Vec<AdbDeviceDto>, String> {
@@ -360,7 +399,7 @@ pub trait McpState: Send + Sync + 'static {
     fn supports_adb_shell(&self) -> bool {
         false
     }
-    /// `adb -s <serial> shell <argv…>`（argv-only，需审批令牌 + 租约）
+    /// Run an ADB shell command as an argument vector with approval and lease checks.
     fn adb_shell(
         &self,
         dut_id: &str,
@@ -368,10 +407,10 @@ pub trait McpState: Send + Sync + 'static {
         writer: duthub_core::lease::WriteIdentity,
     ) -> Result<ProcessResultDto, String>;
 
-    /// 控制动作（Power/Reset/PowerKey）：审批令牌（高危动作二次确认）+ 租约身份
-    /// 都**透传**给共用设备操作入口
-    /// （`duthub-device::control::ControlService）统一校验授权、绑定与动作能力`；
-    /// 驱动只接收已解析的设备地址与动作，不在 MCP 层或驱动层重复授权。
+    /// Pass the request identity and approval to the shared control service.
+    /// It verifies approval, the DUT binding, and the backend's capabilities.
+    /// The driver receives only the physical target and action.
+    /// Device authorization is handled before dispatch.
     fn control_power(
         &self,
         dut_id: &str,
@@ -385,7 +424,7 @@ pub trait McpState: Send + Sync + 'static {
         approval_token: &str,
         writer: duthub_core::lease::WriteIdentity,
     ) -> Result<(), String>;
-    /// 电源按键脉冲（继电器短接 power key 通道后释放）
+    /// Pulse and release the relay channel connected to the DUT power key.
     fn control_power_key(
         &self,
         dut_id: &str,
@@ -427,14 +466,14 @@ pub trait McpState: Send + Sync + 'static {
         Err("control.enter_loader is unavailable on this state source".into())
     }
 
-    /// 继电器逐通道状态查询（只读，无需审批）。返回应答 STATUS 的
-    /// `(通道号, 是否吸合)`；Err = DUT 未配置继电器 / 后端不支持。
+    /// Query relay channel states without an approval token.
+    /// Return channels that responded or an error if the backend cannot perform the query.
     fn relay_status(&self, _dut_id: &str) -> Result<Vec<(u8, bool)>, String> {
         Err("relay.status 经此状态源不可用（仅桌面运行时支持）".into())
     }
 
-    /// 继电器单通道 ON→STATUS→OFF 往返测试（写动作，走 control.test 审批闸门，
-    /// 令牌与租约身份透传给共用设备操作入口统一校验并消费）。
+    /// Energize, verify, and release one relay channel.
+    /// The control service validates the lease and consumes the test approval token.
     fn relay_test(
         &self,
         _dut_id: &str,
@@ -445,13 +484,13 @@ pub trait McpState: Send + Sync + 'static {
         Err("relay.test 经此状态源不可用（仅桌面运行时支持）".into())
     }
 
-    /// 心跳查询（需求⑦）：当前配置 + 最近一次状态（含系统信息提取）。
+    /// Return heartbeat configuration, latest status, and extracted system information.
     fn heartbeat_get(&self, _dut_id: &str) -> Result<HeartbeatViewDto, String> {
         Err("heartbeat.get 经此状态源不可用（仅桌面运行时支持）".into())
     }
 
-    /// 心跳设置（需求⑦）：Agent 改写心跳命令/间隔并启用/停用。
-    /// 返回设置后的完整视图。
+    /// Update heartbeat command, interval, or enablement.
+    /// Return the resulting configuration and status.
     fn heartbeat_set(
         &self,
         _dut_id: &str,
@@ -460,13 +499,13 @@ pub trait McpState: Send + Sync + 'static {
         Err("heartbeat.set 经此状态源不可用（仅桌面运行时支持）".into())
     }
 
-    /// 自定义分段标记（日志分割）：向 DUT 会话日志写 `[mark] {label}` 行。
+    /// Add a segment marker to the DUT session log.
     fn log_mark(&self, _dut_id: &str, _label: &str) -> Result<(), String> {
         Err("log_mark 经此状态源不可用（仅桌面运行时支持）".into())
     }
 
-    /// 导出 SKILL.md 到 `<工作目录>/skill/duthub/`（需求⑥）：返回写入路径。
-    /// 工作目录由实现方经 `duthub_core::store::resolve_work_dir_in` 同源解析。
+    /// Export the skill under the work directory and return its path.
+    /// The host resolves that directory using the shared configuration rules.
     fn skill_export(&self) -> Result<String, String> {
         Err("skill.export 经此状态源不可用".into())
     }
@@ -474,7 +513,7 @@ pub trait McpState: Send + Sync + 'static {
         self.skill_export()
     }
 
-    /// `烧录工具只读测试（白名单参数；preset_id` = settings.flashTools[].id 稳定预设 id）
+    /// Run the allowlisted read-only probe for the specified flash preset ID.
     fn flash_test(&self, preset_id: &str) -> Result<ProcessResultDto, String>;
 
     /// List connected Rockusb/MaskROM/Loader devices using a host-configured flash preset.
@@ -523,9 +562,9 @@ pub trait McpState: Send + Sync + 'static {
         Err("adb_exec is unavailable on this state source".into())
     }
 
-    /// 签发审批令牌（单次有效，5 分钟过期）
+    /// Issue an approval token valid for one use within five minutes.
     fn approval_issue(&self, dut_id: &str, action: &str, args_json: &str) -> ApprovalIssueResult;
-    /// 校验并消费审批令牌
+    /// Validate and consume an approval token.
     fn approval_validate(
         &self,
         token: &str,

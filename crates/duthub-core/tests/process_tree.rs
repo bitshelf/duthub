@@ -1,13 +1,16 @@
-//! 进程执行回归（审核发现 P2-2）：用**会派生子进程的假工具**覆盖进程树与输出收尾。
+//! Process execution regression tests: uses a **fake tool that spawns child processes** to cover
+//! process-tree termination and bounded output draining.
 //!
-//! 假工具就是本测试二进制自身（libtest harness 可执行文件）：
-//! - `fake_tool_spawn_and_exit`：父进程立即退出，孙进程（`fake_tool_hold_output`）
-//!   继续持有继承的输出管道 —— 旧行为下读取线程 join 会一直等到孙进程退出；
-//! - `fake_tool_hang_parent`：父进程长驻（超过超时），验证超时按**进程树**终止；
-//! - `fake_tool_normal_exit`：正常退出并输出（保证常规路径不被破坏）。
+//! The fake tool is this test binary itself (the `libtest` harness executable):
+//! - `fake_tool_spawn_and_exit`: parent exits immediately while grandchild
+//!   (`fake_tool_hold_output`) keeps holding the inherited output pipes; under the old behavior,
+//!   joining reader threads blocked until the grandchild exited.
+//! - `fake_tool_hang_parent`: parent stays alive past the timeout to verify **process-tree**
+//!   termination on timeout.
+//! - `fake_tool_normal_exit`: exits normally with output to verify the normal path is unaffected.
 //!
-//! 假工具模式仅在以 `--exact <名>` 子调用时生效；普通 `cargo test` 直接跑
-//! 回归测试（它们会以假工具模式再拉起本二进制）。
+//! Fake-tool mode activates only when re-invoked with `--exact <name>`; normal `cargo test` runs
+//! the regression tests, which re-spawn this binary in fake-tool mode.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -15,36 +18,38 @@ use std::time::{Duration, Instant};
 use duthub_core::error::DeviceError;
 use duthub_core::process::{ProcessRunner, RealProcessRunner};
 
-/// 孙进程持有输出管道的时长（必须显著大于 `DRAIN_TIMEOUT` + 测试断言上限）。
+/// Duration the grandchild holds the output pipes (must significantly exceed `DRAIN_TIMEOUT` plus
+/// the test assertion bound).
 const HOLD_SECS: u64 = 12;
-/// 回归测试给执行器的超时。
+/// Timeout passed to the runner by the regression tests.
 const RUN_TIMEOUT: Duration = Duration::from_secs(3);
-/// 修复后 `run()` 必须有界返回的上限（远小于 `HOLD_SECS`）。
+/// Upper bound on bounded return time for `run()` (well below `HOLD_SECS`).
 const BOUND: Duration = Duration::from_secs(9);
 
-/// 当前进程是否以"假工具模式"被子调用拉起。
+/// Returns whether the current process was re-invoked in fake-tool mode.
 fn is_fake_tool_mode() -> bool {
     std::env::args()
         .take_while(|arg| arg != "--")
         .any(|arg| arg == "--exact")
 }
 
-/// 以假工具模式拉起本二进制：只运行指定测试（孙进程持有输出管道 `HOLD_SECS`）。
+/// Re-spawn this binary in fake-tool mode to run only the hold test (`HOLD_SECS` pipe hold).
 fn spawn_hold_child() -> std::process::Child {
-    let exe = std::env::current_exe().expect("测试二进制路径");
+    let exe = std::env::current_exe().expect("test binary path");
     Command::new(exe)
         .args(["fake_tool_hold_output", "--exact", "--test-threads=1"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("拉起假工具子进程")
+        .expect("spawn fake-tool child process")
 }
 
 // ---------------------------------------------------------------------------
-// 假工具模式（仅子调用时执行实际逻辑）
+// Fake-tool mode (executes only when re-invoked as a child process)
 // ---------------------------------------------------------------------------
 
-/// 假工具模式：持有输出管道 `HOLD_SECS` 后退出（管道写端因此被长期占用）。
+/// Fake-tool mode: holds output pipes for `HOLD_SECS` before exiting so pipe write ends remain
+/// open.
 #[test]
 fn fake_tool_hold_output() {
     if !is_fake_tool_mode() {
@@ -54,7 +59,8 @@ fn fake_tool_hold_output() {
     std::thread::sleep(Duration::from_secs(HOLD_SECS));
 }
 
-/// 假工具模式：派生孙进程后父进程立即退出（孙进程持有继承的管道写端）。
+/// Fake-tool mode: spawns a grandchild and exits immediately while the grandchild holds inherited
+/// pipe write ends.
 #[test]
 fn fake_tool_spawn_and_exit() {
     if !is_fake_tool_mode() {
@@ -84,7 +90,7 @@ fn fake_tool_hang_parent() {
     std::thread::sleep(Duration::from_secs(60));
 }
 
-/// 假工具模式：正常退出并输出。
+/// Fake-tool mode: exits normally with output.
 #[test]
 fn fake_tool_normal_exit() {
     if !is_fake_tool_mode() {
@@ -94,7 +100,7 @@ fn fake_tool_normal_exit() {
 }
 
 // ---------------------------------------------------------------------------
-// 回归测试
+// Regression tests
 // ---------------------------------------------------------------------------
 
 fn harness_args(test: &str) -> Vec<String> {
@@ -105,8 +111,8 @@ fn harness_args(test: &str) -> Vec<String> {
     ]
 }
 
-/// 主进程正常退出但孙进程持有输出管道：`run()` 必须有界返回（旧行为会阻塞
-/// 到孙进程退出，约 `HOLD_SECS`）。
+/// Parent exits normally while a grandchild holds the output pipes: `run()` must return within a
+/// bounded time (the old behavior blocked for ~`HOLD_SECS` until the grandchild exited).
 #[test]
 fn runner_returns_when_grandchild_holds_pipe() {
     let runner = RealProcessRunner;
@@ -116,19 +122,19 @@ fn runner_returns_when_grandchild_holds_pipe() {
     let elapsed = started.elapsed();
     assert!(
         elapsed < BOUND,
-        "run() 必须有界返回（孙进程持有管道 {HOLD_SECS}s），实际 {elapsed:?}"
+        "run() must return within bound (grandchild holds pipe for {HOLD_SECS}s), got {elapsed:?}"
     );
     match result {
-        // 修复后预期：输出收尾超时（孙进程持有管道，输出不完整）
+        // Expected after fix: output drain times out while the grandchild holds the pipe.
         Err(DeviceError::Timeout) => {}
-        // 或树清理成功拿到完整输出
+        // Or full output collected if tree cleanup succeeded.
         Ok(res) => assert_eq!(res.exit_code, Some(0)),
-        Err(err) => panic!("意外错误: {err}"),
+        Err(err) => panic!("Unexpected error: {err}"),
     }
 }
 
-/// 父进程长驻超过超时：执行器必须按进程树终止并在远小于 `HOLD_SECS` 的时间内返回。
-/// 旧行为只杀主进程，孙进程持有管道会把读取线程拖到约 `HOLD_SECS`。
+/// Parent hangs past timeout: the runner must kill the entire process tree and return well below
+/// `HOLD_SECS` (killing only the parent left the grandchild holding the pipes for ~`HOLD_SECS`).
 #[test]
 fn runner_timeout_kills_tree() {
     let runner = RealProcessRunner;
@@ -138,15 +144,15 @@ fn runner_timeout_kills_tree() {
     let elapsed = started.elapsed();
     assert!(
         matches!(result, Err(DeviceError::Timeout)),
-        "超时必须报 Timeout"
+        "timeout must return DeviceError::Timeout"
     );
     assert!(
         elapsed < BOUND,
-        "超时必须终止进程树并尽快返回（父进程长驻 60s / 孙进程持管道 {HOLD_SECS}s），实际 {elapsed:?}"
+        "timeout must kill the process tree and return promptly (parent hangs 60s / grandchild holds pipe {HOLD_SECS}s), got {elapsed:?}"
     );
 }
 
-/// 常规路径不被破坏：正常退出的假工具返回 exit 0 且能收到输出。
+/// Normal path remains intact: a cleanly exiting fake tool returns exit 0 with captured output.
 #[test]
 fn runner_normal_exit_still_ok() {
     let runner = RealProcessRunner;
@@ -154,13 +160,13 @@ fn runner_normal_exit_still_ok() {
     let started = Instant::now();
     let result = runner
         .run(&exe, &harness_args("fake_tool_normal_exit"), RUN_TIMEOUT)
-        .expect("正常退出必须成功");
+        .expect("normal exit must succeed");
     let elapsed = started.elapsed();
     assert_eq!(result.exit_code, Some(0));
     assert!(result.stdout.contains("test result: ok"));
     assert!(
         elapsed < BOUND,
-        "正常路径不应触发收尾超时，实际 {elapsed:?}"
+        "normal path must not hit drain timeout, got {elapsed:?}"
     );
 }
 
@@ -186,14 +192,14 @@ fn fake_tool_console_state() {
         let window = GetConsoleWindow();
         assert!(
             window.is_null() || IsWindowVisible(window) == 0,
-            "后台工具不能显示控制台"
+            "background tool must not display a visible console window"
         );
         assert!(
             GetConsoleProcessList(
                 processes.as_mut_ptr(),
                 u32::try_from(processes.len()).unwrap()
             ) <= 1,
-            "后台工具不能继承父进程控制台"
+            "background tool must not inherit the parent console"
         );
     }
 }
@@ -207,6 +213,6 @@ fn runner_starts_windows_tools_without_a_console() {
             &harness_args("fake_tool_console_state"),
             RUN_TIMEOUT,
         )
-        .expect("应能启动后台工具并收集输出");
+        .expect("should launch background tool and collect output");
     assert_eq!(result.exit_code, Some(0), "{}", result.stdout);
 }

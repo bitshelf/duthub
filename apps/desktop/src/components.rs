@@ -1,4 +1,4 @@
-//! 共享 UI 构件（对照原型 CSS 的 1:1 尺寸/圆角/配色）。
+//! Shared UI components using the prototype's CSS dimensions, corner radii, and colors.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::switch::Switch;
@@ -10,7 +10,8 @@ use gpui_kit::{
 use crate::icons::{icon, kit_icon};
 use crate::theme::Palette;
 
-/// `.icon-btn`：32px 图标按钮（topbar/tabbar 工具区）——kit Button ghost 变体。
+/// `.icon-btn`: 32px icon-based buttons (used in the top bar/tab bar tool area) – a variant of the
+/// "Kit" button design.
 pub fn icon_btn(id: impl Into<SharedString>, name: &str, p: &Palette) -> Button {
     let id: SharedString = id.into();
     Button::new(id)
@@ -25,7 +26,8 @@ pub fn icon_btn(id: impl Into<SharedString>, name: &str, p: &Palette) -> Button 
         .rounded(px(7.))
 }
 
-/// `.btn`：raised 按钮；variant 决定 primary/danger/tiny。
+/// `.btn`: Raised buttons; the `variant` parameter determines whether they are classified as
+/// "primary", "danger", or "tiny".
 pub enum BtnVariant {
     Normal,
     Primary,
@@ -51,7 +53,8 @@ pub fn btn(
     b
 }
 
-/// `.panel-head`：面板标题行（icon + 标题 + 右侧附件由调用方追加）。
+/// `.panel-head`: Panel header row (icon + title + attachment on the right, added by the calling
+/// party).
 pub fn panel_head(icon_name: &str, title: &str, p: &Palette) -> Div {
     div()
         .flex()
@@ -76,7 +79,8 @@ pub fn panel_head(icon_name: &str, title: &str, p: &Palette) -> Div {
         )
 }
 
-/// `.field`：label + 控件 + 可选 help 的纵向表单域（控件由调用方给）。
+/// `.field`: A vertical form field containing a label, control, and optional help text (the control
+/// is provided by the caller).
 pub fn field(label: &str, control: impl IntoElement, help: Option<&str>, p: &Palette) -> Div {
     let mut col = div()
         .flex()
@@ -103,7 +107,7 @@ pub fn field(label: &str, control: impl IntoElement, help: Option<&str>, p: &Pal
     col
 }
 
-/// `.chip`：快速波特率等小按钮。
+/// `.chip`: Small buttons for settings such as fast baud rates.
 pub fn chip(id: impl Into<SharedString>, label: &str, p: &Palette) -> Stateful<Div> {
     let id: SharedString = id.into();
     div()
@@ -121,7 +125,7 @@ pub fn chip(id: impl Into<SharedString>, label: &str, p: &Palette) -> Stateful<D
         .child(SharedString::from(label.to_string()))
 }
 
-/// 开关（kit Switch）：受控组件，on `为当前态，on_click` 收到请求值。
+/// Controlled switch. `on` stores the current state and `on_click` receives the requested state.
 pub fn toggle(id: &'static str, on: bool, p: &Palette) -> Switch {
     Switch::new(id)
         .checked(on)
@@ -137,7 +141,10 @@ pub fn subtle(text: &str, p: &Palette) -> Div {
 }
 
 /// `.pill`。
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "shared UI primitive retained for component library completeness"
+)]
 pub fn pill(label: &str, p: &Palette) -> Div {
     div()
         .px(px(7.))
@@ -152,7 +159,8 @@ pub fn pill(label: &str, p: &Palette) -> Div {
         .child(SharedString::from(label.to_string()))
 }
 
-/// 输入框统一按键取字符（供 pages/workspace 复用）。
+/// Use a unified button for entering characters into the input field (used for reuse in
+/// pages/workspaces).
 pub fn typed_char(event: &gpui_kit::KeyDownEvent) -> Option<String> {
     let k = &event.keystroke;
     if k.modifiers.control || k.modifiers.alt || k.modifiers.platform {
@@ -164,7 +172,7 @@ pub fn typed_char(event: &gpui_kit::KeyDownEvent) -> Option<String> {
     (k.key.chars().count() == 1).then(|| k.key.clone())
 }
 
-/// App 级剪贴板写入（复制终端输出等）。
+/// Writing to the app-level clipboard (copying terminal output, etc.).
 pub fn copy_text(cx: &App, text: &str) {
     cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.to_string()));
 }

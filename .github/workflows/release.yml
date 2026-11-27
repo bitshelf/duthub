@@ -1,12 +1,12 @@
-# duthub Windows Release 构建
-# main 构建 Windows 产物，版本标签额外发布到 GitHub Release。
+# Build the duthub Windows release.
+# Build Windows artifacts on main and publish tagged versions to GitHub Releases.
 #
-# 发布门禁（ADR-3 §9：2026-11-25 起 goose 改为下载分发）：gate job 必须通过后，
-# 且仓库变量 RELEASE_GATE=true、配置 release environment，才允许 publish-release。
-# 供应链加固：所有第三方 action 已 pin 到 commit SHA（2026-11-21 经 git ls-remote
-# 复核：checkout=v4.4.0、rust-toolchain=stable 分支头、rust-cache=v2、
-# upload-artifact=v4.6.2、download-artifact=v4.3.0、gh-release=v2.6.2）；
-# 升级时更新 SHA 并在提交信息记录复核结果。
+# Release gate (ADR-3 §9, download-only goose distribution since 2026-11-25).
+# Publishing requires a passing gate, RELEASE_GATE=true, and a release environment.
+# Third-party actions are pinned to commit SHAs. git ls-remote verified these refs on
+# 2026-11-21: checkout v4.4.0, rust-toolchain stable head, and rust-cache v2.
+# The remaining refs were upload-artifact v4.6.2, download-artifact v4.3.0, and gh-release v2.6.2.
+# When updating, verify the new SHA and record the result in the commit message.
 
 name: Release (Windows)
 
@@ -36,10 +36,10 @@ jobs:
       - name: Rust build cache
         uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
 
-      # gpui 的 build.rs 需要 fxc.exe（HLSL 着色器编译器）。
-      # 仓库 .cargo/config.toml 指向本机 SDK 22621 路径；runner 上不存在时
-      # build.rs 会按 GPUI_FXC_PATH → PATH → SDK 26100 顺序回退，
-      # 这里显式探测 runner 实际可用的 fxc.exe 并设置环境变量（外部 env 优先于 config.toml）。
+      # The GPUI build script needs fxc.exe, the HLSL compiler.
+      # The SDK 22621 path in .cargo/config.toml is specific to the development host.
+      # The build script checks GPUI_FXC_PATH, PATH, then SDK 26100.
+      # Discover the installed compiler and set an environment override on the runner.
       - name: Locate fxc.exe (HLSL compiler)
         shell: pwsh
         run: |
@@ -53,10 +53,10 @@ jobs:
 
       - name: Verify goose is not embedded (download distribution)
         shell: pwsh
-        # ADR-3 §9（2026-11-25 取代内嵌口径）：仓库/构建不得再携带 goose 字节。
-        # 这里在构建前挡住「内嵌回归」：目录出现即失败；同时确认下载分发契约仍在
-        # （tooldown spec、许可/来源说明），避免门禁被静默删空。旧步骤断言的是已删除
-        # 的 assets/goose 字节数/SHA-256（坑 #110），必然永久失败。
+        # ADR-3 §9 has prohibited bundling goose since 2026-11-25.
+        # Fail before building if bundled assets return. Verify the download distribution
+        # spec and provenance so this gate continues to check the published contract.
+        # The former size and SHA-256 checks targeted the deleted assets/goose tree (#110).
         run: |
           function Fail([string]$Message) { Write-Error $Message; exit 1 }
           $assets = "apps/desktop/assets/goose"
@@ -86,8 +86,8 @@ jobs:
 
       - name: Smoke test (--self-test, informational)
         shell: pwsh
-        # GitHub runner 为无 GPU 无头环境，GPUI 窗口创建可能失败——这是环境限制，
-        # 本机已验证 self-test 通过。此处仅报告，不阻塞发布。
+        # GPUI may fail to create a window on a headless GitHub runner without a GPU.
+        # The self-test passed locally. Report the runner outcome without blocking release.
         run: |
           & .\target\release\duthub.exe --self-test
           Write-Host "self-test exit code: $LASTEXITCODE（runner 无显示环境时可能非 0，属预期）"
@@ -95,9 +95,9 @@ jobs:
 
       - name: Stage artifact
         shell: pwsh
-        # duthub.exe 仍单文件分发；LICENSE/NOTICE 与 goose 来源说明另旁附。
-        # goose 本身不随包分发（用户从「工具下载」页安装），因此只旁附
-        # PROVENANCE.md，不再复制已删除的 assets/goose/LICENSE/NOTICE/manifest。
+        # Distribute duthub.exe as a single executable with license and provenance files alongside.
+        # Users install goose from Tool Downloads. Include its PROVENANCE.md with the release.
+        # The old assets/goose license, notice, and manifest are no longer in the tree.
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item .\target\release\duthub.exe .\dist\duthub.exe
@@ -117,8 +117,8 @@ jobs:
             dist/licenses/**
           if-no-files-found: error
 
-  # 发布门（ADR-3 §9）：回归、SBOM、cargo audit、goose 下载分发契约、Authenticode。
-  # 任一未满足即失败；publish-release 必须 needs 本 job。
+  # ADR-3 §9 requires regression checks, SBOM, cargo audit, goose download checks, and Authenticode.
+  # Publishing depends on this job and any unmet requirement fails the gate.
   gate:
     needs: build-windows
     runs-on: windows-latest
@@ -153,25 +153,24 @@ jobs:
 
       - name: Install release-gate tools (community)
         shell: pwsh
-        # 社区工具，不自造签名链/SBOM 生成器。
+        # Use community tooling for supply-chain checks and SBOM generation.
         run: cargo install --locked cargo-cyclonedx@0.5.10 cargo-audit@0.23.0
 
       - name: Format check
         shell: pwsh
         run: cargo fmt --all --check
 
-      - name: Clippy (workspace + real-hardware, all targets, deny warnings)
+      - name: Clippy (workspace, all targets and features, deny warnings)
         shell: pwsh
         env:
           CARGO_BUILD_WARNINGS: deny
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo clippy -p duthub-device --features real-hardware --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Test (workspace)
         shell: pwsh
-        # Runner 日志对未认证读取不可见，所以失败时把失败用例名写成 annotation 与
-        # step summary：公开的 check-run annotation 是失败证据，不必再猜是哪个用例。
+        # Unauthenticated viewers cannot read runner logs. Put failing test names in public
+        # check annotations and the step summary so failures can be identified.
         run: |
           cargo test --workspace 2>&1 | Tee-Object -FilePath test-workspace.log
           $code = $LASTEXITCODE
@@ -197,8 +196,8 @@ jobs:
 
       - name: Desktop self-test (informational on headless runner)
         shell: pwsh
-        # 等价于 scripts/regression 的第 4 步；runner 无显示环境时可能非 0，按既有
-        # build-windows smoke test 口径只记录，真正的窗口验收在本机执行。
+        # This is the optional fourth step of scripts/regression. A headless runner may exit
+        # nonzero. Report that outcome and run the window acceptance check locally.
         continue-on-error: true
         run: |
           & .\dist\duthub.exe --self-test
@@ -206,9 +205,9 @@ jobs:
 
       - name: Generate CycloneDX SBOM (duthub)
         shell: pwsh
-        # --override-filename 只给基名 duthub.cdx：工具按 --format json 自行追加
-        # .json，产出 apps/desktop/duthub.cdx.json（写错成 duthub.cdx.json 会得到
-        # duthub.cdx.json.json，后续 Copy-Item 与 gate 均找不到文件）。
+        # Pass the base name duthub.cdx to --override-filename. The JSON writer appends .json.
+        # The resulting file is apps/desktop/duthub.cdx.json, which Copy-Item and the gate expect.
+        # Including .json in the base name would produce an extra extension.
         run: |
           New-Item -ItemType Directory -Force -Path dist\sbom | Out-Null
           cargo cyclonedx --format json --spec-version 1.7 --manifest-path apps/desktop/Cargo.toml --no-build-deps --override-filename duthub.cdx
@@ -216,9 +215,9 @@ jobs:
 
       - name: Audit duthub dependencies
         shell: pwsh
-        # cargo audit 在发现漏洞/错误时以非 0 退出。这里捕获退出码写入
-        # audit-exit 文件并让本步以 0 结束，由 release-gate.ps1 统一判定
-        # （JSON 无漏洞 + 退出码为 0 才算过；gate artifacts 仍会被上传供排查）。
+        # cargo audit exits nonzero on an advisory or error. Capture its exit code in audit-exit
+        # and let release-gate.ps1 evaluate the outcome after artifacts have been written.
+        # A pass requires both exit code zero and a JSON report without vulnerabilities.
         run: |
           cargo audit --file Cargo.lock --json > dist\sbom\audit.json
           $code = $LASTEXITCODE
@@ -228,10 +227,10 @@ jobs:
 
       - name: Record goose runtime dependency audit status (placeholder)
         shell: pwsh
-        # ADR-3 §9：goose 不再随 duthub 分发，内嵌资产的 Cargo.lock 已不存在，无法也不该
-        # 由本仓库审计。这里不伪造审计结果：如果内嵌资产回归（lock 出现），立即回到旧的
-        # fail-closed 上游 Cargo.lock 审计；否则写一份显式 UNVERIFIED 状态，
-        # release-gate.ps1 断言该文件存在且以 UNVERIFIED 开头（占位检查，不允许静默消失）。
+        # ADR-3 §9 moved goose to download distribution. The bundled Cargo.lock was removed.
+        # If the bundled lockfile reappears, restore the fail-closed upstream lockfile audit.
+        # For download distribution, record the upstream audit status explicitly as UNVERIFIED.
+        # release-gate.ps1 requires the status file and its UNVERIFIED prefix.
         run: |
           New-Item -ItemType Directory -Force -Path dist\sbom | Out-Null
           $lock = "apps\desktop\assets\goose\Cargo.lock"
@@ -249,8 +248,8 @@ jobs:
 
       - name: Release gate (signature, hashes, SBOM, audit, checksums)
         shell: pwsh
-        # 当前未配置代码签名证书，构建统一传 -AllowUnsigned 将 Authenticode 降为
-        # warning（发布说明仍如实记录实际签名状态）；接入 signtool 后恢复强制校验。
+        # Until a code-signing certificate is configured, -AllowUnsigned reports a warning.
+        # Record the actual signature status and restore enforcement when signtool is configured.
         run: |
           $gateArgs = @('-NoProfile', '-File', 'scripts/release-gate.ps1', '-RepoRoot', '.', '-AllowUnsigned')
           pwsh @gateArgs

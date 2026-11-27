@@ -187,20 +187,19 @@ impl TransferGuard {
         } else {
             None
         };
-        let rejection = if create {
-            authorize_create(&state, authorizer.as_ref(), &scope, req)
-                .await
-                .err()
-        } else if let Some(id) = upload
-            && [Method::PATCH, Method::HEAD, Method::DELETE].contains(&method)
-        {
-            authorize_resource(&state, authorizer.as_ref(), &scope, &method, id)
-                .await
-                .err()
-        } else if target == Target::Malformed {
-            Some(Rejection::InvalidUploadId)
-        } else {
-            Some(Rejection::MethodNotAllowed)
+        let rejection = match (&target, &method) {
+            (Target::Mount, &Method::POST) => {
+                authorize_create(&state, authorizer.as_ref(), &scope, req)
+                    .await
+                    .err()
+            }
+            (Target::Upload(id), &Method::PATCH | &Method::HEAD | &Method::DELETE) => {
+                authorize_resource(&state, authorizer.as_ref(), &scope, &method, id)
+                    .await
+                    .err()
+            }
+            (Target::Malformed, _) => Some(Rejection::InvalidUploadId),
+            _ => Some(Rejection::MethodNotAllowed),
         };
         if let Some(rejection) = rejection {
             return render_rejection(res, rejection);
@@ -418,14 +417,11 @@ async fn authorize_resource(
     method: &Method,
     id: &str,
 ) -> Result<(), Rejection> {
-    let op = if method == Method::PATCH {
-        UploadOp::Write
-    } else if method == Method::HEAD {
-        UploadOp::Query
-    } else if method == Method::DELETE {
-        UploadOp::Terminate
-    } else {
-        return Ok(());
+    let op = match *method {
+        Method::PATCH => UploadOp::Write,
+        Method::HEAD => UploadOp::Query,
+        Method::DELETE => UploadOp::Terminate,
+        _ => return Ok(()),
     };
     // Only a missing record is the tus layer's 404 to answer. A record that
     // exists but cannot be read or decoded must not become "unknown upload":
@@ -507,19 +503,24 @@ async fn complete(state: &TransferState, res: &mut Response, id: &str) {
         }
         // The record is ours. If it cannot be read back, the upload cannot be
         // trusted, so fail closed instead of publishing it unverified.
-        Some(record) => if let Some(declared) = record
-            .as_deref()
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(Checksum::from_metadata) { declared } else {
-            discard(state, id, "stored checksum record is unreadable".to_owned()).await;
-            render_rejection(
-                res,
-                Rejection::VerificationFailed(
-                    "stored checksum record is unreadable".to_owned(),
-                ),
-            );
-            return;
-        },
+        Some(record) => {
+            if let Some(declared) = record
+                .as_deref()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .and_then(Checksum::from_metadata)
+            {
+                declared
+            } else {
+                discard(state, id, "stored checksum record is unreadable".to_owned()).await;
+                render_rejection(
+                    res,
+                    Rejection::VerificationFailed(
+                        "stored checksum record is unreadable".to_owned(),
+                    ),
+                );
+                return;
+            }
+        }
     };
     let Ok(marker) = state.store.verified_marker(id) else {
         return;

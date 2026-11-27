@@ -117,6 +117,7 @@ fn fn_block<'a>(source: &'a str, anchor: &str) -> &'a str {
 
 #[test]
 fn the_tray_surface_has_a_single_win32_module() {
+    const ALLOWED: &[&str] = &["tray.rs", "agent_host/job.rs"];
     let src = desktop_src();
     let mut files = Vec::new();
     collect_rust_files(&src, &mut files);
@@ -126,7 +127,6 @@ fn the_tray_surface_has_a_single_win32_module() {
     // (design §12.6). Anything else on the tray/alert surface must go through
     // the tray port; `the_close_and_alert_surface_never_touches_win32` below
     // enforces exactly that list.
-    const ALLOWED: &[&str] = &["tray.rs", "agent_host/job.rs"];
     let mut offenders = Vec::new();
     for path in files {
         let file = relative(&src, &path);

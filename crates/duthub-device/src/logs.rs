@@ -1,13 +1,13 @@
-//! 会话日志管道（M1.5，`docs/SECURITY.md` #8）。
+//! Serial session logging and segment rotation.
 //!
-//! - 文本流：utf8-lossy 行，append-only，按大小轮换（`<session>.log` → `.1.log` → …）。
-//! - 原始字节流：`<session>.bin` 追加，**永不**按行重组/转码，保证 panic/oops 证据不被
-//!   ANSI/编码处理污染。二进制流不轮换内联截断，超过 `raw_cap` 起新序号文件。
-//! - 结构化记录流（`.rec`，第三条流）：zerocopy 定长记录头 + 载荷，逐条 flush，
-//!   格式与读取见 `crate::rec` 与 `docs/reference/REC_LOG_FORMAT.md`。`.log`/`.bin` 仍是
-//!   审计权威；`.rec` 是带类型/时间戳的伴生流（终端日志视图数据源）。
-//! - 写入目录由调用方给定（产品用解析后工作目录 `logs/`，见
-//!   `duthub_core::store::resolve_work_dir_in`）。
+//! Append lossy UTF-8 text lines to the text stream and rotate by size.
+//! Append the exact received and transmitted bytes to the binary stream.
+//! Start a new numbered file at the raw-size limit instead of truncating data.
+//! The structured stream adds timestamps and record types to payload bytes.
+//! It flushes each record and serves the terminal log view.
+//! The text and binary streams remain the basis for audit and raw-byte inspection.
+//! The caller supplies the directory for session files (see
+//! `duthub_core::store::resolve_work_dir_in`).
 
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -62,8 +62,8 @@ pub struct SessionLogWriter {
     split_logs: bool,
     /// Reusable encode buffer for `.rec` records (one allocation, reused).
     rec_scratch: Vec<u8>,
-    /// 会话日志开关（串口设置页）：false = .log/.bin/.rec 停写（总线事件不受影响）。
-    /// 默认 true——实时落盘是产品红线，关闭是用户显式选择。
+    /// Whether to write the session's text, raw, and structured streams.
+    /// Logging defaults to on. Disabling it leaves event delivery active.
     enabled: bool,
 }
 
@@ -139,7 +139,10 @@ impl PortableArchive {
             sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| std::io::Error::other("日志序号用尽"))?;
-            let stem = format!("logs/{name}-{sequence:03}_{stamp}");
+            let stem = format!(
+                "{}/{name}-{sequence:03}_{stamp}",
+                duthub_core::dut_artifacts::SERIAL_LOGS_DIR
+            );
             let text_path = format!("{stem}.txt");
             let raw_path = format!("{stem}.bin");
             let rec_path = format!("{stem}.rec");
@@ -197,7 +200,7 @@ impl SessionLogWriter {
         Self::with_limits(dir, session_id, TEXT_ROTATE_BYTES, RAW_ROTATE_BYTES)
     }
 
-    /// 自定义轮换阈值（测试用小阈值快速验证轮换路径）。
+    /// Override the rotation sizes for testing.
     pub fn with_limits(
         dir: &Path,
         session_id: &str,
@@ -282,7 +285,7 @@ impl SessionLogWriter {
         writer
     }
 
-    /// 会话日志开关（串口设置页）：关 = .log/.bin 停写，总线事件照常。
+    /// Stop file writes while leaving event delivery active.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
@@ -446,28 +449,26 @@ impl SessionLogWriter {
     }
 
     fn open_at(&self, stream: Stream, rotation: u32) -> DeviceResult<LogFile> {
-        let name = if self.saving.is_some() {
-            format!("{}-{rotation:010}.{}", self.session_id, stream.extension())
-        } else if rotation == 0 {
-            // 首段使用主名（.log / .bin / .rec）
-            self.stem(stream)
-        } else {
-            self.rotated_name(stream, rotation)
+        let (name, truncate) = match (self.saving.is_some(), rotation) {
+            (true, _) => (
+                format!("{}-{rotation:010}.{}", self.session_id, stream.extension()),
+                false,
+            ),
+            // Use the base filename and replace a prior base file for the first segment.
+            (false, 0) => (self.stem(stream), true),
+            (false, _) => (self.rotated_name(stream, rotation), false),
         };
         let path = self.dir.join(name);
-        // 首段（index 0）覆盖旧残留；轮换段追加
-        let mut file = if self.saving.is_some() {
-            OpenOptions::new().create(true).append(true).open(&path)
-        } else if rotation == 0 {
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&path)
+        let mut options = OpenOptions::new();
+        options.create(true);
+        if truncate {
+            options.write(true).truncate(true);
         } else {
-            OpenOptions::new().create(true).append(true).open(&path)
+            options.append(true);
         }
-        .map_err(|e| DeviceError::Invalid(format!("打开日志失败 {}: {e}", path.display())))?;
+        let mut file = options
+            .open(&path)
+            .map_err(|e| DeviceError::Invalid(format!("打开日志失败 {}: {e}", path.display())))?;
         // `.rec` segments start with the format preamble; only when the file is
         // still empty (a re-opened segment keeps its existing preamble).
         if stream == Stream::Rec {
@@ -478,7 +479,7 @@ impl SessionLogWriter {
         Ok(BufWriter::new(Box::new(file)))
     }
 
-    /// 开始新的文本与原始日志段。两个新句柄均打开后再切换写入目标。
+    /// Open both files before switching the active text and raw destinations.
     pub fn split(&mut self) -> DeviceResult<()> {
         if !self.split_logs {
             return Ok(());
@@ -568,7 +569,7 @@ impl SessionLogWriter {
         Ok(())
     }
 
-    /// 追加一行文本与对应的原始字节（原始流先写，防止文本处理崩溃丢证据）。
+    /// Write the raw bytes first, then append the associated text line.
     pub fn append(&mut self, raw_bytes: &[u8], text_line: &str) -> DeviceResult<()> {
         self.ensure_segment_space(raw_bytes.len() + text_line.len() + 1)?;
         if !self.ensure_writing()? {
@@ -649,7 +650,7 @@ impl SessionLogWriter {
         }
     }
 
-    /// 仅追加原始字节流（键入字节审计：.bin 记真字节，.log 文本流不动）。
+    /// Append audit bytes without writing to the text stream.
     pub fn append_raw(&mut self, raw_bytes: &[u8]) -> DeviceResult<()> {
         if !self.ensure_writing()? {
             return Ok(());
@@ -668,7 +669,7 @@ impl SessionLogWriter {
         Ok(())
     }
 
-    /// 会话关闭：flush 并关闭三条流。
+    /// Flush and close all three streams.
     pub fn finish(&mut self) -> DeviceResult<()> {
         if let Some(mut text) = self.text.take() {
             text.flush()
@@ -686,7 +687,7 @@ impl SessionLogWriter {
     }
 }
 
-/// 列出某会话已产生的日志段（测试与 UI 检查用）。
+/// List the files produced by this session.
 ///
 /// Only the `.log`/`.bin` stream families: the `.rec` structured stream has
 /// its own listing (`rec::list_rec_segments`) and must not leak into this
@@ -716,7 +717,7 @@ pub fn list_segments(dir: &Path, session_id: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    /// 测试临时目录放在项目 target/ 内（遵守“只写项目目录”约束）。
+    /// Create temporary test files inside the workspace target directory.
     fn test_dir(tag: &str) -> PathBuf {
         let dir = std::env::current_dir()
             .unwrap()
@@ -746,11 +747,10 @@ mod tests {
         let logs = duthub_core::log_archive::list(&root.join("duthub-data"), "a", 0, 20);
         assert_eq!(logs.len(), 3);
         for (segment, number) in logs.iter().zip([3, 2, 1]) {
-            assert!(
-                segment
-                    .id
-                    .starts_with(&format!("dut/RK3576/logs/RK3576-{number:03}_"))
-            );
+            assert!(segment.id.starts_with(&format!(
+                "dut/RK3576/{}/RK3576-{number:03}_",
+                duthub_core::dut_artifacts::SERIAL_LOGS_DIR
+            )));
             assert!(
                 Path::new(&segment.id)
                     .extension()
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn rotates_when_threshold_reached() {
         let dir = test_dir("rotate");
-        // 小阈值触发真实轮换路径：每 64 字节换段
+        // Use a 64-byte threshold to exercise segment rotation.
         let mut writer = SessionLogWriter::with_limits(&dir, "sess-b", 64, 64).unwrap();
         let line = "x".repeat(30);
         for i in 0..5 {
@@ -869,13 +869,13 @@ mod tests {
                 .unwrap();
         }
         writer.finish().unwrap();
-        // 5 条 × 31B ≈ 155B ≥ 64×2 → 至少轮换 2 段
+        // Five approximately 31-byte records force at least two rotations.
         let segments = list_segments(&dir, "sess-b");
         assert!(
             segments.len() >= 3,
-            "应产生主段 + 轮换段，实际 {segments:?}"
+            "expected base segment plus rotated segments, got {segments:?}"
         );
-        // 轮换段内容连续（旧段在前）
+        // Reading oldest to newest must reproduce the original sequence.
         let seg0 = std::fs::read_to_string(dir.join("sess-b.log.1")).unwrap();
         assert!(seg0.lines().count() >= 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -895,8 +895,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 普通模式按时间顺序收集某一流的所有段：主段（.log/.bin）最旧在前，
-    /// 之后 .1/.2/… 依次更晚（rotate/split 都是 rotation+1 开新文件）。
+    /// Collect a stream in chronological order, with the base segment first.
+    /// Both explicit splits and size rotation allocate the next number.
     fn chronological_segments(dir: &Path, session_id: &str, raw: bool) -> Vec<PathBuf> {
         let extension = if raw { "bin" } else { "log" };
         let mut found = Vec::new();
@@ -914,17 +914,17 @@ mod tests {
         found
     }
 
-    /// LOG-1 逐条实时落盘（AGENTS.md 坑 #47「逐条 flush 语义不变、实时落盘、
-    /// `零丢失」红线）：append/append_raw/note/mark` 都是 `write_all` + flush 后才
-    /// 返回（BufWriter 只作缓冲不攒批），任一时刻读盘文件必已含此前所有已确认
-    /// 消息，不缓冲到会话结束。每步写完立即 `std::fs::read` 断言，全程不手动
-    /// flush/drop——攒批实现必炸。末尾用宽松时限上界锁机制（200 条 0 间隔
-    /// append 远低于 10s），只防攒批/逐条卡死，不写窄时序断言。
+    /// An acknowledged append, note, or marker must already be readable from disk.
+    /// Each operation writes and flushes before it returns.
+    /// The buffered writer therefore cannot defer records until session shutdown.
+    /// Read the file after each operation without manually flushing it.
+    /// Also check an uninterrupted run of 200 writes using a generous deadline.
+    /// This detects batching or a stuck writer without imposing tight timing.
     #[test]
     fn log_writes_are_visible_on_disk_immediately() {
         let dir = test_dir("live-flush");
         let mut writer = SessionLogWriter::new(&dir, "sess-live").unwrap();
-        // append：返回后文本与原始字节立刻可见
+        // Read the matching text and bytes immediately after append returns.
         writer.append(b"rx-1\r\n", "rx-1").unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("sess-live.log")).unwrap(),
@@ -934,27 +934,27 @@ mod tests {
             std::fs::read(dir.join("sess-live.bin")).unwrap(),
             b"rx-1\r\n"
         );
-        // append_raw：返回后 .bin 立刻增长
+        // A raw append must immediately extend the binary log.
         writer.append_raw(b"typed\r\n").unwrap();
         assert_eq!(
             std::fs::read(dir.join("sess-live.bin")).unwrap(),
             b"rx-1\r\ntyped\r\n"
         );
-        // note：注记行立刻可见
+        // Read the annotation without an additional flush.
         writer.note("[note] hello").unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("sess-live.log")).unwrap(),
             "rx-1\n[note] hello\n"
         );
-        // mark：标记行立刻可见（本测试只锁 flush 时机；切段行为由
-        // mark_splits_pair_and_preserves_previous_segment 锁）
+        // Read the marker without an additional flush.
+        // A separate test covers the segment switch itself.
         writer.mark("[mark] seg-a").unwrap();
         assert!(
             std::fs::read_to_string(dir.join("sess-live.log"))
                 .unwrap()
                 .ends_with("[mark] seg-a\n")
         );
-        // 宽松上界：200 条 append 完成 + 不调用 finish/drop，磁盘必已含全部行
+        // Complete 200 writes and inspect the file while the writer remains open.
         let started = std::time::Instant::now();
         for i in 0..200u32 {
             let line = format!("line-{i}");
@@ -962,19 +962,19 @@ mod tests {
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
-            "逐条落盘不得攒批或卡死：{:?}",
+            "per-record flush must not batch or stall: {:?}",
             started.elapsed()
         );
         let tail = std::fs::read_to_string(dir.join("sess-live.log.1")).unwrap();
         for i in 0..200u32 {
-            assert!(tail.contains(&format!("line-{i}\n")), "缺 line-{i}");
+            assert!(tail.contains(&format!("line-{i}\n")), "missing line-{i}");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-8：`.rec` 结构化记录流逐条 flush 与 .log/.bin 同语义——每次
-    /// `append_rec` 返回后读盘必须能零拷贝解析出此前全部记录（不攒批），
-    /// 载荷逐字节一致且含多字节 UTF-8。
+    /// Structured appends flush each record just like the text and raw streams.
+    /// Read and parse every prior record without an extra flush.
+    /// The payload must preserve the original bytes, including multibyte UTF-8.
     #[test]
     fn rec_records_are_visible_on_disk_immediately() {
         let dir = test_dir("rec-live-flush");
@@ -983,10 +983,14 @@ mod tests {
         writer
             .append_rec(RecKind::Note, "[note] 中文注记".as_bytes())
             .unwrap();
-        // 不 flush/drop，直接读盘解析
+        // Read and parse the records while the writer is still open.
         let raw = std::fs::read(dir.join("sess-rec-live.rec")).unwrap();
         let batch = crate::rec::parse_records(&raw);
-        assert_eq!(batch.records.len(), 2, "逐条 flush：两条记录立即可解析");
+        assert_eq!(
+            batch.records.len(),
+            2,
+            "per-record flush: both records must be immediately parseable"
+        );
         assert_eq!(batch.records[0].kind, RecKind::Raw);
         assert_eq!(batch.records[0].payload, b"rx-1\r\n");
         assert_eq!(batch.records[1].kind, RecKind::Note);
@@ -994,9 +998,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-9：`.rec` 大小轮换与 split 联动——小阈值触发真实轮换路径（与
-    /// .bin 同阈值），轮换段按主段 → .1 时间序拼接等于完整记录流；
-    /// `split()` 三条流一起切段，`.rec` 段与 .log/.bin 段序对齐。
+    /// Exercise the structured stream's size rotation and explicit split behavior.
+    /// Reading size-rotated segments in order must reproduce every record.
+    /// An explicit split rotates all three streams together.
     #[test]
     fn rec_rotates_and_splits_with_pair() {
         let dir = test_dir("rec-rotate");
@@ -1009,7 +1013,7 @@ mod tests {
         writer.split().unwrap();
         writer.append_rec(RecKind::Mark, b"after-split").unwrap();
         writer.finish().unwrap();
-        // 按段序拼接：主段 + 所有轮换段（旋转计数兼容 rec 自己的阈值轮换）
+        // Collect the base segment and all numbered files using the structured stream's naming.
         let mut paths = vec![dir.join("sess-rec-rot.rec")];
         for rotation in 1..=MAX_ROTATIONS {
             let path = dir.join(format!("sess-rec-rot.rec.{rotation}"));
@@ -1019,9 +1023,12 @@ mod tests {
                 break;
             }
         }
-        assert!(paths.len() >= 2, "小阈值必须触发 .rec 轮换");
-        // 按段逐个解析：每段带独立 preamble，原始字节直接拼接会被第二段的
-        // preamble 卡停——这也是终端日志视图按段读取的原因
+        assert!(
+            paths.len() >= 2,
+            "small threshold must trigger .rec rotation"
+        );
+        // Parse each file separately because each segment starts with a preamble.
+        // Concatenating file bytes would feed the next preamble to the record parser.
         let all: Vec<(RecKind, Vec<u8>)> = paths
             .iter()
             .flat_map(|path| {
@@ -1045,14 +1052,14 @@ mod tests {
                 b"record-04".as_slice(),
                 b"after-split",
             ],
-            "分段拼接必须等于完整记录流（kinds: {kinds:?}）"
+            "concatenated segments must match full record stream (kinds: {kinds:?})"
         );
         assert_eq!(*kinds.last().unwrap(), RecKind::Mark);
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-10：`.rec` 跟随会话日志开关——停写后 `append_rec` 不产生任何字节，
-    /// 恢复后继续追加（普通模式句柄保留，内容接续不重开）。
+    /// Disabling logging makes structured append a no-op.
+    /// Re-enabling resumes writing to the existing handles in ordinary mode.
     #[test]
     fn rec_toggle_follows_session_logging() {
         let dir = test_dir("rec-toggle");
@@ -1062,7 +1069,11 @@ mod tests {
         writer.append_rec(RecKind::Raw, b"muted").unwrap();
         let raw = std::fs::read(dir.join("sess-rec-toggle.rec")).unwrap();
         let batch = crate::rec::parse_records(&raw);
-        assert_eq!(batch.records.len(), 1, "关闭期间必须停写");
+        assert_eq!(
+            batch.records.len(),
+            1,
+            "writes must stop while logging is disabled"
+        );
         assert_eq!(batch.records[0].payload, b"before");
         writer.set_enabled(true);
         writer.append_rec(RecKind::Raw, b"after").unwrap();
@@ -1073,11 +1084,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-2 双流语义分离：.log 记文本行（逐行 \n 结尾），.bin 记真实线上字节
-    /// 不转码不重组（含非法 UTF-8/NUL/\r\n `原样保真）；append_raw（键入字节`
-    /// 审计）只进 .bin，.log 不动。[TX] 注记换行转义为字面 \r/\n 属 demo.rs
-    /// single_line_tx（P2-034），由既有测试 `tx_annotation_is_single_line_for`_
-    /// `multiline_text` 锁定——本测试锁 logs.rs 侧的双流分离与字节保真。
+    /// The text stream stores lines with LF endings.
+    /// The binary stream preserves all wire bytes, including invalid UTF-8, NUL, and CRLF.
+    /// A raw-only append must never reach the text stream.
+    /// The session actor separately tests escape handling in its TX annotations.
+    /// This test covers the writer's separation of text and raw bytes.
     #[test]
     fn append_raw_is_bin_only_and_bin_keeps_verbatim_bytes() {
         let dir = test_dir("pair-split");
@@ -1085,19 +1096,19 @@ mod tests {
         writer
             .append(b"root@dev:~# uname\r\n", "root@dev:~# uname")
             .unwrap();
-        // 键入字节审计：含非法 UTF-8 与 NUL 的线上字节只允许进 .bin
+        // Send invalid UTF-8 and NUL through the raw-only append path.
         writer.append_raw(b"\xff\xfe\x00whoami\r\n").unwrap();
-        // .bin 逐字节保真：行尾 \r\n 原样、非法字节原样，无转码无重组
+        // Expect the exact original bytes and line ending in the binary stream.
         assert_eq!(
             std::fs::read(dir.join("sess-pair.bin")).unwrap(),
             b"root@dev:~# uname\r\n\xff\xfe\x00whoami\r\n"
         );
-        // .log 只含文本行：raw-only 字节不得漏进文本流
+        // The raw-only payload must be absent from the text stream.
         assert_eq!(
             std::fs::read_to_string(dir.join("sess-pair.log")).unwrap(),
             "root@dev:~# uname\n"
         );
-        // 多字节 UTF-8 文本行原样进 .log；.bin 同步记线上字节（含行尾）
+        // Preserve multibyte text in the text stream and original wire bytes in the raw stream.
         writer.append("终端 ok\r\n".as_bytes(), "终端 ok").unwrap();
         assert!(
             std::fs::read_to_string(dir.join("sess-pair.log"))
@@ -1112,9 +1123,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-3 普通模式按会话分文件互不混入：同一目录下 <session>.log/.bin 只装
-    /// `本会话内容，list_segments` 只列本会话前缀（`{session_id}.` 开头）的段，
-    /// 相近前缀（sess-alicia）与他会话文件一律不进列表。
+    /// Different sessions can share a directory without mixing their log segments.
+    /// Match the complete session ID followed by a dot.
+    /// Exclude other sessions that only share part of the prefix.
     #[test]
     fn sessions_in_shared_dir_stay_separate_and_list_filters_prefix() {
         let dir = test_dir("shared-dir");
@@ -1137,12 +1148,16 @@ mod tests {
             std::fs::read(dir.join("sess-alice.bin")).unwrap(),
             b"alice-1alice-2"
         );
-        // 异会话/相近前缀文件不进本会话段列表
+        // Exclude all files for sessions with other IDs.
         std::fs::write(dir.join("sess-bob.log.1"), "no\n").unwrap();
         std::fs::write(dir.join("sess-alicia.log"), "no\n").unwrap();
         std::fs::write(dir.join("other.log"), "no\n").unwrap();
         let segments = list_segments(&dir, "sess-alice");
-        assert_eq!(segments.len(), 2, "只列本会话前缀：{segments:?}");
+        assert_eq!(
+            segments.len(),
+            2,
+            "must list only this session prefix: {segments:?}"
+        );
         assert!(segments.iter().all(|p| {
             p.file_name()
                 .unwrap()
@@ -1152,10 +1167,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-3 大小阈值轮换（产品默认文本 2MB/原始 8MB，测试用 `with_limits` 配
-    /// 小阈值走真实轮换路径）：文本流与原始流各自独立轮换；旧段内容原样保留
-    /// 且在前——按主段 → .1 → .2 时间序拼接必须等于完整流（不丢不乱，边界
-    /// 位置不锁死，将来改轮换策略测试仍成立）。
+    /// Exercise size-based rotation using small limits for both streams.
+    /// Text and raw logs rotate independently and preserve all earlier segments.
+    /// Concatenating segments oldest first must preserve every original byte in order.
+    /// The test does not depend on an exact split position.
     #[test]
     fn rotated_segments_preserve_text_and_raw_continuity() {
         let dir = test_dir("rotate-continuity");
@@ -1174,32 +1189,44 @@ mod tests {
         writer.finish().unwrap();
         let text_segments = chronological_segments(&dir, "sess-cont", false);
         let raw_segments = chronological_segments(&dir, "sess-cont", true);
-        assert!(text_segments.len() > 1, "文本流应轮换：{text_segments:?}");
-        assert!(raw_segments.len() > 1, "原始流应轮换：{raw_segments:?}");
+        assert!(
+            text_segments.len() > 1,
+            "text stream should rotate: {text_segments:?}"
+        );
+        assert!(
+            raw_segments.len() > 1,
+            "raw stream should rotate: {raw_segments:?}"
+        );
         let mut text_all = String::new();
         for path in &text_segments {
             text_all.push_str(&std::fs::read_to_string(path).unwrap());
         }
-        assert_eq!(text_all, expected_text, "文本流拼接必须连续");
+        assert_eq!(
+            text_all, expected_text,
+            "concatenated text stream must be continuous"
+        );
         let mut raw_all = Vec::new();
         for path in &raw_segments {
             raw_all.extend(std::fs::read(path).unwrap());
         }
-        assert_eq!(raw_all, expected_raw, "原始流拼接必须连续");
+        assert_eq!(
+            raw_all, expected_raw,
+            "concatenated raw stream must be continuous"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-3 归档（portable）模式按 DUT 名称目录 + 递增序号命名，并按配额阈值
-    /// `自动分段（ensure_segment_space：段内累计超过` limit/8 即切新段）：全部
-    /// 行按写入顺序分布在各段中不丢不乱。跨重启续号由既有测试
-    /// `portable_log_numbers_continue_across_splits_and_reopen` 锁定。
+    /// Portable archives use the DUT directory and increasing segment numbers.
+    /// Create a new segment when the current segment exceeds one eighth of the quota.
+    /// Reading all segments must reproduce every line in its original order.
+    /// A separate test covers numbering across reopens.
     #[test]
     fn portable_archive_splits_on_size_threshold_and_keeps_order() {
         let root = test_dir("portable-size");
-        // portable 的 next_segment 经 open_dut_for_write 需要已存在的根目录
+        // The writable archive root must already exist.
         std::fs::create_dir_all(&root).unwrap();
         let saving = Arc::new(AtomicBool::new(true));
-        // 配额 64KB → 单段阈值 8KB；30 × ~573B 文本必触发自动切段
+        // A 64 KB quota yields an 8 KB segment threshold.
         let quota = duthub_core::dut_quota::DutQuota::new(64 * 1024);
         let mut log = SessionLogWriter::portable_archive(&root, "sz", "SIZE-DUT", saving, quota);
         let mut lines = Vec::new();
@@ -1211,8 +1238,8 @@ mod tests {
         let archive = root.join("duthub-data");
         let segments = duthub_core::log_archive::list(&archive, "sz", 0, 20);
         let ids: Vec<&str> = segments.iter().map(|s| s.id.as_str()).collect();
-        assert!(segments.len() >= 2, "应触发自动分段：{ids:?}");
-        // list 最新在前 → 反转为时间序拼接 == 全部行按写入顺序
+        assert!(segments.len() >= 2, "should trigger auto-split: {ids:?}");
+        // Reverse the newest-first listing before comparing the full chronological stream.
         let mut all_text = String::new();
         for segment in segments.iter().rev() {
             all_text.push_str(
@@ -1226,22 +1253,25 @@ mod tests {
             expected.push_str(line);
             expected.push('\n');
         }
-        assert_eq!(all_text, expected, "分段后行序必须连续");
+        assert_eq!(
+            all_text, expected,
+            "line order must remain continuous across segments"
+        );
         drop(log);
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// LOG-4 会话日志开关即时生效且语义明确（串口设置页，普通模式）：
-    /// 默认开（实时落盘是产品红线，关闭是用户显式选择）；关 = .log/.bin 停写
-    /// 且文件内容逐字节不变；开 = 同文件续写（不开新段）。
-    /// 「总线事件/MCP `serial_read` 不受影响」属 SessionCtx/驱动层
-    /// （demo.rs `emit_raw` 总线发布、lib.rs `set_session_logging），不在本文件`
-    /// 可测范围；新会话按构造值初始化的接线在 lib.rs 会话创建处。
+    /// Logging changes take effect immediately in ordinary mode.
+    /// While disabled, existing file bytes must stay unchanged.
+    /// Re-enabling appends to the same files without allocating a segment.
+    /// The session actor separately tests that event delivery remains active.
+    /// The session constructor sets the initial logging flag.
+    /// These checks exercise only the writer.
     #[test]
     fn session_toggle_stops_file_writes_and_resumes_same_file() {
         let dir = test_dir("toggle");
         let mut writer = SessionLogWriter::new(&dir, "sess-toggle").unwrap();
-        assert!(writer.enabled(), "新会话默认开启");
+        assert!(writer.enabled(), "new session defaults to enabled");
         writer.append(b"before-off", "before-off").unwrap();
         writer.append_raw(b"raw-before").unwrap();
         let text_before = std::fs::read_to_string(dir.join("sess-toggle.log")).unwrap();
@@ -1249,7 +1279,7 @@ mod tests {
 
         writer.set_enabled(false);
         assert!(!writer.enabled());
-        // 关闭期间各类写入全部不落盘，文件内容一字节不变
+        // All writes while disabled must leave both files byte for byte unchanged.
         writer.append(b"while-off", "while-off").unwrap();
         writer.append_raw(b"raw-off").unwrap();
         writer.note("[note] while-off").unwrap();
@@ -1263,7 +1293,7 @@ mod tests {
             raw_before
         );
 
-        // 重新开启：同文件续写（普通模式不开新段），已确认内容原样保留
+        // Re-enable and confirm that writing continues in the original files.
         writer.set_enabled(true);
         writer.append(b"after-on", "after-on").unwrap();
         writer.append_raw(b"raw-on").unwrap();
@@ -1280,19 +1310,19 @@ mod tests {
         assert_eq!(
             chronological_segments(&dir, "sess-toggle", false).len(),
             1,
-            "普通模式开关切换不得开新段"
+            "toggling in ordinary mode must not open a new segment"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-4 归档模式 saving 开关：关 = 当前段 finish 收尾、停写且已确认内容
-    /// 原样保留；开 = 开新段续写（portable 走 `next_segment` 递增序号），已确认
-    /// 内容不因开关切换丢失。关闭期间入队的消息被拒写（开关后的输出才落盘）
-    /// ——写线程队列的「先入队消息不丢」由 demo.rs 写线程测试锁。
+    /// Disabling portable logging finishes the current segment.
+    /// Re-enabling opens a newly numbered segment and preserves earlier files.
+    /// Discard writes queued while saving was disabled.
+    /// The session actor separately tests draining queued writes at shutdown.
     #[test]
     fn archive_saving_toggle_finishes_segment_and_resumes_new_segment() {
         let root = test_dir("portable-saving");
-        // portable 的 next_segment 经 open_dut_for_write 需要已存在的根目录
+        // Create the archive root before opening a portable segment.
         std::fs::create_dir_all(&root).unwrap();
         let saving = Arc::new(AtomicBool::new(true));
         let quota = duthub_core::dut_quota::DutQuota::new(1024 * 1024);
@@ -1305,7 +1335,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         let first_id = first[0].id.clone();
 
-        // 关闭：停写，当前段收尾（内容原样保留）
+        // Disable saving and retain the completed segment.
         saving.store(false, Ordering::Release);
         log.note("while-off").unwrap();
         log.mark("while-off").unwrap();
@@ -1320,16 +1350,20 @@ mod tests {
             "seg-a-1\nseg-a-2\n"
         );
 
-        // 重新开启：新段续号（002），旧段不变
+        // Re-enable to open segment 002 and preserve the old file.
         saving.store(true, Ordering::Release);
         log.note("seg-b-1").unwrap();
         let segments = duthub_core::log_archive::list(&archive, "sv", 0, 10);
         let ids: Vec<&str> = segments.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(segments.len(), 2, "开启后应开新段：{ids:?}");
+        assert_eq!(
+            segments.len(),
+            2,
+            "re-enabling should open a new segment: {ids:?}"
+        );
         assert_ne!(segments[0].id, first_id);
         assert!(
             segments[0].id.contains("-002_"),
-            "重开应递增序号：{}",
+            "reopening must increment sequence number: {}",
             segments[0].id
         );
         assert_eq!(
@@ -1404,12 +1438,22 @@ mod tests {
             text,
             "first session\n[mark] Power ON\n[mark] Agent\nafter markers\nreopened\nback to continuous\n"
         );
-        let raw = std::fs::read(root.join("CONTINUOUS-DUT/logs/serial.bin")).unwrap();
+        let raw = std::fs::read(
+            root.join("CONTINUOUS-DUT")
+                .join(duthub_core::dut_artifacts::SERIAL_LOGS_DIR)
+                .join("serial.bin"),
+        )
+        .unwrap();
         assert_eq!(
             raw,
             b"first session\nafter markers\nreopened\nback to continuous\n"
         );
-        assert!(root.join("CONTINUOUS-DUT/logs/serial.rec").is_file());
+        assert!(
+            root.join("CONTINUOUS-DUT")
+                .join(duthub_core::dut_artifacts::SERIAL_LOGS_DIR)
+                .join("serial.rec")
+                .is_file()
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1452,12 +1496,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// LOG-5 mark 分段标记切文件：标记行本身落当前（旧）段并实时可见，随后
-    /// 输出落新段（.log.1/.bin.1），旧段内容原样保留——「分段必须发生在控制
-    /// 指令前：供电操作先落段再派发」（红线）。mark 同步返回成败；供电边界经
-    /// 写线程 `MarkSync` ack 同步执行（排空此前队列后才 mark）的部分在
-    /// demo.rs/lib.rs，不在本文件可测范围。bare split 的段落保留由既有测试
-    /// `explicit_split_keeps_previous_pair_and_writes_to_new_pair` 锁定。
+    /// A marker is immediately visible at the end of the current segment.
+    /// Later output goes to newly numbered text and raw files.
+    /// Pre-power markers must complete before control dispatch.
+    /// The session actor's synchronous marker command drains earlier writes first.
+    /// Those dispatch and queue checks live outside the writer tests.
+    /// A separate test covers explicit splitting without a marker.
     #[test]
     fn mark_splits_pair_and_preserves_previous_segment() {
         let dir = test_dir("mark-split");
@@ -1466,7 +1510,7 @@ mod tests {
         writer.mark("[mark] power cycle").unwrap();
         writer.append(b"post\r\n", "post").unwrap();
         writer.finish().unwrap();
-        // 旧段：设备输出 + 标记行（mark 行是本机注记，raw 记标记文本本身）
+        // The old segment contains device output and the locally generated marker.
         assert_eq!(
             std::fs::read_to_string(dir.join("sess-mark.log")).unwrap(),
             "boot ok\n[mark] power cycle\n"
@@ -1475,7 +1519,7 @@ mod tests {
             std::fs::read(dir.join("sess-mark.bin")).unwrap(),
             b"boot ok\r\n[mark] power cycle"
         );
-        // 新段：mark 之后的输出
+        // The new segment starts with output after the marker.
         assert_eq!(
             std::fs::read_to_string(dir.join("sess-mark.log.1")).unwrap(),
             "post\n"
@@ -1487,10 +1531,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// LOG-5 分段失败同步返回错误：段数达到上限后 split 返回 Err 而非无限增长
-    /// ——该 Err 是写线程 `MarkSync` ack `携带值，log_control_boundary（lib.rs`）
-    /// 据此拦截控制派发并广播错误注记（那半段在 lib.rs/demo.rs）。本测试锁
-    /// Err 的产生与同步返回。
+    /// Return a synchronous error when no further segments can be allocated.
+    /// The writer thread returns that error to the control boundary.
+    /// The boundary blocks dispatch and publishes an error annotation.
+    /// This test checks the writer's synchronous failure.
     #[test]
     fn split_reports_error_after_rotation_cap() {
         let dir = test_dir("split-cap");
@@ -1499,7 +1543,10 @@ mod tests {
             writer.split().unwrap();
         }
         let error = writer.split().unwrap_err();
-        assert!(error.to_string().contains("分段"), "应报分段上限：{error}");
+        assert!(
+            error.to_string().contains("分段"),
+            "expected segment cap error: {error}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

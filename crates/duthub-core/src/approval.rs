@@ -1,12 +1,12 @@
-//! 写操作审批令牌（`docs/API_CONTRACT.md`；`docs/SECURITY.md` #3）。
+//! Single-use approvals for write operations.
 //!
-//! - 令牌由 core 签发：CSPRNG 随机、单次有效、5 分钟过期、绑定
-//!   dut+action+参数哈希（令牌不可由参数哈希推导）。
-//! - 无 token / 过期 / 不匹配 / 已使用的写操作一律拒绝。
-//! - 审批留痕只记 SHA-256 指纹（`ApprovalFingerprint`），配置 `AuditSink` 后
-//!   同步写 `approval.issue` / `approval.consume` 审计事件；明文令牌永不落审计。
-//! - M4 阶段 token 经 MCP `approval.request` 工具签发并写入审计日志；
-//!   M5 接入 GUI 审批闸门后改为"申请 → 人工确认 → 发放"。
+//! Generate unpredictable tokens that expire after five minutes.
+//! Bind each token to the DUT, action, and parameter hash.
+//! Reject absent, expired, replayed, or mismatched tokens.
+//! Audit only the SHA-256 fingerprint.
+//! Record issuance and consumption without logging token contents.
+//! Clients request approval through the MCP tool.
+//! The GUI can require a confirmation before issuing the token.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -20,19 +20,21 @@ use crate::audit::{AuditOutcome, AuditSink};
 
 pub const APPROVAL_TTL_SECS: u64 = 300;
 
-/// 进程内审批指纹环容量（长期运行的 MCP 进程不无限增长）。
+/// Maximum number of recent approval fingerprints kept in memory.
 const AUDIT_TAIL_CAP: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ApprovalError {
     /// Missing approval token.
-    #[error("缺少审批令牌：先调用 approval.request 签发")]
+    #[error("Missing approval token. Request one with approval.request")]
     Missing,
     /// Unknown, expired, or already-consumed approval token.
-    #[error("审批令牌无效或已使用/过期：重新调用 approval.request")]
+    #[error(
+        "Approval token is invalid, used, or expired. Request a new token with approval.request"
+    )]
     Unknown,
     /// Token does not match the requested DUT, action, or argument hash.
-    #[error("审批令牌与本次操作的 dut/action/参数不匹配")]
+    #[error("Approval token does not match the DUT, action, or parameters")]
     Mismatch,
 }
 
@@ -40,9 +42,13 @@ impl ApprovalError {
     #[must_use]
     pub fn message(&self) -> &'static str {
         match self {
-            ApprovalError::Missing => "缺少审批令牌：先调用 approval.request 签发",
-            ApprovalError::Unknown => "审批令牌无效或已使用/过期：重新调用 approval.request",
-            ApprovalError::Mismatch => "审批令牌与本次操作的 dut/action/参数不匹配",
+            ApprovalError::Missing => "Missing approval token. Request one with approval.request",
+            ApprovalError::Unknown => {
+                "Approval token is invalid, used, or expired. Request a new token with approval.request"
+            }
+            ApprovalError::Mismatch => {
+                "Approval token does not match the DUT, action, or parameters"
+            }
         }
     }
 }
@@ -101,7 +107,7 @@ fn token_sha256(token: &str) -> String {
     crate::util::sha256_hex(token.as_bytes())
 }
 
-/// 审批令牌管理器（进程内，单次消费）。
+/// In-process store for issuing and consuming single-use approvals.
 pub struct ApprovalManager {
     entries: Mutex<HashMap<String, Entry>>,
     ttl: Duration,
@@ -145,7 +151,7 @@ impl ApprovalManager {
         self
     }
 
-    /// 签发令牌（并记录审计行：时间戳 / dut / action / 参数哈希）。
+    /// Issue a token and audit its time, target, action, and parameter hash.
     ///
     /// The token is generated from the CSPRNG and never derived from the
     /// arguments hash, so guessing the bound arguments does not reveal it.
@@ -180,10 +186,10 @@ impl ApprovalManager {
         }
     }
 
-    /// 校验并消费令牌（单次）；不匹配 / 过期 / 已使用 → 错误。
+    /// Check and consume a valid token exactly once.
     ///
-    /// 语义 = [`Self::peek`] + [`Self::consume`]（P1-014 器件层前置拆分）：
-    /// 既有调用方（control.* 写路径）行为不变。
+    /// Combines `Self::peek` with `Self::consume`.
+    /// Reject expired, mismatched, and used tokens.
     pub fn validate(
         &self,
         token: &str,
@@ -195,10 +201,10 @@ impl ApprovalManager {
         self.consume(token)
     }
 
-    /// 校验令牌（存在 / 未过期 / dut+action+参数匹配）但**不消费**。
+    /// Check expiry and request binding without consuming the token.
     ///
-    /// 供审批链先做租约/授权复核、全部就绪后再 consume（M10：admit 不通过
-    /// 不烧令牌）。过期令牌顺手清除（与旧 validate 行为一致）。
+    /// Callers can verify leases and permissions before committing consumption.
+    /// Discard expired entries.
     pub fn peek(
         &self,
         token: &str,
@@ -224,8 +230,8 @@ impl ApprovalManager {
         Ok(())
     }
 
-    /// 消费令牌：移除并返回结果；已用 / 不存在 / 为空 → 错误（不记录审计）。
-    /// 仅在 peek 通过后调用；重复消费（一次性语义）报 Unknown。
+    /// Remove an approved token and record its consumption.
+    /// Call after validation. Absent or already used tokens return an error.
     pub fn consume(&self, token: &str) -> Result<(), ApprovalError> {
         if token.trim().is_empty() {
             return Err(ApprovalError::Missing);
@@ -243,7 +249,7 @@ impl ApprovalManager {
         Ok(())
     }
 
-    /// 审计日志（近期记录；只含指纹，绝不含明文令牌）。
+    /// Recent audit records contain fingerprints only.
     pub fn audit_tail(&self, limit: usize) -> Vec<String> {
         let audit = crate::util::lock_unpoisoned(&self.audit);
         audit
@@ -286,7 +292,7 @@ mod tests {
         let token = mgr.issue("dut-a", "serial.write", r#"{"text":"uname"}"#);
         mgr.validate(&token.token, "dut-a", "serial.write", r#"{"text":"uname"}"#)
             .unwrap();
-        // 单次消费：第二次必须 Unknown
+        // The second consumption must report an unknown token.
         assert_eq!(
             mgr.validate(&token.token, "dut-a", "serial.write", r#"{"text":"uname"}"#),
             Err(ApprovalError::Unknown)
@@ -334,30 +340,30 @@ mod tests {
         assert_ne!(h1, args_hash("dut-b", "serial.write", r#"{"text":"x"}"#));
     }
 
-    /// P1-014 器件层前置：peek 只校验不消费，consume 才移除；
-    /// validate = peek + consume（既有语义不变）。
+    /// Validation without consumption leaves the token available.
+    /// The combined API still validates and consumes in one call.
     #[test]
     fn peek_does_not_consume_and_consume_removes() {
         let mgr = ApprovalManager::new();
         let token = mgr.issue("dut-a", "serial.write", r#"{"text":"uname"}"#);
-        // peek 可重复：令牌不被消费
+        // Repeated validation does not consume the token.
         mgr.peek(&token.token, "dut-a", "serial.write", r#"{"text":"uname"}"#)
             .unwrap();
         mgr.peek(&token.token, "dut-a", "serial.write", r#"{"text":"uname"}"#)
             .unwrap();
-        // peek 仍会拒绝不匹配
+        // Validation rejects a different request.
         assert_eq!(
             mgr.peek(&token.token, "dut-b", "serial.write", r#"{"text":"uname"}"#),
             Err(ApprovalError::Mismatch)
         );
-        // consume 移除后：再次 consume 与 peek 均 Unknown（一次性语义）
+        // Once consumed, the token cannot be validated or consumed again.
         mgr.consume(&token.token).unwrap();
         assert_eq!(mgr.consume(&token.token), Err(ApprovalError::Unknown));
         assert_eq!(
             mgr.peek(&token.token, "dut-a", "serial.write", r#"{"text":"uname"}"#),
             Err(ApprovalError::Unknown)
         );
-        // validate 语义不变：peek + consume
+        // The combined operation consumes a valid token.
         let token2 = mgr.issue("dut-a", "control.power", r#"{"on":true}"#);
         mgr.validate(&token2.token, "dut-a", "control.power", r#"{"on":true}"#)
             .unwrap();

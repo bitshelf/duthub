@@ -103,7 +103,7 @@ mod tests {
         assert!(budget.allow(start + Duration::from_secs(120)));
         assert!(
             !budget.allow(start + Duration::from_secs(180)),
-            "10 分钟窗口内第 4 次重启必须拒绝"
+            "4th restart within the 10-minute window must be denied"
         );
         assert_eq!(
             budget.restarts_in_window(start + Duration::from_secs(180)),
@@ -137,7 +137,7 @@ mod tests {
         assert_eq!(
             budget.restarts_in_window(start + RESTART_WINDOW),
             1,
-            "恰好在窗口边界上的旧记录必须被移除"
+            "entries exactly on the window boundary must be expired"
         );
     }
 }

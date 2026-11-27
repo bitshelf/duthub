@@ -66,6 +66,7 @@ pub struct Checksum {
 
 /// Why an `Upload-Checksum` value cannot be honored.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChecksumError {
     /// Not shaped like `<algorithm> <hex digest>`.
     #[error("malformed Upload-Checksum header")]

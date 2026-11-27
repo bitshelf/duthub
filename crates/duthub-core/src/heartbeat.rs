@@ -1,10 +1,11 @@
-//! 心跳检测共享类型（需求⑦）：配置 / 状态 / 系统信息启发式提取。
+//! Shared heartbeat types: configuration, runtime state, and heuristic system info extraction.
 //!
-//! - 配置挂在 [`crate::model::DutConfig`]（duts.json `heartbeat` 段，缺段 = 关闭）。
-//! - 状态由运行时（desktop 心跳引擎）维护：`last_ok=None` 表示尚未探测，
-//!   不与「探测失败」混淆（避免首次渲染就红徽标）。
-//! - [`extract_sysinfo`] 是纯函数：从响应原文提取 uptime/mem/cpu/hostname，
-//!   提不出就留空（不伪造）。
+//! - Configuration lives on [`crate::model::DutConfig`] (`duts.json` `heartbeat` section; absent =
+//!   disabled).
+//! - Runtime state is maintained by the desktop heartbeat engine: `last_ok=None` means not yet
+//!   probed, distinct from probe failure (avoids showing a red badge on initial render).
+//! - [`extract_sysinfo`] is a pure function that parses uptime/mem/cpu/hostname from raw response
+//!   text and leaves unextracted fields as `None` without fabricating values.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +13,8 @@ pub const DEFAULT_INTERVAL_SECS: u32 = 30;
 pub const DEFAULT_LOSS_THRESHOLD: u32 = 3;
 pub const DEFAULT_COMMAND: &str = "uname -a";
 
-/// 心跳配置（duts.json `heartbeat` 段；Agent 可经 `heartbeat.set` 改写命令与间隔）。
+/// Heartbeat configuration (`duts.json` `heartbeat` section; agents may update command and
+/// interval via `heartbeat.set`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HeartbeatConfig {
@@ -23,7 +25,7 @@ pub struct HeartbeatConfig {
     pub expected_response: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused_until_unix_ms: Option<u64>,
-    /// 连续多少次无响应判定丢联（发 `AlertEvent`）。
+    /// Number of consecutive missed probes before reporting connection loss (emits `AlertEvent`).
     pub loss_threshold: u32,
 }
 
@@ -41,13 +43,14 @@ impl Default for HeartbeatConfig {
 }
 
 impl HeartbeatConfig {
-    /// 与默认完全一致时序列化省略整段（保持旧 duts.json 形状）。
+    /// Skip serializing the entire section when it matches the default (preserves legacy
+    /// `duts.json` shape).
     #[must_use]
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
 
-    /// 间隔下限保护（1 秒）：0 会让 tick 每帧狂发命令。
+    /// Lower-bound interval guard (1 second): `0` would send commands on every tick.
     #[must_use]
     pub fn normalized_interval(&self) -> u32 {
         self.interval_secs.clamp(1, 86_400)
@@ -60,7 +63,7 @@ impl HeartbeatConfig {
     }
 }
 
-/// 系统信息（启发式提取结果；提不出的字段为 None，不伪造）。
+/// System info extracted heuristically from heartbeat output; missing fields stay `None`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SysInfo {
@@ -70,7 +73,7 @@ pub struct SysInfo {
     pub hostname: Option<String>,
 }
 
-/// 心跳状态（需求⑦字段命名）：`last_ok=None` 尚未探测。
+/// Heartbeat runtime state: `last_ok=None` indicates no probe has completed yet.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HeartbeatState {
@@ -79,13 +82,14 @@ pub struct HeartbeatState {
     pub loss_count: u32,
     pub last_response: String,
     pub sysinfo: SysInfo,
-    /// 探测因 Busy/Lease 被暂缓（P2-036：Agent 持租约期活性盲区标记；
-    /// 成功探测或收到其他错误时清除）。false 为默认，序列化时省略。
+    /// Probes are deferred due to a busy lease (liveness blind-spot marker while an Agent holds
+    /// the lease; cleared on a successful probe or another error). Defaults to `false` and is
+    /// omitted when serializing.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub paused_by_lease: bool,
 }
 
-/// 丢联告警事件（供弹窗阶段消费；当前先入队列由 UI drain 成 toast）。
+/// Heartbeat loss alert event queued for UI consumption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatAlert {
@@ -95,7 +99,8 @@ pub struct HeartbeatAlert {
     pub at_unix_ms: u64,
 }
 
-/// 判定一行是否为「设备响应」（排除本机回显/驱动信令/分段标记）。
+/// Return whether a line represents device output (excluding local TX echoes, driver notices, and
+/// segment markers).
 #[must_use]
 pub fn is_response_line(text: &str) -> bool {
     !text.is_empty()
@@ -104,7 +109,7 @@ pub fn is_response_line(text: &str) -> bool {
         && !text.starts_with("[mark] ")
 }
 
-/// 常见架构 token（uname -m / uname -a 输出）。
+/// Common architecture tokens from `uname -m` / `uname -a`.
 const ARCH_TOKENS: [&str; 9] = [
     "aarch64",
     "armv7l",
@@ -117,7 +122,8 @@ const ARCH_TOKENS: [&str; 9] = [
     "s390x",
 ];
 
-/// 从响应原文提取 uptime/mem/cpu/hostname（启发式，提不出留 None）。
+/// Heuristically extract uptime/mem/cpu/hostname from raw response text; missing fields stay
+/// `None`.
 pub fn extract_sysinfo(text: &str) -> SysInfo {
     let mut info = SysInfo::default();
     for raw in text.lines() {
@@ -125,10 +131,10 @@ pub fn extract_sysinfo(text: &str) -> SysInfo {
         if line.is_empty() {
             continue;
         }
-        // uptime：` 14:32:01 up 4 days,  2:03,  2 users, load average: …`
+        // uptime: ` 14:32:01 up 4 days,  2:03,  2 users, load average: ...`
         if info.uptime.is_none() && line.contains(" up ") {
             let rest = line.rsplit(" up ").next().unwrap_or("").trim();
-            // 截掉 load average 段，再去掉结尾的 users 计数段（`, 2 users` / `, 1 user`）
+            // Strip the `load average` suffix, then remove trailing user counts (`, 2 users` / `, 1 user`).
             let mut seg = rest
                 .split_once("load average")
                 .map_or(rest, |(head, _)| head)
@@ -137,7 +143,7 @@ pub fn extract_sysinfo(text: &str) -> SysInfo {
             if let Some(pos) = seg.rfind(" user") {
                 let tail = &seg[pos + " user".len()..];
                 if tail == "s" || tail == "s," || tail == "," || tail.is_empty() {
-                    // 同时剥掉计数数字：`, 2 users` → `,`
+                    // Also strip the leading user count digits: `, 2 users` -> `,`.
                     let head = seg[..pos]
                         .trim_end()
                         .trim_end_matches(|c: char| c.is_ascii_digit())
@@ -151,14 +157,14 @@ pub fn extract_sysinfo(text: &str) -> SysInfo {
                 info.uptime = Some(seg);
             }
         }
-        // uptime：/proc/uptime 形态（1–2 个浮点数单独成行）
+        // uptime: `/proc/uptime` format (1-2 floating-point numbers on their own line).
         if info.uptime.is_none() && looks_like_proc_uptime(line) {
             info.uptime = Some(format!(
                 "{} s",
                 line.split_whitespace().next().unwrap_or(line)
             ));
         }
-        // mem：free 输出 `Mem:` 行 或 /proc/meminfo `MemTotal:` 行
+        // mem: `free` output `Mem:` line or `/proc/meminfo` `MemTotal:` line.
         if info.mem.is_none() {
             if let Some(rest) = line.strip_prefix("Mem:") {
                 info.mem = Some(format!("Mem: {}", rest.trim()));
@@ -166,7 +172,7 @@ pub fn extract_sysinfo(text: &str) -> SysInfo {
                 info.mem = Some(format!("MemTotal: {}", rest.trim()));
             }
         }
-        // cpu：uname 架构 token 或 `model name : …`
+        // cpu: `uname` architecture token or `model name : ...`.
         if info.cpu.is_none() {
             if let Some(rest) = line.split_once("model name") {
                 info.cpu = rest
@@ -184,7 +190,7 @@ pub fn extract_sysinfo(text: &str) -> SysInfo {
                 }
             }
         }
-        // hostname：提示符 `root@rk3576:~#` 或 uname `Linux rk3576 …`
+        // hostname: shell prompt `root@rk3576:~#` or `uname` `Linux rk3576 ...`.
         if info.hostname.is_none() {
             if let Some((user, host_and_path)) = line.split_once('@')
                 && let Some((host, _)) = host_and_path.split_once(':')
@@ -210,7 +216,7 @@ pub fn extract_sysinfo(text: &str) -> SysInfo {
     info
 }
 
-/// 连续空白折叠为单空格（uptime 输出 `4 days,  2:03` → `4 days, 2:03`）。
+/// Collapse runs of spaces/tabs into a single space (`4 days,  2:03` -> `4 days, 2:03`).
 fn collapse_spaces(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
@@ -225,7 +231,7 @@ fn collapse_spaces(text: &str) -> String {
     out.trim().to_string()
 }
 
-/// `/proc/uptime` 形态：1–2 个浮点数构成的独立行。
+/// Match `/proc/uptime` format: 1-2 floating-point numbers on their own line.
 fn looks_like_proc_uptime(line: &str) -> bool {
     let mut tokens = line.split_whitespace();
     let first_ok = tokens
@@ -291,7 +297,7 @@ mod tests {
     fn extract_proc_uptime_line() {
         let info = extract_sysinfo("381948.23 1514820.91");
         assert_eq!(info.uptime.as_deref(), Some("381948.23 s"));
-        // 负数/非数字/多列不算
+        // Negative, non-numeric, or extra columns do not match.
         assert_eq!(extract_sysinfo("-1 2").uptime, None);
         assert_eq!(extract_sysinfo("abc 2").uptime, None);
         assert_eq!(extract_sysinfo("1 2 3").uptime, None);
@@ -315,7 +321,7 @@ mod tests {
         assert_eq!(back.interval_secs, 5);
         assert_eq!(back.loss_threshold, 2);
         assert!(!back.is_default());
-        // 旧文件缺字段 → 默认补齐
+        // Legacy files missing fields deserialize to defaults.
         let legacy: HeartbeatConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(legacy, HeartbeatConfig::default());
         assert_eq!(legacy.normalized_interval(), 30);

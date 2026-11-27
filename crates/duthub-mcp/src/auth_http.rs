@@ -1,21 +1,21 @@
-//! HTTP Bearer 认证服务包装 + MCP 层租约/授权辅助（`docs/SECURITY.md`）。
+//! Bearer authentication and the MCP authorization context.
 //!
-//! - 每请求读 `Authorization: Bearer <token>`（禁止 query 参数，SPEC §5.1.4）；
-//!   auth 开启：指纹定位候选 → `subtle` 常量时间比较 → `Principal::Agent` 注入
-//!   request extensions；未超限的失败统一 `401 {"error":"unauthorized"}`
-//!   （不泄露「token 是否存在/属于哪个 agent」）+ 审计 auth.fail（无 token 内容）。
-//! - 同一监听器在滑动窗口内失败超过 [`AUTH_FAILURE_LIMIT`] 后统一 `429`
-//!   （`Retry-After: 60`），且只记一条聚合 auth.fail（防 LAN 暴力猜 token）。
-//! - auth 关闭时 HTTP 返回 401，无法通过回环地址获得本机管理员权限；
-//!   写工具的租约要求仍由 device 写入通道 + server 层复核（GUI 优先无条件生效）。
-//! - stdio 无 HTTP parts：[`CurrentPrincipal`] 提取器回退 `LocalAdmin`（偏差 5）；
-//!   带认证上下文的服务器（HTTP）缺少 Parts 时 fail closed（401），不再误回退。
-//! - Principal 不从工具参数取（SPEC §7）：全部来自本服务注入。
+//! Read the bearer token from the authorization header.
+//! Use its fingerprint to locate a candidate, then verify it in constant time.
+//! Attach the authenticated Agent principal to the request extensions.
+//! Return the same unauthorized response for every failure and audit without token contents.
+//! Apply the authentication failure limit per listener and time window.
+//! Rate-limited requests receive 429 with a retry delay and share an aggregate audit event.
+//! HTTP requests without authentication never acquire local administrator privileges.
+//! The tool handler and device admission still enforce grants and leases.
+//! Stdio requests have no HTTP parts and use the local administrator principal.
+//! An HTTP request without the expected parts is denied.
+//! Tools get the principal from the server, never from tool arguments.
 //!
-//! 实现注：auth 层是手写 tower `Service` 包装（而非 `axum::middleware::from_fn`）——
-//! `from_fn` 的提取器元组推断在本工作区 rmcp+axum 组合下不收敛（tokio/axum 0.8.9
-//! 最小复现通过、接入 rmcp 路由后 Service 绑定不满足），手写实现完全确定且
-//! 不引入额外依赖形态。
+//! Wrap the router with a Tower service.
+//! The middleware function's inferred extractor types did not compose with the rmcp service.
+//! The service wrapper makes the request context explicit.
+//!
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -38,8 +38,8 @@ use rmcp::handler::server::tool::ToolCallContext;
 
 use crate::server::McpServerCore;
 
-/// MCP 层共享的接入上下文：认证运行时 + 租约管理器 + 审计（desktop 构造注入，
-/// 测试可全内存构造）。server.rs 与 auth 服务共用同一实例（复核口径一致）。
+/// Shared authentication, lease, and audit context used by middleware and tool handlers.
+/// Tests can supply in-memory implementations.
 #[derive(Clone)]
 pub struct AccessContext {
     pub auth: Arc<AgentAccessRuntime>,
@@ -109,7 +109,7 @@ impl std::fmt::Debug for AuthFailureLimiter {
             .field("window", &self.window)
             .field("max_sources", &self.max_sources)
             .field("tracked_sources", &self.tracked_sources())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -247,10 +247,10 @@ impl AuthFailureLimiter {
     }
 }
 
-/// Bearer 认证服务包装：包住 axum Route（/mcp 端点），认证通过时把
-/// [`Principal`] 注入 request extensions——rmcp `StreamableHttpService` 会把整个
-/// `http::request::Parts`（含 extensions）透传进工具调用上下文
-/// （tower.rs 注入，方案 §1.2 已验证），工具经 [`CurrentPrincipal`] 取回。
+/// Wrap a Streamable HTTP route with bearer authentication.
+/// Put the verified principal in the request extensions.
+/// The transport forwards the request parts into the tool request context.
+/// Tools retrieve the principal with `CurrentPrincipal`.
 #[derive(Clone)]
 pub struct AuthSvc<S> {
     ctx: AccessContext,
@@ -314,7 +314,11 @@ where
         let mut inner = self.inner.clone();
         let source_key = req
             .extensions()
-            .get::<ConnectInfo<SocketAddr>>().map_or_else(|| DEFAULT_AUTH_SOURCE.to_owned(), |ConnectInfo(addr)| addr.ip().to_string());
+            .get::<ConnectInfo<SocketAddr>>()
+            .map_or_else(
+                || DEFAULT_AUTH_SOURCE.to_owned(),
+                |ConnectInfo(addr)| addr.ip().to_string(),
+            );
         Box::pin(async move {
             // Reject before touching credentials while this source's window is
             // exhausted: brute-force traffic from one peer cannot keep probing
@@ -323,8 +327,8 @@ where
                 return Ok(rate_limited_response());
             }
             let bearer = bearer_token(req.headers());
-            // 每会话监听器（runtime overlay）走 internal 认证：只查 overlay，
-            // 不受持久 auth 总开关影响；其余监听器维持持久表语义。
+            // Internal session listeners authenticate against the runtime overlay.
+            // Other listeners use persistent credentials and their authentication settings.
             let internal = listener_id
                 .as_deref()
                 .is_some_and(|id| ctx.auth.is_runtime_listener(id));
@@ -345,11 +349,14 @@ where
                         );
                     }
                     req.extensions_mut().insert(principal);
-                    inner.call(req).await.map(axum::response::IntoResponse::into_response)
+                    inner
+                        .call(req)
+                        .await
+                        .map(axum::response::IntoResponse::into_response)
                 }
                 Err(err) => {
-                    // 失败细节只进审计（脱敏），响应统一 401 不区分原因（SPEC §5.1.6）。
-                    // 超过失败预算后只记一条聚合事件，后续失败不再逐条落审计。
+                    // Log the redacted failure reason and return a generic 401.
+                    // After the failure limit, log a single aggregate event.
                     let decision = failures.record_failure_for(&source_key);
                     match decision {
                         AuthFailureDecision::Audit => {
@@ -389,7 +396,7 @@ where
     }
 }
 
-/// 401 统一响应体：固定 `{"error":"unauthorized"}`（无任何原因区分）。
+/// Use a uniform unauthorized response regardless of the reason.
 pub(crate) fn unauthorized_response() -> Response {
     (
         axum::http::StatusCode::UNAUTHORIZED,
@@ -417,7 +424,7 @@ fn auth_fail_detail(err: &AuthError) -> String {
     }
 }
 
-/// 提取 `Authorization: Bearer <token>`（仅 header，禁止 query 参数）。
+/// Extract a bearer token from the authorization header only.
 fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     let value = headers
         .get(axum::http::header::AUTHORIZATION)?
@@ -430,8 +437,8 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-/// 工具调用上下文中的当前主体：HTTP 请求经 `AuthSvc` 注入；stdio（无 HTTP parts）
-/// 回退 LocalAdmin（偏差 5）。rmcp `#[tool]` 参数提取器。
+/// Get the principal injected into the HTTP tool context.
+/// Local stdio requests use the local administrator principal.
 #[derive(Debug)]
 pub struct CurrentPrincipal(pub Principal);
 
@@ -468,8 +475,8 @@ impl FromContextPart<ToolCallContext<'_, McpServerCore>> for CurrentPrincipal {
     }
 }
 
-/// 服务端确认的租约持有者（SPEC §7：不接受客户端自报身份）。
-/// LocalAdmin（auth 关/stdio）以稳定占位凭据持有租约——句柄即权限（SPEC §6.3）。
+/// Build the lease identity from the server-verified principal.
+/// Local administrator leases use a stable identity.
 #[must_use]
 pub fn holder_for(principal: &Principal) -> LeaseHolder {
     match principal {
@@ -487,8 +494,8 @@ pub fn holder_for(principal: &Principal) -> LeaseHolder {
     }
 }
 
-/// 租约错误 → MCP 错误码（`LeaseRequired/{code}` 前缀约定，方案 §6.2；
-/// 与既有 `ApprovalRequired/{code}` 同型）。
+/// Map lease errors to the machine-readable MCP error codes.
+/// Approval errors use the same prefix-plus-code convention.
 #[must_use]
 pub fn lease_error_code(err: &LeaseError) -> &'static str {
     match err {
@@ -507,7 +514,7 @@ pub fn lease_error_code(err: &LeaseError) -> &'static str {
     }
 }
 
-/// 租约错误 → isError 工具结果（客户端可按前缀+码解析）。
+/// Report a lease failure as a tool error with its stable code.
 #[must_use]
 pub fn lease_error(err: &LeaseError) -> rmcp::ErrorData {
     rmcp::ErrorData::new(
@@ -517,7 +524,7 @@ pub fn lease_error(err: &LeaseError) -> rmcp::ErrorData {
     )
 }
 
-/// 授权拒绝 → `LeaseRequired/UNAUTHORIZED`（SPEC §6.4：业务互斥不伪装 401）。
+/// Report denied authorization as a tool error rather than a transport-level 401.
 #[must_use]
 pub fn unauthorized_error(dut_id: &str, action: &str) -> rmcp::ErrorData {
     rmcp::ErrorData::new(
@@ -558,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn auth_off_denies_even_with_a_previously_configured_bearer() {
         let ctx = ctx(false, "dth-nope");
-        // 探针必须打在 AuthSvc 保护的路由上（而非旁路直连 handler）
+        // Send the probe through the authenticated route rather than calling the handler directly.
         let router = axum::Router::new().route_service(
             "/probe",
             AuthSvc::new(
@@ -566,7 +573,7 @@ mod tests {
                 axum::routing::post(|req: Request<Body>| async move {
                     assert!(
                         req.extensions().get::<Principal>().is_some(),
-                        "AuthSvc 必须注入 Principal"
+                        "AuthSvc must inject Principal"
                     );
                     "ok"
                 }),
@@ -574,7 +581,7 @@ mod tests {
         );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        // tokio from_std 要求非阻塞（阻塞模式会卡死 current_thread runtime）
+        // Use a nonblocking socket for the Tokio listener.
         listener.set_nonblocking(true).unwrap();
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -599,7 +606,7 @@ mod tests {
                     let p = req.extensions().get::<Principal>().cloned();
                     assert!(
                         matches!(p, Some(Principal::Agent { .. })),
-                        "认证通过必须注入 Agent 主体"
+                        "successful auth must inject an Agent principal"
                     );
                     "ok"
                 }),
@@ -612,7 +619,7 @@ mod tests {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             axum::serve(listener, router).await.unwrap();
         });
-        // 无 Bearer / 错 Bearer → 统一 401 + 固定 body；正确 Bearer → 200 + Agent 主体
+        // Missing and invalid tokens must produce the same 401. A valid token exposes its Agent identity.
         let resp = send_probe(addr, None).await;
         assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
         assert!(resp.contains("{\"error\":\"unauthorized\"}"), "{resp}");
@@ -620,15 +627,18 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
         let resp = send_probe(addr, Some(&good)).await;
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-        // 失败审计 auth.fail ×2（无 token 内容）
+        // Count both failures without recording either token.
         let fails = audit
             .recent(50)
             .iter()
             .filter(|e| e.action == "auth.fail")
             .count();
-        assert_eq!(fails, 2, "两次失败都落审计");
+        assert_eq!(fails, 2, "both auth failures must be audited");
         let raw_events = format!("{:?}", audit.recent(50));
-        assert!(!raw_events.contains("dth-wrong"), "token 不得落审计");
+        assert!(
+            !raw_events.contains("dth-wrong"),
+            "token must not appear in audit records"
+        );
     }
 
     async fn send_probe(addr: std::net::SocketAddr, auth: Option<&str>) -> String {
@@ -636,7 +646,7 @@ mod tests {
         let mut stream =
             tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
                 .await
-                .expect("连接超时")
+                .expect("connect timeout")
                 .unwrap();
         let auth_line = match auth {
             Some(t) => format!("Authorization: Bearer {t}\r\n"),

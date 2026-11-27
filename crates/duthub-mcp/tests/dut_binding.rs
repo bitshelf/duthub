@@ -1,9 +1,10 @@
-//! DUT 专用监听器的跨 DUT 行为回归（W1 / T19）：
-//! 13 个 Plan 工具在 `listener_dut = Some("dut-a")` 下只允许 dut-a；
-//! `dut_list`/`adb_list_devices` 只返回绑定 DUT 的记录；`dut_files` 省略
-//! `dutId` 时默认绑定 DUT；`skill_export` 不泄露其他 DUT。
+//! Cross-DUT regression for DUT-dedicated listeners (W1 / T19):
+//! the 10 Plan tools under `listener_dut = Some("dut-a")` only allow `dut-a`;
+//! `dut_list` and `adb_list_devices` only return the bound DUT; `dut_files` defaults
+//! to the bound DUT when `dutId` is omitted; `skill_export` never leaks other DUTs.
 //!
-//! 走真实 HTTP 路由（AuthSvc + rmcp 客户端），而不是直接调私有工具方法。
+//! Exercises the real HTTP route (`AuthSvc` + `rmcp` client) rather than calling
+//! private tool methods directly.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -229,6 +230,9 @@ impl McpState for FixtureState {
             dut_id: dut_id.into(),
             state: "free".into(),
             holder: None,
+            session_name: None,
+            acquired_at_unix_ms: None,
+            occupied_secs: None,
             remaining_secs: None,
             generation: 0,
             queue_len: 0,
@@ -348,18 +352,18 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
     let token = duthub_core::agent_access::generate_token();
     let (client, task) = connect("dut-a-mcp", "dut-a", &token).await;
 
-    // 13 个 Plan 工具全部可见。
+    // All 10 Plan tools are visible.
     let tools = client.list_all_tools().await.expect("list tools");
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     for expected in PLAN_TOOLS {
         assert!(
             names.contains(&expected),
-            "缺少 Plan 工具 {expected}: {names:?}"
+            "missing Plan tool {expected}: {names:?}"
         );
     }
     assert!(
         !names.contains(&"relay_status"),
-        "relay_status 不在 Plan 路由（只读但计划模式不暴露）"
+        "relay_status must not be on the Plan route (read-only but hidden in plan mode)"
     );
 
     // Cross-DUT reads must all return LeaseRequired/UNAUTHORIZED.
@@ -381,10 +385,10 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
     for (tool, arguments) in cross_dut_calls {
         let error = call(&client, tool, arguments)
             .await
-            .expect_err(&format!("{tool} 跨 DUT 必须拒绝"));
+            .expect_err(&format!("{tool} must reject cross-DUT access"));
         assert!(
             error.contains("UNAUTHORIZED"),
-            "{tool} 跨 DUT 拒绝文案: {error}"
+            "{tool} cross-DUT rejection message: {error}"
         );
     }
 
@@ -409,7 +413,7 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
         .expect("media_streams dut-a");
     assert_eq!(data["streams"], json!({}));
 
-    // log_segments / log_segment_read：绑定 DUT 可读。
+    // log_segments / log_segment_read: readable for the bound DUT.
     let data = call(&client, "log_segments", json!({"dutId": "dut-a"}))
         .await
         .expect("log_segments dut-a");
@@ -425,7 +429,7 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
     .expect("log_segment_read dut-a");
     assert_eq!(data["text"], "[mark] boot\nalpha log\n");
 
-    // dut_files：省略 dutId 时默认绑定 DUT，只列出 dut-a 的文件。
+    // dut_files: omitting dutId defaults to the bound DUT and lists only dut-a files.
     let data = call(&client, "dut_files", json!({}))
         .await
         .expect("dut_files default bound dut");
@@ -445,7 +449,7 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
     .expect("dut_file_read dut-a");
     assert_eq!(data["base64"], "YWxwaGE=");
 
-    // dut_list / adb_list_devices / skill_export 只暴露绑定 DUT。
+    // dut_list / adb_list_devices / skill_export expose only the bound DUT.
     let data = call(&client, "dut_list", json!({}))
         .await
         .expect("dut_list");
@@ -465,12 +469,15 @@ async fn dut_bound_listener_scopes_all_plan_tools_to_its_dut() {
         .expect("skill_export");
     let markdown = data["markdown"].as_str().unwrap();
     assert!(markdown.contains("仅可读 DUT `dut-a`"), "{markdown}");
-    assert!(!markdown.contains("dut-b"), "SKILL 不得提到其他 DUT");
+    assert!(
+        !markdown.contains("dut-b"),
+        "SKILL must not mention other DUTs"
+    );
 
-    // relay_status 不在 Plan 路由：计划模式直接拒绝。
+    // relay_status is not on the Plan route: plan mode rejects it immediately.
     let error = call(&client, "relay_status", json!({"dutId": "dut-b"}))
         .await
-        .expect_err("relay_status 不在 Plan 路由");
+        .expect_err("relay_status must not be on the Plan route");
     assert!(error.contains("PLAN_MODE_ONLY"), "{error}");
 
     client.cancel().await.ok();

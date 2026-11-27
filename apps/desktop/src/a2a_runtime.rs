@@ -1,14 +1,13 @@
-//! 桌面端 A2A 运行时包装（W4a）。
+//! Desktop A2A runtime packaging (W4a).
 //!
-//! - 把 `duthub_a2a::A2aRuntime` 的 async API 驱动在专属 tokio 运行时上，
-//!   GUI 线程全部走同步入口（`block_on`）；监听任务常驻 worker 线程。
-//! - 启动时把 MCP 侧端口（`agentAccess.httpPort` + `listeners[].port`）以
-//!   External 身份预登记进 PortRegistry，A2A 绝不抢占；每 DUT 自身的
-//!   `a2a.port` 由运行时自行 reserve（预登记反而会让自己的 bind 被拒）。
-//! - `reserved_ports`（MCP + 全部已启用 DUT A2A 端口的合集）用于保存/启用
-//!   时的冲突检测（`agent_ui::validate_a2a_port`）。
-//! - 任何失败（驱动构建失败/启动失败）都降级为状态可见，绝不 panic——
-//!   Workbench 必须能在 A2A 不可用时照常启动。
+//! The desktop calls the asynchronous `duthub_a2a::A2aRuntime` through synchronous `block_on` entry
+//! points. Listeners run on a dedicated Tokio runtime.
+//! Register MCP ports from `agentAccess.httpPort` and `listeners[].port` as external reservations
+//! before startup. A2A reserves each DUT's `a2a.port` itself when it binds.
+//! Use `reserved_ports` and `agent_ui::validate_a2a_port` to check for conflicts before saving or
+//! enabling a listener.
+//! Report runtime construction or listener startup errors as status so the workbench can still
+//! start.
 
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +18,7 @@ use duthub_mcp::state::McpState;
 use crate::data::DutsState;
 use duthub_desktop::agent_ui;
 
-/// 已启用 A2A 的 DUT → 监听器配置（顺序与 duts.json 一致）。
+/// Build listener configurations for A2A-enabled DUTs in the order they appear in `duts.json`.
 fn start_configs(duts: &DutsState) -> Vec<A2aDutConfig> {
     duts.file
         .duts
@@ -34,18 +33,19 @@ fn start_configs(duts: &DutsState) -> Vec<A2aDutConfig> {
         .collect()
 }
 
-/// MCP 侧端口（交给 `A2aRuntime` 预登记为 External：A2A 不绑定这些端口）。
-/// 注意：已启用 DUT 自身的 a2a 端口不在此列——PortRegistry 会对任何已有
-/// 持有者拒绝 reserve，预登记会让运行时拒绝绑定自己的端口。
+/// MCP side ports are managed by `A2aRuntime`. These ports are registered as "External": A2A does
+/// not bind these ports.
+/// Note: Ports that have been configured for use by the DUT itself are not included in this list.
+/// `PortRegistry` will refuse to reserve such ports, and registration will prevent the runtime from
+/// binding these ports to itself.
 fn reserved_mcp_ports(settings: &SettingsFile) -> Vec<u16> {
     let mut reserved = vec![settings.agent_access.http_port];
     reserved.extend(settings.agent_access.listeners.iter().map(|l| l.port));
     reserved
 }
 
-/// 冲突检测合集（W4a）：MCP HTTP 端口 + listeners[].port + 全部已启用
-/// DUT 的 a2a.port（去重保序）。保存/启用 A2A 端口前经
-/// `agent_ui::validate_a2a_port` 校验。
+/// Collect the MCP HTTP port, all `listeners[].port` values, and enabled DUT `a2a.port` values.
+/// Deduplicate them in order. Validate proposed A2A ports with `agent_ui::validate_a2a_port`.
 pub fn combined_reserved_ports(settings: &SettingsFile, duts: &DutsState) -> Vec<u16> {
     agent_ui::reserved_ports_from(
         settings,

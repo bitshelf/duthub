@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Openai,
+    #[serde(rename = "openai_responses")]
+    OpenaiResponses,
     Anthropic,
     Gemini,
     Deepseek,
@@ -22,8 +24,9 @@ impl Provider {
     pub fn from_setting(value: &str) -> Option<Provider> {
         match value {
             "openai" => Some(Provider::Openai),
+            "openai_responses" | "openaiResponses" => Some(Provider::OpenaiResponses),
             "anthropic" => Some(Provider::Anthropic),
-            "google" => Some(Provider::Gemini),
+            "google" | "gemini" => Some(Provider::Gemini),
             "deepseek" => Some(Provider::Deepseek),
             "qwen" => Some(Provider::Qwen),
             "compatible" => Some(Provider::Compatible),
@@ -35,6 +38,7 @@ impl Provider {
     pub fn label(self) -> &'static str {
         match self {
             Provider::Openai => "OpenAI",
+            Provider::OpenaiResponses => "OpenAI Responses",
             Provider::Anthropic => "Anthropic",
             Provider::Gemini => "Google Gemini",
             Provider::Deepseek => "DeepSeek",
@@ -47,7 +51,7 @@ impl Provider {
     #[must_use]
     pub const fn default_base(self) -> &'static str {
         match self {
-            Provider::Openai => "https://api.openai.com/v1",
+            Provider::Openai | Provider::OpenaiResponses => "https://api.openai.com/v1",
             Provider::Anthropic => "https://api.anthropic.com",
             Provider::Gemini => "https://generativelanguage.googleapis.com/v1beta",
             Provider::Deepseek => "https://api.deepseek.com",

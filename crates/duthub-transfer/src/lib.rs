@@ -109,6 +109,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// Server assembly failures.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TransferError {
     /// Filesystem or socket problem while setting up the listener.
     #[error("transfer io error: {0}")]

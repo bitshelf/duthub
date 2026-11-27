@@ -6,7 +6,7 @@
 //!   explicitly configured external program (`program + expectedSha256`, see
 //!   [`resolve_external`]) → downloaded install (`<config>/tools/goose/`, through
 //!   `duthub_desktop::tool_resolver`) → bare `goose` on PATH.
-//! - Nothing is embedded any more (2026-11-24): goose is installed from the
+//! - Nothing is embedded any more: goose is installed from the
 //!   tool-downloads page like adb/ffmpeg. When no candidate is usable the launch
 //!   fails with [`RegistryError::NotInstalled`] instead of unwrapping, and
 //!   [`goose_install_state`] is the public status the Agent page renders
@@ -67,7 +67,8 @@ impl std::fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
-/// 一次启动实际使用的规格（`Debug` 不输出环境变量的值）。
+/// The specifications actually used during startup (`Debug` mode does not display the values of
+/// environment variables).
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentLaunchSpec {
     pub agent_id: String,
@@ -75,13 +76,14 @@ pub struct AgentLaunchSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// Legacy flag: duthub no longer embeds a goose build (2026-11-24), so
+    /// Legacy flag: duthub no longer embeds a goose build, so
     /// product paths always record `false`. Kept because the spec is public and
     /// the UI badge projection still reads it.
     pub embedded: bool,
     pub sha256: String,
     pub version: Option<String>,
-    /// 当前只记录 manifest/文件事实，不做签名链验证；外部程序一律 `NotSigned`。
+    /// Currently, only the facts related to manifests/files are recorded. Signature chain
+    /// verification is not performed. All external programs are marked as `"NotSigned"`.
     pub signature: String,
 }
 
@@ -118,7 +120,7 @@ impl AgentLaunchSpec {
     }
 }
 
-/// UI 探测结果：外部路径的 SHA-256 / 版本 / 签名状态。
+/// UI Detection Results: SHA-256 hash value, version, and signature status of the external path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramProbe {
     pub path: PathBuf,
@@ -128,7 +130,8 @@ pub struct ProgramProbe {
     pub normalized_version: Option<(u64, u64, u64)>,
 }
 
-/// 同步校验定义是否允许启动（不做磁盘 I/O）；CLI 在此明确拒绝。
+/// Determines whether synchronization verification is allowed to be initiated (without performing
+/// any disk I/O operations). The CLI explicitly rejects this option.
 pub fn ensure_launchable(definition: &AgentDefinition) -> Result<(), RegistryError> {
     if !definition.enabled {
         return Err(RegistryError::Disabled(definition.id.clone()));
@@ -139,7 +142,8 @@ pub fn ensure_launchable(definition: &AgentDefinition) -> Result<(), RegistryErr
     }
 }
 
-/// 解析定义到启动规格；外部程序哈希/版本在这里 fail closed。
+/// Parsing the definition to the startup specifications; external program hashes/versions fail to
+/// be closed here.
 pub fn resolve(
     work_dir: &Path,
     definition: &AgentDefinition,
@@ -480,10 +484,12 @@ fn verify_downloaded_goose(
     Ok(Some((path.to_path_buf(), actual, line)))
 }
 
-/// 外部路径探测（UI「校验并保存」）：完整 SHA-256 + goose 版本 + 未签名状态。
+/// External path verification (UI "Verify and Save"): Complete SHA-256 hash value, along with the
+/// goose version number and unsigned status.
 ///
-/// 非 goose ACP 程序不要求 `--version` 的输出格式，因此只计算哈希；goose 必须
-/// 通过 >= [`MIN_GOOSE_VERSION`] 的版本门槛。
+/// The non-goose ACP program does not require the `--version` output format. Therefore, it only
+/// calculates the hash value. Goose must be running on a version that meets the requirement of >=
+/// [`MIN_GOOSE_VERSION`).
 pub fn probe_program(path: &Path, goose: bool) -> Result<ProgramProbe, RegistryError> {
     let raw = path.to_string_lossy();
     ensure_absolute_program(&raw)?;
@@ -526,7 +532,8 @@ pub fn ensure_goose_version(line: &str) -> Result<(), RegistryError> {
     )))
 }
 
-/// 比较版本：解析文本中第一个 `major.minor.patch`，按数值比较。
+/// Comparison version: Parses the first `major.minor.patch` value in the text, and compares them
+/// based on numerical values.
 #[must_use]
 pub fn version_at_least(actual: &str, minimum: &str) -> bool {
     match (parse_version(actual), parse_version(minimum)) {
@@ -535,7 +542,7 @@ pub fn version_at_least(actual: &str, minimum: &str) -> bool {
     }
 }
 
-/// 解析 `goose-acp 1.60.2` / `goose-acp v1.61.0-rc.1` 中的三段版本号。
+/// Analyzing the version numbers in `goose-acp 1.60.2` and `goose-acp v1.61.0-rc.1`.
 #[must_use]
 pub fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
     for token in text.split(|character: char| {
@@ -614,7 +621,7 @@ mod tests {
         #[cfg(windows)]
         assert!(
             !is_absolute_program("/usr/bin/acme"),
-            "Windows 上不带盘符的根路径不是合法绝对程序路径"
+            "The root path on Windows that does not contain a drive letter is not a valid absolute program path."
         );
         for relative in [
             "acme.exe",
@@ -693,7 +700,7 @@ mod tests {
         assert_eq!(
             args("C:/tools/goose/goose.exe", &["acp", "--verbose"]),
             ["acp", "--verbose"],
-            "显式配置的 args 必须原样保留"
+            "The explicitly configured args must be preserved as they are."
         );
     }
 
@@ -704,22 +711,26 @@ mod tests {
     #[test]
     fn builtin_goose_from_path_uses_the_acp_subcommand() {
         let Some(program) = std::env::var_os("DUTHUB_TEST_GOOSE").map(PathBuf::from) else {
-            eprintln!("SKIP: DUTHUB_TEST_GOOSE 未设置；本机没有可用的 goose 可执行文件");
+            eprintln!("SKIP: DUTHUB_TEST_GOOSE is unset and no goose executable is available");
             return;
         };
         if !program.is_file() {
-            eprintln!("SKIP: {} 不是文件", program.display());
+            eprintln!("SKIP: {} is not a file", program.display());
             return;
         }
         let definition = AgentDefinition::goose();
         let spec = resolve_builtin_from(&definition, Vec::new(), None, Some(program))
-            .expect("真实 goose 必须能解析");
-        assert_eq!(spec.args, ["acp"], "goose.exe 必须以 acp 子命令启动");
+            .expect("The real goose must be able to parse it properly.");
+        assert_eq!(
+            spec.args,
+            ["acp"],
+            "The goose.exe program must be launched using the acp command."
+        );
         assert!(
             spec.version
                 .as_deref()
                 .is_some_and(|line| !line.trim().is_empty()),
-            "版本探测必须拿到 goose 版本行: {:?}",
+            "The version information must be obtained using the goose method. Please provide the specific version number: {:?}",
             spec.version
         );
     }
@@ -728,7 +739,8 @@ mod tests {
     /// looks for: id `goose`, one executable named `goose.exe`.
     #[test]
     fn tooldown_spec_matches_the_goose_install_layout() {
-        let spec = duthub_tooldown::spec_by_id(GOOSE_TOOL_ID).expect("goose 必须在工具下载表中");
+        let spec = duthub_tooldown::spec_by_id(GOOSE_TOOL_ID)
+            .expect("Goose must be listed in the tool download list.");
         assert_eq!(spec.id, GOOSE_TOOL_ID);
         assert_eq!(
             spec.entries
@@ -737,11 +749,11 @@ mod tests {
                 .map(|entry| entry.file_name)
                 .collect::<Vec<_>>(),
             ["goose.exe"],
-            "解析层按安装内核报告的可执行文件启动"
+            "The parsing layer starts by executing the executable files reported by the installed kernel."
         );
         assert!(
             spec.url.contains("aaif-goose/goose/releases"),
-            "下载来源必须是上游 release: {}",
+            "The source from which the file was downloaded must be a valid upstream release: {}.",
             spec.url
         );
     }
@@ -759,7 +771,7 @@ mod tests {
                 path: downloaded.0,
                 sha256: downloaded.1,
             },
-            "已下载安装必须优先于 PATH"
+            "The downloaded and installed files must be given priority over the PATH environment variables."
         );
         assert_eq!(
             goose_install_state_from(None, Some(path_program.clone())),
@@ -771,7 +783,7 @@ mod tests {
         assert_eq!(none.program(), None);
         assert!(
             none.to_string().contains("工具下载"),
-            "未安装状态必须指向工具下载页：{none}"
+            "In the uninstalled state, the link must point to the tool download page: {none}"
         );
     }
 
@@ -791,12 +803,12 @@ mod tests {
             Some(&(downloaded.clone(), recorded)),
             Some(path_candidate.clone()),
         )
-        .expect_err("同哈希但非 goose 的程序必须 fail closed");
+        .expect_err("The programs that use the same hash function but are not related to \"goose\" must be terminated with failure.");
         let text = error.to_string();
         assert!(matches!(error, RegistryError::Version(_)), "{text}");
         assert!(
             text.contains(&downloaded.display().to_string()),
-            "必须先尝试已下载候选: {text}"
+            "You must first try the downloaded candidate: {text}."
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -827,7 +839,7 @@ mod tests {
     #[test]
     fn missing_goose_reports_not_installed_instead_of_panicking() {
         let error = resolve_builtin_from(&AgentDefinition::goose(), Vec::new(), None, None)
-            .expect_err("没有候选时必须返回可展示状态");
+            .expect_err("When there are no candidates available, the system must return to the displayable state.");
         assert!(matches!(error, RegistryError::NotInstalled(_)), "{error}");
         let text = error.to_string();
         assert!(text.contains("工具下载"), "{text}");

@@ -1,7 +1,7 @@
-//! duthub-adb：通过官方 `adb` CLI 发现阶段（`adb devices -l`，只读）。
+//! Read-only discovery via the official `adb` CLI (`adb devices -l`).
 //!
-//! 契约（docs/SECURITY.md #6）：可执行路径来自 `settings.tools.adbExecutable`；
-//! 校验 `state == device` 才可进入后续写操作（M3 后续任务）。
+//! Contract (`docs/SECURITY.md` #6): the executable path comes from
+//! `settings.tools.adbExecutable`; subsequent write operations require `state == device`.
 
 #![forbid(unsafe_code)]
 
@@ -113,7 +113,7 @@ impl AdbClient {
         Self { runner }
     }
 
-    /// 默认真实执行器。
+    /// Default real process runner.
     #[must_use]
     pub fn real() -> Self {
         Self::new(Arc::new(RealProcessRunner))
@@ -170,7 +170,7 @@ impl AdbClient {
         })
     }
 
-    /// 执行 `adb devices -l` 并解析设备列表（只读，无副作用）。
+    /// Run `adb devices -l` and parse the device list (read-only, no side effects).
     pub fn devices_l(&self, adb_spec: &str) -> DeviceResult<Vec<AdbDevice>> {
         let exe = resolve_executable(adb_spec)?;
         let result = self
@@ -214,7 +214,7 @@ pub fn list_local_server_devices() -> DeviceResult<Vec<AdbDevice>> {
     Ok(parse_devices_l(&output))
 }
 
-/// 解析 `adb devices -l` 输出：跳过表头、空行与 daemon 提示；取 serial/state/model。
+/// Parse `adb devices -l` output: skip header, blank, and daemon lines; extract serial, state, and model.
 #[must_use]
 pub fn parse_devices_l(output: &str) -> Vec<AdbDevice> {
     output
@@ -233,7 +233,7 @@ pub fn parse_devices_l(output: &str) -> Vec<AdbDevice> {
             let serial = tokens.next()?;
             let state = tokens.next()?;
             if state.contains(':') {
-                // 状态位不是裸 token，说明这不是设备行
+                // Not a bare state token, so this is not a device row.
                 return None;
             }
             let model = tokens
@@ -359,7 +359,10 @@ mod tests {
     #[test]
     fn empty_and_header_only() {
         assert_eq!(parse_devices_l(""), [] as [duthub_core::AdbDevice; 0]);
-        assert_eq!(parse_devices_l("List of devices attached\n\n"), [] as [duthub_core::AdbDevice; 0]);
+        assert_eq!(
+            parse_devices_l("List of devices attached\n\n"),
+            [] as [duthub_core::AdbDevice; 0]
+        );
     }
 
     #[test]
@@ -391,16 +394,16 @@ mod tests {
     }
 }
 
-/// `OpenHarmony` HDC（HarmonyOS Device Connector）目标设备。
+/// `OpenHarmony` HDC (`HarmonyOS` Device Connector) target device.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HdcTarget {
-    /// 连接键（如 `COM5` / `127.0.0.1:5555`）
+    /// Connection key (for example `COM5` or `127.0.0.1:5555`).
     pub key: String,
-    /// 设备状态（USB / CONN / Update …）
+    /// Device state (for example `USB`, `CONN`, or `Update`).
     pub state: String,
 }
 
-/// `OpenHarmony` `hdc` CLI 客户端（发现阶段只读：`hdc list targets`）。
+/// `OpenHarmony` `hdc` CLI client (read-only discovery via `hdc list targets`).
 pub struct HdcClient {
     runner: Arc<dyn ProcessRunner>,
 }
@@ -421,7 +424,7 @@ impl HdcClient {
         Self::new(Arc::new(RealProcessRunner))
     }
 
-    /// 执行 `hdc list targets` 并解析目标列表（只读，无副作用）。
+    /// Run `hdc list targets` and parse the target list (read-only, no side effects).
     pub fn list_targets(&self, hdc_spec: &str) -> DeviceResult<Vec<HdcTarget>> {
         let exe = resolve_executable(hdc_spec)?;
         let result = self
@@ -438,7 +441,7 @@ impl HdcClient {
     }
 }
 
-/// 解析 `hdc list targets` 输出：`<connectKey> <state>`，忽略 `[Empty]` 与空行。
+/// Parse `hdc list targets` output (`<connectKey> <state>`), ignoring `[Empty]` and blank lines.
 #[must_use]
 pub fn parse_targets(output: &str) -> Vec<HdcTarget> {
     let mut targets = Vec::new();

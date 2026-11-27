@@ -73,25 +73,26 @@ pub struct ProcessResult {
     pub elapsed_ms: u64,
 }
 
-/// 控制动作的已解析目标：共用设备操作入口完成授权/绑定/能力校验后，
-/// 把 DUT 配置解析成驱动可直接使用的设备地址与通道，驱动**不接触**审批令牌。
+/// Resolved target for a control action: after the shared device entry point verifies
+/// authorization, binding, and capabilities, it resolves the DUT configuration into a device
+/// address and channel that drivers use directly. Drivers never touch approval tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlTarget {
-    /// 已解析的设备地址（继电器串口节点 / SNMP PDU 地址）
+    /// Resolved device address (relay serial node or SNMP PDU address).
     pub address: String,
-    /// 板卡协议驱动标识（如 CH340；SNMP PDU 为 "snmp-pdu"）
+    /// Board protocol driver identifier (e.g. `CH340`, or `"snmp-pdu"` for SNMP PDUs).
     pub driver: String,
-    /// 动作对应的通道或插座号（继电器通道 / PDU 插座）
+    /// Target channel or outlet number (relay channel or PDU outlet).
     pub channel: u16,
 }
 
-/// 单通道 ON→STATUS→OFF 往返测试报告（继电器测试，全程记录）。
+/// Report for a single-channel ON -> STATUS -> OFF round-trip relay test (recorded end-to-end).
 ///
-/// - `before`：往返前通道状态（板卡不回答 STATUS 时为 `None`，此时 ON/OFF
-///   断言不可信，`on_ok`/`off_ok` 必为 `false`）；
-/// - `on_ok`：ON 后 STATUS 读回确认吸合；
-/// - `off_ok`：OFF 后 STATUS 读回确认释放；
-/// - `after`：最后一次 STATUS 读回（恢复态，继电器测试要求恒为释放）。
+/// - `before`: channel state before the round-trip (`None` when the board does not answer STATUS,
+///   in which case ON/OFF assertions cannot be trusted and `on_ok`/`off_ok` are both `false`).
+/// - `on_ok`: STATUS readback after ON confirmed the channel is closed/energized.
+/// - `off_ok`: STATUS readback after OFF confirmed the channel is released.
+/// - `after`: final STATUS readback (restored state; relay tests always restore to released).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelTestReport {
     pub before: Option<bool>,
@@ -102,22 +103,25 @@ pub struct ChannelTestReport {
 
 #[async_trait]
 pub trait ControlBackend: Send + Sync {
-    /// 通断目标通道/插座。授权与绑定校验在共用入口完成；驱动只执行动作。
+    /// Switch the target channel/outlet on or off. Authorization and binding checks run in the
+    /// shared entry point; drivers only execute the action.
     async fn power(&self, target: &ControlTarget, on: bool) -> DeviceResult<()>;
-    /// 复位脉冲（仅继电器类驱动支持；PDU 不伪造 Reset）。
+    /// Issue a reset pulse (relay drivers only; PDUs do not emulate reset).
     async fn reset(&self, target: &ControlTarget) -> DeviceResult<()>;
-    /// `电源按键脉冲（long_press=长按强制断电；仅继电器类驱动支持`）。
+    /// Issue a power-key pulse (`long_press` = long press to force power off; relay drivers only).
     async fn power_key(&self, target: &ControlTarget, long_press: bool) -> DeviceResult<()>;
 
-    /// `继电器逐通道状态查询（只读，OP_STATUS` 逐通道轮询）。返回应答 STATUS 的
-    /// `(通道号, 是否吸合)` 列表；板卡不回答 STATUS 时为空表。仅继电器类驱动
-    /// 实现；PDU 等其他后端默认 [`DeviceError::Unsupported`]。
+    /// Query per-channel relay state (read-only, polling `OP_STATUS` per channel). Returns
+    /// `(channel, closed)` pairs for channels that answered STATUS, or an empty list if the board
+    /// does not answer STATUS. Implemented by relay drivers only; other backends such as PDUs
+    /// return [`DeviceError::Unsupported`].
     async fn channel_status(&self, _address: &str) -> DeviceResult<Vec<(u8, bool)>> {
         Err(DeviceError::Unsupported)
     }
 
-    /// 继电器单通道 ON→STATUS→OFF 往返测试（写动作）。无论 ON 断言是否通过，
-    /// 都必须继续执行 OFF 恢复释放态（恢复优先于断言）。
+    /// Run a single-channel ON -> STATUS -> OFF round-trip relay test (write action). Even if the
+    /// ON assertion fails, OFF must still run to restore the released state (recovery takes
+    /// priority over assertion).
     async fn channel_test(&self, _address: &str, _channel: u8) -> DeviceResult<ChannelTestReport> {
         Err(DeviceError::Unsupported)
     }

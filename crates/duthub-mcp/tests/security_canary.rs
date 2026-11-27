@@ -1,11 +1,12 @@
-//! Token 被盗 / 绕过边界的 canary（W1 / T19）：
+//! Token theft and boundary-bypass canaries (W1 / T19):
 //!
-//! 1. 同用户可读 `settings.json`，其中的**通用** token 可以读取全部 DUT——这是
-//!    既有契约（不是要修的漏洞），canary 证明它确实如此；
-//! 2. 持久 token 与会话（runtime overlay）token 互不通用：会话 token 打不开主
-//!    监听器，持久 token 也进不了会话监听器；吊销后立即 401；
-//! 3. `tool.call` 审计只记元数据（tool/dutId/credential/耗时/结果摘要），不记
-//!    token 与响应正文。
+//! 1. The same OS user can read `settings.json`, whose **general** token can read all DUTs;
+//!    this is an existing contract (not a bug to fix), and the canary verifies it.
+//! 2. Persistent tokens and session (runtime overlay) tokens are not interchangeable: a
+//!    session token cannot open the primary listener, a persistent token cannot open a
+//!    session listener, and revocation returns 401 immediately.
+//! 3. `tool.call` audit entries record metadata only (`tool`, `dutId`, `credential`,
+//!    duration, result summary) and never record tokens or response bodies.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -109,8 +110,7 @@ async fn post_initialize(endpoint: SocketAddr, bearer: Option<&str>) -> Option<u
     .await
     .ok()?
     .ok()?;
-    let auth_line = bearer
-        .map_or_default(|token| format!("Authorization: Bearer {token}\r\n"));
+    let auth_line = bearer.map_or_default(|token| format!("Authorization: Bearer {token}\r\n"));
     let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: {endpoint}\r\n{auth_line}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -130,7 +130,7 @@ async fn initialize_status(endpoint: SocketAddr, bearer: Option<&str>) -> u16 {
         if let Some(status) = post_initialize(endpoint, bearer).await {
             return status;
         }
-        assert!(Instant::now() < deadline, "listener 未就绪: {endpoint}");
+        assert!(Instant::now() < deadline, "listener not ready: {endpoint}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -157,13 +157,14 @@ fn assert_port_released(endpoint: SocketAddr) {
             drop(listener);
             return;
         }
-        assert!(Instant::now() < deadline, "端口未释放: {endpoint}");
+        assert!(Instant::now() < deadline, "port not released: {endpoint}");
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// Canary：同用户读 settings.json 得到的通用 token 可在通用监听器读取全部 DUT。
-/// 这是既有契约（ADR-7：外部通用 listener 保留全局读），不是要修掉的边界。
+/// Canary: the general token read from `settings.json` by the same OS user can read every DUT
+/// on the general listener. This is an existing contract (ADR-7: external general listener
+/// retains global read), not a boundary to remove.
 #[tokio::test]
 async fn general_token_in_settings_json_can_read_every_dut() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -176,11 +177,11 @@ async fn general_token_in_settings_json_can_read_every_dut() {
         ..Default::default()
     };
     duthub_core::store::save_settings_atomic(dir.path(), &settings_file).unwrap();
-    // 同用户可直接从磁盘读出 token（canary 的前提，不做文件 ACL 假定）。
+    // Same OS user can read the token directly from disk (canary premise; no file ACL assumed).
     let raw = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
     assert!(
         raw.contains(&token),
-        "通用 token 按用户要求明文在 settings.json"
+        "general token is stored in plaintext in settings.json as required"
     );
     let loaded = duthub_core::store::load_settings(dir.path()).unwrap();
     assert_eq!(loaded.agent_access, settings_file.agent_access);
@@ -218,7 +219,7 @@ async fn general_token_in_settings_json_can_read_every_dut() {
     assert_eq!(
         data["duts"].as_array().unwrap().len(),
         2,
-        "通用 token 可读全部 DUT（既有契约）: {data}"
+        "general token can read all DUTs (existing contract): {data}"
     );
     client.cancel().await.ok();
 
@@ -226,7 +227,7 @@ async fn general_token_in_settings_json_can_read_every_dut() {
     assert_port_released(endpoint);
 }
 
-/// Token 被盗 canary：持久 token 与会话 token 不能跨监听器使用；吊销立即 401。
+/// Stolen-token canary: persistent and session tokens cannot cross listeners, and revocation returns 401 immediately.
 #[tokio::test]
 async fn stolen_persistent_or_session_token_cannot_cross_listeners() {
     let persistent_token = generate_token();
@@ -250,7 +251,7 @@ async fn stolen_persistent_or_session_token_cannot_cross_listeners() {
     let primary_endpoint = primary.endpoint;
     let session_endpoint = session.endpoint;
 
-    // 各自的 token 在自己的监听器上有效。
+    // Each token is valid on its own listener.
     assert_ne!(
         initialize_status(primary_endpoint, Some(&persistent_token)).await,
         401
@@ -259,19 +260,19 @@ async fn stolen_persistent_or_session_token_cannot_cross_listeners() {
         initialize_status(session_endpoint, Some(&session_token)).await,
         401
     );
-    // 交叉使用一律 401（会话 token 打不开主监听器；主 token 也进不了会话监听器）。
+    // Cross-listener use always returns 401 (session token rejected by primary, persistent token rejected by session).
     assert_eq!(
         initialize_status(primary_endpoint, Some(&session_token)).await,
         401,
-        "会话 token 绝不能打开持久监听器"
+        "session token must never open the persistent listener"
     );
     assert_eq!(
         initialize_status(session_endpoint, Some(&persistent_token)).await,
         401,
-        "持久 token 绝不能通过 internal 认证"
+        "persistent token must never pass internal auth"
     );
 
-    // 吊销会话 listener → 其 token 立即 401；主监听器不受影响。
+    // Revoking the session listener immediately returns 401 for its token without affecting the primary listener.
     auth.remove_runtime_listener("session-a").unwrap();
     assert_eq!(
         initialize_status(session_endpoint, Some(&session_token)).await,
@@ -280,7 +281,7 @@ async fn stolen_persistent_or_session_token_cannot_cross_listeners() {
     assert_ne!(
         initialize_status(primary_endpoint, Some(&persistent_token)).await,
         401,
-        "吊销会话 listener 不得影响主监听器"
+        "revoking the session listener must not affect the primary listener"
     );
 
     assert!(primary.shutdown_and_join_with_timeout(Duration::from_secs(5)));
@@ -289,8 +290,8 @@ async fn stolen_persistent_or_session_token_cannot_cross_listeners() {
     assert_port_released(session_endpoint);
 }
 
-/// `tool.call` 审计：成功/拒绝都记 tool、dutId、credential、耗时与摘要；
-/// 不记 token，也不记响应正文。
+/// `tool.call` audit records `tool`, `dutId`, `credential`, duration, and summary for both
+/// allowed and denied calls, without recording tokens or response bodies.
 #[tokio::test]
 async fn tool_call_audit_records_metadata_but_no_token_or_body() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -320,12 +321,12 @@ async fn tool_call_audit_records_metadata_but_no_token_or_body() {
         .await
         .expect("session client init");
 
-    // Ok：dut_list（绑定 DUT，返回 1 条）
+    // Ok: dut_list (bound DUT, returns 1 entry).
     client
         .call_tool_once(rmcp::model::CallToolRequestParams::new("dut_list"))
         .await
         .expect("dut_list");
-    // Denied：跨 DUT 读
+    // Denied: cross-DUT read.
     let denied = client
         .call_tool_once(
             rmcp::model::CallToolRequestParams::new("dut_status").with_arguments(
@@ -336,7 +337,7 @@ async fn tool_call_audit_records_metadata_but_no_token_or_body() {
             ),
         )
         .await;
-    assert!(denied.is_err(), "跨 DUT 必须拒绝");
+    assert!(denied.is_err(), "cross-DUT read must be rejected");
     client.cancel().await.ok();
 
     let events = audit.recent(100);
@@ -352,15 +353,18 @@ async fn tool_call_audit_records_metadata_but_no_token_or_body() {
                 .as_deref()
                 .is_some_and(|d| d.contains("tool=dut_list"))
         })
-        .expect("dut_list 必须有 tool.call 审计");
+        .expect("dut_list must emit a tool.call audit entry");
     assert_eq!(ok.result, AuditOutcome::Ok);
     assert_eq!(ok.credential_id.as_deref(), Some("cred-session"));
     assert_eq!(ok.agent.as_deref(), Some("session-agent"));
     let detail = ok.detail.as_deref().unwrap();
     assert!(detail.contains("duration_ms="), "{detail}");
     assert!(detail.contains("content_bytes="), "{detail}");
-    // 不记正文（DUT 名称/日志文本都不该出现）
-    assert!(!detail.contains("Alpha"), "审计不得记响应正文: {detail}");
+    // Response body (DUT name or log text) must not appear in audit details.
+    assert!(
+        !detail.contains("Alpha"),
+        "audit must not record response body: {detail}"
+    );
     assert!(!detail.contains("alpha ready"), "{detail}");
 
     let denied = tool_calls
@@ -371,20 +375,20 @@ async fn tool_call_audit_records_metadata_but_no_token_or_body() {
                 .as_deref()
                 .is_some_and(|d| d.contains("tool=dut_status"))
         })
-        .expect("dut_status 拒绝必须有 tool.call 审计");
+        .expect("dut_status denial must emit a tool.call audit entry");
     assert_eq!(denied.result, AuditOutcome::Denied);
     assert_eq!(denied.dut.as_deref(), Some("dut-b"));
     assert!(denied.detail.as_deref().unwrap().contains("UNAUTHORIZED"));
 
-    // 任何审计字节都不得包含会话 token。
+    // No audit bytes may contain the session token.
     let raw = format!("{events:?}");
-    assert!(!raw.contains(&token), "审计泄露 token: {raw}");
+    assert!(!raw.contains(&token), "audit leaked token: {raw}");
 
     assert!(handle.shutdown_and_join_with_timeout(Duration::from_secs(5)));
     assert_port_released(endpoint);
 }
 
-/// 防未来误改：`settings.json` 的读写路径本身不承载 runtime overlay。
+/// Regression guard: `settings.json` serialization never includes the runtime overlay.
 #[test]
 fn settings_json_shape_never_contains_runtime_overlay() {
     let rt = duthub_core::AgentAccessRuntime::from_settings(AgentAccessSettings::default());

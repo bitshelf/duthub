@@ -445,7 +445,8 @@ fn icon_identity_is_an_rfc4122_version_5_name() {
 /// Packs a point the way the shell does for a v4 callback `wParam`
 /// (`MAKELPARAM`: low word x, high word y).
 fn pack(x: i16, y: i16) -> usize {
-    (x as u16 as usize) | ((y as u16 as usize) << 16)
+    usize::from(u16::from_ne_bytes(x.to_ne_bytes()))
+        | (usize::from(u16::from_ne_bytes(y.to_ne_bytes())) << 16)
 }
 
 const WM_LBUTTONUP_LOCAL: u32 = 0x0202;

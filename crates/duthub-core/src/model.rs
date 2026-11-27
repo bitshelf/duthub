@@ -1,11 +1,12 @@
-//! v1 配置 schema（`settings.json` / `duts.json`）。
+//! v1 configuration schema (`settings.json` / `duts.json`).
 //!
-//! 字段形状与 UI 原型 `settingsFile()` / `dutsFile()` 的 JSON 输出一一对应，
-//! 语义见 `docs/DATA_MODEL.md`。serde 容忍未知字段（向前兼容），可选字段带 default。
+//! Field shapes match the prototype `settingsFile()` / `dutsFile()` JSON output; see
+//! `docs/DATA_MODEL.md` for semantics. Unknown fields are tolerated by `serde` for forward
+//! compatibility, and optional fields carry defaults.
 
 use serde::{Deserialize, Serialize};
 
-/// `settings.json` 根对象。
+/// Root object of `settings.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsFile {
@@ -21,35 +22,37 @@ pub struct SettingsFile {
     pub agent: AgentSettings,
     #[serde(default)]
     pub tools: ToolsSettings,
-    /// A2A 互联配置（原型 `a2a` 段；token 永不入文件，走密钥库）。
+    /// A2A interconnection settings (the `a2a` section; tokens never touch disk and live in the
+    /// OS keyring).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2a: Option<A2aConfig>,
-    /// 工作目录（logs / captures / exports / runtime 等工作文件的输出根）。
-    /// None = 可执行文件所在目录。CLI 可覆盖此字段。
+    /// Working directory root for logs, captures, exports, and runtime data.
+    /// `None` defaults to the executable's directory; CLI flags can override this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dut_storage_gib: Option<u32>,
     /// Global pop-up alert settings: only the per-source suppression list.
-    /// The former global on/off switch was removed (2026-11-25); an old
+    /// The legacy global on/off switch has been removed; an old
     /// `enabled` key is ignored by serde and every DUT defaults to enabled
     /// unless its `alertsByDut` entry disables it. The section is omitted from
     /// disk when empty (docs/examples/settings.json roundtrip stays lossless).
     #[serde(default, skip_serializing_if = "global_alerts_is_default")]
     pub alerts: GlobalAlertSettings,
-    /// Agent 接入统一认证与独占控制（docs/SECURITY.md）：
-    /// 凭据 / Grant / auth 开关 / MCP 端口 / 租约 TTL。
-    /// 旧 settings.json 无此段 → default（auth 关、无凭据）；等于默认值时
-    /// 序列化省略该段（roundtrip.rs 既有测试不动一行仍绿，坑 #19/#24 同款）。
+    /// Unified Agent access authentication and exclusive control settings (`docs/SECURITY.md`):
+    /// credentials, grants, auth toggle, MCP port, and lease TTL.
+    /// Legacy `settings.json` files without this section deserialize to the default (auth off, no
+    /// credentials), and the section is omitted on serialize when equal to the default so
+    /// `roundtrip.rs` stays unchanged.
     #[serde(
         default,
         skip_serializing_if = "crate::agent_access::agent_access_is_default"
     )]
     pub agent_access: crate::agent_access::AgentAccessSettings,
-    /// 串口终端设置（「串口」设置段，与控制设备同级）：Prompt 高亮规则 /
-    /// 键盘映射 / 滚动缓冲 / 会话日志开关。
-    /// 旧 settings.json 无此段 → 全默认；等于默认值时序列化省略该段
-    /// （roundtrip.rs 既有测试不动一行仍绿，坑 #19/#24 同款）。
+    /// Serial terminal settings (top-level `serial` section alongside control devices): prompt
+    /// highlight rules, key mappings, scrollback buffer, and session log options.
+    /// Legacy `settings.json` files without this section deserialize to defaults, and the section
+    /// is omitted on serialize when equal to the default so `roundtrip.rs` stays unchanged.
     #[serde(default, skip_serializing_if = "serial_is_default")]
     pub serial: SerialSettings,
 }
@@ -75,16 +78,19 @@ pub struct AlertSettings {
     pub suppressed_sources: Vec<String>,
 }
 
-/// Global pop-up alert settings (`settings.json` `alerts`): only the
-/// per-source suppression list. There is deliberately no global on/off switch
-/// any more; a DUT is silenced by `duts.json` `alertsByDut.<id>.enabled =
-/// false`, and non-DUT subjects (relay boards, generic agent notices) can only
-/// be silenced by suppressing a source.
+/// Global pop-up alert settings (`settings.json` `alerts`): per-source
+/// suppression list and taskbar/tray notification mute toggle. There is
+/// deliberately no global on/off switch any more; a DUT is silenced by
+/// `duts.json` `alertsByDut.<id>.enabled = false`, and non-DUT subjects (relay
+/// boards, generic agent notices) can only be silenced by suppressing a source.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlobalAlertSettings {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suppressed_sources: Vec<String>,
+    /// Suppress taskbar button flashing and tray balloon/icon alerts while hidden or minimized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mute_taskbar_alerts: bool,
 }
 
 /// Per-DUT garbled-byte detection switch (`duts.json` `garbledByDut`).
@@ -151,7 +157,8 @@ pub struct A2aPeer {
     pub card_url: String,
 }
 
-/// 每台 DUT 的 A2A 预配置（运行时见 duthub-a2a；token 存 OS 密钥库 `a2a/<dut_id>`）。
+/// Per-DUT A2A pre-configuration (runtime lives in `duthub-a2a`; tokens live in the OS keyring at
+/// `a2a/<dut_id>`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DutA2aConfig {
@@ -159,11 +166,12 @@ pub struct DutA2aConfig {
     pub enabled: bool,
     #[serde(default = "default_a2a_port")]
     pub port: u16,
-    /// 省略时 UI 回退到 DUT 名称。
+    /// When omitted, the UI falls back to the DUT name.
     #[serde(default)]
     pub agent_name: String,
-    /// 监听绑定地址；None/缺省 = `127.0.0.1`（仅回环）。非回环或其他绑定值
-    /// 由运行时判为 `NeedsProductSignoff`（ADR-2，W3 一律拒绝）。
+    /// Listener bind address; `None` / omitted defaults to `127.0.0.1` (loopback only).
+    /// Non-loopback or other bind values are classified as `NeedsProductSignoff` at runtime and
+    /// rejected (ADR-2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
 }
@@ -202,6 +210,10 @@ pub struct TerminalSettings {
     pub font_family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
+    /// Scroll back to the bottom whenever new terminal output arrives.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scroll_on_output: bool,
+    /// Scroll back to the bottom when typing or pasting into the terminal.
     #[serde(default)]
     pub jump_to_latest: bool,
     #[serde(default)]
@@ -218,25 +230,26 @@ fn default_match_color() -> String {
     "#edbe7a".into()
 }
 
-/// 串口终端设置（「串口」设置段）。
+/// Serial terminal settings (top-level `serial` section).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SerialSettings {
-    /// Prompt 正则高亮规则：按序生效、先到先得不重叠。旧
-    /// `terminal.promptHighlight`（单条、从未接入渲染）在加载时播种为首条。
+    /// Prompt regex highlight rules: applied in order, first-match wins without overlap. Legacy
+    /// `terminal.promptHighlight` (single rule, never wired to rendering) is seeded first on load.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub highlight_rules: Vec<PromptRule>,
-    /// 键盘退格字节（None = 0x7f DEL；CtrlH = 0x08，部分 shell/工具需要）。
+    /// Keyboard backspace byte (`None` = `0x7f` DEL; `CtrlH` = `0x08` for shells/tools that expect it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backspace: Option<SerialBackspace>,
-    /// 键盘回车行尾（None = CR；Lf / Crlf 可选，仅键盘路径，MCP 行尾另设）。
+    /// Keyboard Enter line ending (`None` = CR; `Lf` / `Crlf` optional; keyboard path only, MCP
+    /// line endings are configured separately).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enter_ending: Option<SerialEnterEnding>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub paste_on_right_click: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub copy_on_select: bool,
-    /// 终端回滚缓冲行数（None = 1000；桌面端按渲染上限钳制）。
+    /// Terminal scrollback buffer size in rows (`None` = 1000; clamped to the desktop render cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrollback_rows: Option<u32>,
 }
@@ -253,7 +266,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// 单条 Prompt 正则高亮规则（渲染期叠加层：只改显示色，不碰数据流）。
+/// Single prompt regex highlight rule (render-time overlay only; does not alter the byte stream).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptRule {
@@ -328,25 +341,26 @@ fn default_rule_enabled() -> bool {
     true
 }
 
-/// 键盘退格字节。
+/// Keyboard backspace byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SerialBackspace {
-    /// 0x7f（DEL，默认，绝大多数 Linux shell 的 erase）
+    /// `0x7f` (DEL, default erase byte for most Linux shells).
     Del,
-    /// 0x08（Ctrl-H，部分 BSP shell / 老工具需要）
+    /// `0x08` (Ctrl-H, needed by some BSP shells and legacy tools).
     CtrlH,
 }
 
-/// 键盘回车行尾（仅键盘路径；MCP/心跳写入的行尾策略是会话级独立配置）。
+/// Keyboard Enter line ending (keyboard path only; MCP/heartbeat writes use their own session
+/// line-ending policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SerialEnterEnding {
-    /// \r（默认）
+    /// `\r` (default).
     Cr,
-    /// \n
+    /// `\n`.
     Lf,
-    /// \r\n
+    /// `\r\n`.
     Crlf,
 }
 
@@ -399,10 +413,112 @@ pub struct ModelProvider {
     pub models: Vec<ProviderModel>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T"
+)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// Supported input modalities for a configured LLM model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent LLM input modality checkboxes persisted in settings.json"
+)]
+pub struct ModelInputModalities {
+    /// Text input is always enabled.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub text: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub image: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pdf: bool,
+}
+
+impl Default for ModelInputModalities {
+    fn default() -> Self {
+        Self {
+            text: true,
+            image: false,
+            video: false,
+            pdf: false,
+        }
+    }
+}
+
+impl ModelInputModalities {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True when the model accepts visual inputs (images or video).
+    #[must_use]
+    pub fn supports_vision(&self) -> bool {
+        self.image || self.video
+    }
+}
+
+/// Optional model feature flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilities {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_output: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web_search: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mid_conversation_system: bool,
+}
+
+impl ModelCapabilities {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderModel {
     pub id: String,
     pub enabled: bool,
+    /// Context window size in tokens (e.g. `1_000_000`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Maximum output tokens per response (e.g. `128_000`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "ModelInputModalities::is_default")]
+    pub input_modalities: ModelInputModalities,
+    #[serde(default, skip_serializing_if = "ModelCapabilities::is_default")]
+    pub capabilities: ModelCapabilities,
+    /// Reasoning effort levels from low to high (e.g. `["low", "high", "max"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<String>,
+    /// Optional JSON object mapping reasoning parameters for the provider API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_params: Option<serde_json::Value>,
+}
+
+impl ProviderModel {
+    #[must_use]
+    pub fn new(id: impl Into<String>, enabled: bool) -> Self {
+        Self {
+            id: id.into(),
+            enabled,
+            ..Self::default()
+        }
+    }
 }
 
 fn default_debug_tool() -> String {
@@ -413,7 +529,8 @@ fn default_hdc() -> String {
     "hdc".into()
 }
 
-/// 坑 #19：默认值段序列化跳过，保证 examples 往返语义相等（旧 settings.json 无 hdcExecutable 键）。
+/// Skip serializing the default value so example round-trips remain semantically identical
+/// (legacy `settings.json` has no `hdcExecutable` key).
 fn is_default_hdc(tool: &str) -> bool {
     tool == "hdc"
 }
@@ -423,7 +540,7 @@ fn is_default_hdc(tool: &str) -> bool {
 pub struct ToolsSettings {
     #[serde(default = "default_adb")]
     pub adb_executable: String,
-    /// `OpenHarmony` hdc 可执行文件（PATH 命令名或绝对路径）
+    /// `OpenHarmony` `hdc` executable (PATH command name or absolute path).
     #[serde(default = "default_hdc", skip_serializing_if = "is_default_hdc")]
     pub hdc_executable: String,
     #[serde(default, skip_serializing_if = "capture_is_empty")]
@@ -582,7 +699,7 @@ fn default_adb() -> String {
     "adb".into()
 }
 
-/// `duts.json` 根对象。
+/// Root object of `duts.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DutsFile {
@@ -618,7 +735,8 @@ fn default_relay_channels() -> u8 {
 }
 
 impl DutsFile {
-    /// 把旧配置中重复的继电器串口定义收口到板卡；原通道保持不变。
+    /// Consolidate duplicated legacy USB serial relay definitions into shared relay boards while
+    /// preserving original channel assignments.
     pub fn migrate_usb_relays(&mut self) {
         for dut in &mut self.duts {
             let RelayConfig::UsbSerial {
@@ -728,14 +846,15 @@ pub struct DutConfig {
     pub relay: RelayConfig,
     #[serde(default = "McpConfig::default_http")]
     pub mcp: McpConfig,
-    /// 每 DUT A2A 预配置（默认整段省略，保持旧 duts.json 往返不变）。
+    /// Per-DUT A2A pre-configuration (omitted when default to keep legacy `duts.json` round-trips
+    /// unchanged).
     #[serde(default, skip_serializing_if = "dut_a2a_is_default")]
     pub a2a: DutA2aConfig,
     #[serde(default)]
     pub flash: FlashConfig,
     #[serde(default, skip_serializing_if = "media_is_empty")]
     pub media: DutMediaConfig,
-    /// 会话心跳（需求⑦）：配置缺省 = 关闭；Agent 可经 heartbeat.set 改写。
+    /// Session heartbeat (omitted when default = disabled; agents may update via `heartbeat.set`).
     #[serde(default, skip_serializing_if = "heartbeat_is_default")]
     pub heartbeat: crate::heartbeat::HeartbeatConfig,
 }
@@ -767,7 +886,11 @@ pub struct SerialConfig {
     pub reference_similarity: Option<u8>,
 }
 
-pub const DEFAULT_BOOT_SIMILARITY: u8 = 95;
+pub const DEFAULT_BOOT_SIMILARITY: u8 =
+    match u8::from_str_radix(env!("DUTHUB_DEFAULT_BOOT_SIMILARITY"), 10) {
+        Ok(percent @ 1..=100) => percent,
+        _ => panic!("Default boot similarity must be an integer between 1 and 100"),
+    };
 
 fn default_baud() -> u32 {
     115_200
@@ -785,7 +908,7 @@ pub struct AdbConfig {
     pub host: String,
     #[serde(default)]
     pub serial: String,
-    /// USB 调试通道工具：adb | hdc（OpenHarmony）
+    /// USB debug channel tool: `adb` | `hdc` (`OpenHarmony`).
     #[serde(
         default = "default_debug_tool",
         skip_serializing_if = "is_default_debug_tool"
@@ -793,7 +916,8 @@ pub struct AdbConfig {
     pub tool: String,
 }
 
-/// 坑 #19：默认值段序列化跳过，保证 examples 往返语义相等（旧 duts.json 无 tool 键）。
+/// Skip serializing the default value so example round-trips remain semantically identical
+/// (legacy `duts.json` has no `tool` key).
 fn is_default_debug_tool(tool: &str) -> bool {
     tool == "adb"
 }
@@ -820,7 +944,8 @@ fn default_adb_mode() -> String {
     "disabled".into()
 }
 
-/// 控制单元绑定（JSON tag: `mode`）。SNMP PDU 只暴露 Power，不伪造 Reset/Recovery。
+/// Control unit binding (JSON tag: `mode`). SNMP PDUs expose only Power and do not emulate Reset
+/// or Recovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum RelayConfig {
@@ -866,7 +991,7 @@ pub struct RelayChannels {
     pub recovery: Option<u8>,
     #[serde(default)]
     pub maskrom: Option<u8>,
-    /// 电源按键（Rockchip power key，短接脉冲触发）
+    /// Power key channel (Rockchip power key, triggered via a short-circuit pulse).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_key: Option<u8>,
 }
@@ -892,7 +1017,7 @@ pub struct SnmpConfig {
     pub address: String,
     #[serde(default = "default_snmp_version")]
     pub version: String,
-    /// 指向 OS 密钥库的引用，永不存明文（docs/SECURITY.md #5）。
+    /// Reference to an OS keyring entry; plaintext secrets are never stored (`docs/SECURITY.md` #5).
     #[serde(default)]
     pub credential_ref: String,
 }
@@ -912,7 +1037,7 @@ fn default_outlet() -> u16 {
     1
 }
 
-/// MCP 传输（JSON tag: `transport`）。stdio 无 TCP 端口；HTTP 必须是完整 URL。
+/// MCP transport (JSON tag: `transport`). Stdio uses no TCP port; HTTP requires a full URL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum McpConfig {
@@ -974,7 +1099,7 @@ mod tests {
         assert_eq!(value["testArgs"], serde_json::json!(["--help"]));
         let back: FlashConfig = serde_json::from_value(value).unwrap();
         assert_eq!(back, cfg);
-        // 无 presetId 时序列化省略字段（向前兼容旧读取方）
+        // Omit `presetId` when absent for backward compatibility with older readers.
         let bare = FlashConfig {
             preset_id: None,
             executable: "t".into(),
@@ -986,7 +1111,8 @@ mod tests {
 
     #[test]
     fn dut_a2a_defaults_off_and_roundtrips_camel_case() {
-        // 旧 duts.json 无 a2a：默认关闭，且默认值不序列化（roundtrip 示例不变）。
+        // Legacy `duts.json` without `a2a`: defaults to disabled and is omitted on serialize
+        // (keeps example round-trip unchanged).
         let legacy: DutConfig = serde_json::from_value(serde_json::json!({
             "id": "dut-a",
             "name": "RK3576",
@@ -998,7 +1124,10 @@ mod tests {
         assert_eq!(legacy.a2a.agent_name, "");
 
         let back = serde_json::to_value(&legacy).unwrap();
-        assert!(back.get("a2a").is_none(), "默认 a2a 段必须省略: {back}");
+        assert!(
+            back.get("a2a").is_none(),
+            "default a2a section must be omitted: {back}"
+        );
 
         let mut enabled = legacy;
         enabled.a2a.enabled = true;
@@ -1019,13 +1148,13 @@ mod tests {
             "serial": {"host": "local", "port": "COM8", "baud": 115_200, "format": "8N1"}
         });
 
-        // 缺省 = None，序列化省略 bindAddr（默认 a2a 段整体省略的口径不变）。
+        // Default is `None`; `bindAddr` is omitted on serialize (whole-section omission unchanged).
         let mut dut: DutConfig = serde_json::from_value(base_json.clone()).unwrap();
         dut.a2a.enabled = true;
         let value = serde_json::to_value(&dut).unwrap();
         assert!(value["a2a"].get("bindAddr").is_none(), "{value}");
 
-        // 显式回环地址往返（camelCase 键）。
+        // Explicit loopback address round-trips with camelCase key.
         let mut bound: DutConfig = serde_json::from_value(base_json).unwrap();
         bound.a2a.bind_addr = Some("127.0.0.1".into());
         let value = serde_json::to_value(&bound).unwrap();
@@ -1037,21 +1166,31 @@ mod tests {
     #[test]
     fn default_highlight_rules_cover_prompt_parts() {
         let rules = default_highlight_rules();
-        assert!(rules.len() >= 3, "至少覆盖 user@host / 路径 / 提示符");
+        assert!(
+            rules.len() >= 3,
+            "default rules must cover user@host, path, and prompt suffix"
+        );
         for rule in &rules {
-            assert!(!rule.regex.trim().is_empty(), "默认规则不得为空正则");
-            assert!(rule.enabled, "默认规则必须启用");
+            assert!(
+                !rule.regex.trim().is_empty(),
+                "default rule regex must not be empty"
+            );
+            assert!(rule.enabled, "default rule must be enabled");
             assert!(
                 rule.color.starts_with('#') && rule.color.len() == 7,
-                "颜色必须是 #rrggbb：{}",
+                "color must be #rrggbb: {}",
                 rule.color
             );
         }
-        // 语义分组用不同颜色：user@host 绿、路径蓝、提示符浅灰
+        // Distinct colors per semantic group: user@host green, path blue, suffix light gray.
         let colors: std::collections::HashSet<&str> =
             rules.iter().map(|rule| rule.color.as_str()).collect();
-        assert_eq!(colors.len(), 3, "三类语义应各有一种颜色");
-        // 空串与默认值保持原契约（播种只发生在 load 路径，roundtrip 不受影响）
+        assert_eq!(
+            colors.len(),
+            3,
+            "each semantic group should have its own color"
+        );
+        // Empty/default contract stays unchanged (seeding happens only on load, not roundtrip).
         assert_eq!(
             SerialSettings::default().highlight_rules,
             Vec::<PromptRule>::new()
@@ -1060,11 +1199,11 @@ mod tests {
 
     #[test]
     fn alert_settings_roundtrips_camel_case_and_defaults() {
-        // 旧 settings.json 无 alerts 段 → 默认开启、无抑制
+        // Legacy `settings.json` without `alerts` defaults to enabled with no suppressions.
         let legacy: AlertSettings = serde_json::from_str("{}").unwrap();
         assert!(legacy.enabled);
         assert_eq!(legacy.suppressed_sources, Vec::<String>::new());
-        // 往返必须写 camelCase 键（snake_case 会被静默丢弃落 default，坑 #15）
+        // Round-trip must emit camelCase keys (`snake_case` would silently fall back to default).
         let value = serde_json::json!({
             "enabled": false,
             "suppressedSources": ["serial", "agent"]
@@ -1089,7 +1228,10 @@ mod tests {
         assert_eq!(legacy.suppressed_sources, vec!["relay"]);
         let back = serde_json::to_value(&legacy).unwrap();
         assert_eq!(back, serde_json::json!({"suppressedSources": ["relay"]}));
-        assert!(back.get("enabled").is_none(), "旧总开关不得写回: {back}");
+        assert!(
+            back.get("enabled").is_none(),
+            "retired global enabled key must not be written back: {back}"
+        );
         // An empty section is omitted from settings.json entirely (the field is
         // skipped when it equals the default), so old files stay unchanged.
         let empty = GlobalAlertSettings::default();
@@ -1097,8 +1239,60 @@ mod tests {
         let raw = serde_json::to_value(crate::store::default_settings()).unwrap();
         assert!(
             raw.get("alerts").is_none(),
-            "默认不得序列化 alerts 段: {raw}"
+            "default alerts section must not be serialized: {raw}"
         );
+        let muted = GlobalAlertSettings {
+            suppressed_sources: Vec::new(),
+            mute_taskbar_alerts: true,
+        };
+        assert!(!global_alerts_is_default(&muted));
+        let serialized = serde_json::to_value(&muted).unwrap();
+        assert_eq!(serialized, serde_json::json!({"muteTaskbarAlerts": true}));
+        let parsed: GlobalAlertSettings = serde_json::from_value(serialized).unwrap();
+        assert!(parsed.mute_taskbar_alerts);
+    }
+
+    #[test]
+    fn provider_model_extended_config_roundtrips_and_skips_defaults() {
+        let minimal = ProviderModel::new("deepseek-flash", true);
+        let minimal_json = serde_json::to_value(&minimal).unwrap();
+        assert_eq!(
+            minimal_json,
+            serde_json::json!({ "id": "deepseek-flash", "enabled": true })
+        );
+        let legacy: ProviderModel =
+            serde_json::from_str(r#"{"id":"legacy-m","enabled":true}"#).unwrap();
+        assert!(legacy.input_modalities.text);
+        assert!(!legacy.input_modalities.supports_vision());
+
+        let rich = ProviderModel {
+            id: "GLM-5.3-Flash".into(),
+            enabled: true,
+            context_window: Some(1_000_000),
+            max_output_tokens: Some(128_000),
+            input_modalities: ModelInputModalities {
+                text: true,
+                image: true,
+                video: true,
+                pdf: true,
+            },
+            capabilities: ModelCapabilities {
+                structured_output: false,
+                web_search: true,
+                mid_conversation_system: true,
+            },
+            reasoning_levels: vec!["low".into(), "high".into(), "max".into()],
+            reasoning_params: Some(serde_json::json!({"thinking": {"type": "enabled"}})),
+        };
+        let json = serde_json::to_value(&rich).unwrap();
+        assert_eq!(json["contextWindow"], 1_000_000);
+        assert_eq!(json["maxOutputTokens"], 128_000);
+        assert_eq!(
+            json["reasoningLevels"],
+            serde_json::json!(["low", "high", "max"])
+        );
+        let back: ProviderModel = serde_json::from_value(json).unwrap();
+        assert_eq!(back, rich);
     }
 
     #[test]
@@ -1111,5 +1305,27 @@ mod tests {
             serde_json::to_value(GarbledDetection { enabled: false }).unwrap(),
             serde_json::json!({})
         );
+    }
+
+    #[test]
+    fn terminal_scroll_settings_roundtrip_camel_case_and_skip_false_scroll_on_output() {
+        let legacy: TerminalSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.scroll_on_output);
+        assert!(!legacy.jump_to_latest);
+
+        let default_json = serde_json::to_value(&legacy).unwrap();
+        assert!(default_json.get("scrollOnOutput").is_none());
+
+        let enabled = TerminalSettings {
+            scroll_on_output: true,
+            jump_to_latest: true,
+            ..TerminalSettings::default()
+        };
+        let encoded = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(encoded["scrollOnOutput"], true);
+        assert_eq!(encoded["jumpToLatest"], true);
+
+        let decoded: TerminalSettings = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, enabled);
     }
 }

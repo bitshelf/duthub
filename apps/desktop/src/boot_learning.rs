@@ -7,12 +7,23 @@ const REFERENCE_DIR: &str = "references";
 const REFERENCE_LOG: &str = "reference-boot.log";
 
 pub(crate) fn boot_reference_path(root: &Path, dut: &DutConfig) -> Option<PathBuf> {
-    if let Some(path) = dut.serial.reference_log.as_deref() {
-        return (!path.trim().is_empty()).then(|| root.join(path.trim()));
+    let configured = dut.serial.reference_log.as_deref()?.trim();
+    if configured.is_empty() {
+        return None;
     }
-    let name = duthub_core::dut_artifacts::name_component(&dut.name).ok()?;
-    let path = root.join(name).join(REFERENCE_DIR).join(REFERENCE_LOG);
-    path.is_file().then_some(path)
+    let path = root.join(configured);
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        .then_some(path)
+}
+
+pub(crate) fn reference_path_text(root: &Path, path: &Path) -> String {
+    let root = duthub_core::store::plain_path(root);
+    let path = duthub_core::store::plain_path(path);
+    path.strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn save(root: &Path, dut_id: &str, name: &str, text: &str) -> io::Result<PathBuf> {
@@ -37,12 +48,24 @@ pub fn save(root: &Path, dut_id: &str, name: &str, text: &str) -> io::Result<Pat
     result.map(|()| root.join(name).join(REFERENCE_DIR).join(REFERENCE_LOG))
 }
 
+pub(crate) fn record_learned_reference(
+    file: &mut duthub_core::DutsFile,
+    dut_id: &str,
+    path: &str,
+) -> bool {
+    let Some(dut) = file.duts.iter_mut().find(|dut| dut.id == dut_id) else {
+        return false;
+    };
+    dut.serial.reference_log = Some(path.to_owned());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn reference_lookup_uses_the_dut_configuration_and_its_learned_file() {
+    fn reference_lookup_requires_a_configured_nonempty_file() {
         let mut dut: DutConfig = serde_json::from_value(serde_json::json!({
             "id": "dut-test",
             "name": "DUT Test",
@@ -54,15 +77,49 @@ mod tests {
 
         assert_eq!(boot_reference_path(&root, &dut), None);
         let learned = save(&root, &dut.id, &dut.name, "DDR Version 1").unwrap();
-        assert_eq!(boot_reference_path(&root, &dut), Some(learned));
+        assert_eq!(boot_reference_path(&root, &dut), None);
+        dut.serial.reference_log = Some(reference_path_text(&root, &learned));
+        assert_eq!(boot_reference_path(&root, &dut), Some(learned.clone()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(learned)
+            .unwrap();
+        assert_eq!(boot_reference_path(&root, &dut), None);
         dut.serial.reference_log = Some("manual.log".to_owned());
-        assert_eq!(
-            boot_reference_path(&root, &dut),
-            Some(root.join("manual.log"))
-        );
+        assert_eq!(boot_reference_path(&root, &dut), None);
         dut.serial.reference_log = Some(String::new());
         assert_eq!(boot_reference_path(&root, &dut), None);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn record_learned_reference_updates_only_the_target_dut() {
+        let mut file: duthub_core::DutsFile = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "duts": [
+                {
+                    "id": "dut-a",
+                    "name": "DUT A",
+                    "serial": {"host": "local", "port": "COM3", "referenceLog": ""}
+                },
+                {
+                    "id": "dut-b",
+                    "name": "DUT B",
+                    "serial": {"host": "local", "port": "COM4", "referenceLog": "keep.log"}
+                }
+            ]
+        }))
+        .unwrap();
+
+        let learned = "DUT A/references/reference-boot.log";
+        assert!(record_learned_reference(&mut file, "dut-a", learned));
+        assert!(!record_learned_reference(&mut file, "dut-missing", learned));
+        assert_eq!(file.duts[0].serial.reference_log.as_deref(), Some(learned));
+        assert_eq!(
+            file.duts[1].serial.reference_log.as_deref(),
+            Some("keep.log")
+        );
     }
 }

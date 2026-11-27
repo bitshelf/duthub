@@ -1,5 +1,5 @@
-# duthub 应用图标生成器（线性版，避免 PS 函数输出管道坑）
-# 设计：青色渐变圆角方（品牌色）+ 深色 UART 波形（串口信号）+ 亮色终端光标块
+# Generate the duthub application icon inline to avoid PowerShell function output pitfalls.
+# Use a rounded teal gradient square, a dark UART waveform, and a bright terminal cursor.
 param([string]$OutDir = "")
 
 Add-Type -AssemblyName System.Drawing
@@ -11,14 +11,14 @@ if ($OutDir -eq "") {
 }
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-# 256 主图（GraphicsPath 直接构建）
+# Build the 256-pixel source directly with GraphicsPath.
 $S = 256
 $bmp = New-Object System.Drawing.Bitmap $S, $S
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.SmoothingMode = 'AntiAlias'
 $g.PixelOffsetMode = 'HighQuality'
 
-# 1) 品牌青色渐变圆角方
+# Draw the rounded square with the brand's teal gradient.
 $bgPath = New-Object System.Drawing.Drawing2D.GraphicsPath
 foreach ($seg in @(
     @{x=8;   y=8;   d=112; a=180; s=90},
@@ -37,12 +37,12 @@ $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush (
 )
 $g.FillPath($brush, $bgPath) | Out-Null
 
-# 2) 内侧深色细描边
+# Add a thin dark inset border.
 $penBg = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 7, 16, 24)), 10
 $g.DrawPath($penBg, $bgPath) | Out-Null
 $penBg.Dispose() | Out-Null
 
-# 3) UART 波形（0101 帧样式）
+# Draw a UART waveform with a 0101 frame pattern.
 $ink = [System.Drawing.Color]::FromArgb(255, 7, 16, 24)
 $wf = New-Object System.Drawing.Pen ($ink), 22
 $wf.LineJoin = 'Round'; $wf.StartCap = 'Round'; $wf.EndCap = 'Round'
@@ -56,7 +56,7 @@ $pts = @(
 $g.DrawLines($wf, $pts) | Out-Null
 $wf.Dispose() | Out-Null
 
-# 4) 终端光标块（亮色）
+# Draw the bright terminal cursor.
 $cur = New-Object System.Drawing.Drawing2D.GraphicsPath
 foreach ($seg in @(
     @{x=196; y=86;  d=20; a=180; s=90},
@@ -74,7 +74,7 @@ $g.Dispose() | Out-Null
 
 $bmp.Save((Join-Path $OutDir "app-256.png"), [System.Drawing.Imaging.ImageFormat]::Png) | Out-Null
 
-# 多尺寸
+# Render the supported icon sizes.
 $sizes = @(256, 128, 64, 48, 32, 16)
 $pngs = @{}
 foreach ($s in $sizes) {
@@ -96,7 +96,7 @@ foreach ($s in $sizes) {
 }
 $bmp.Dispose() | Out-Null
 
-# ICO 容器
+# Pack the ICO container.
 $msIco = New-Object System.IO.MemoryStream
 $bw = New-Object System.IO.BinaryWriter $msIco
 $bw.Write([uint16]0) | Out-Null; $bw.Write([uint16]1) | Out-Null; $bw.Write([uint16]$sizes.Count) | Out-Null

@@ -1,5 +1,5 @@
-# 裁剪放大截图区域便于读图取证
-# 用法: powershell -File scripts/ui-crop.ps1 -SrcFile <png> -X <x> -Y <y> -W <w> -H <h> -OutFile <png> [-Zoom 2]
+# Crop and enlarge part of a screenshot for inspection.
+# Usage: powershell -File scripts/ui-crop.ps1 -SrcFile <png> -X <x> -Y <y> -W <w> -H <h> -OutFile <png> [-Zoom 2]
 param(
     [string]$SrcFile = "target/ui-verify/00-initial.png",
     [int]$X = 0, [int]$Y = 0, [int]$W = 400, [int]$H = 60,

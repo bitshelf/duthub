@@ -295,17 +295,17 @@ mod tests {
         assert_eq!(
             effective_spec_in(configured, "adb", &root),
             configured,
-            "显式路径优先于已下载"
+            "Explicit paths take precedence over already downloaded paths."
         );
         assert_eq!(
             effective_spec_in("my-adb", "adb", &root),
             "my-adb",
-            "非规范裸名保持既有 PATH 行为"
+            "Non-standard bare names maintain the existing PATH behavior."
         );
         assert_eq!(
             effective_spec_in("%ADB_HOME%/adb.exe", "adb", &root),
             "%ADB_HOME%/adb.exe",
-            "环境变量展开的 spec 不被已下载劫持"
+            "The specified environment variables cannot be downloaded and exploited."
         );
         // hdc has no downloadable spec: even the canonical name falls back.
         assert_eq!(effective_spec_in("hdc", "hdc", &root), "hdc");

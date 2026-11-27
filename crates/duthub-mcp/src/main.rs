@@ -1,15 +1,15 @@
-//! duthub-mcp stdio 入口：由 Code Agent 作为子进程启动（MCP stdio 传输）。
+//! MCP stdio entry point for a subprocess launched by an Agent.
 //!
-//! 状态源：读取工作目录 `runtime/mcp-state.json` 快照（desktop 落盘，只读）。
-//! 工作目录解析与桌面端同序：CLI `--workdir`、`.duthub/settings.json` 的 `workspaceDir`、
-//! exe 同级 `duthub-data/`。
-//! 两者都未配置时保留旧发现链（exe 同级存在 → 进程 cwd 存在 → 相对路径，
-//! 兼容外部 MCP 客户端以任意 cwd 启动）。
-//! stdout 只输出 MCP 协议数据（rmcp 管理）；日志走 stderr。
+//! Read the desktop's persisted state snapshot from the work directory.
+//! Use the explicit work directory, then the saved workspace directory,
+//! then the default beside the executable.
+//! Without a configured directory, also look for existing legacy snapshots.
+//! This supports clients that launch the executable from another directory.
+//! Reserve standard output for MCP messages and send diagnostics to standard error.
 
 use std::path::{Path, PathBuf};
 
-/// 从候选 bootstrap 目录读取 settings.json 的 `workspaceDir`（缺失/损坏按未配置处理）。
+/// Read the saved workspace directory if the bootstrap settings exist and are valid.
 fn load_workspace_setting(candidates: &[PathBuf]) -> Option<String> {
     candidates.iter().find_map(|dir| {
         let raw = std::fs::read_to_string(dir.join("settings.json")).ok()?;
@@ -18,10 +18,10 @@ fn load_workspace_setting(candidates: &[PathBuf]) -> Option<String> {
     })
 }
 
-/// 工作目录发现（快照只读，与桌面端写盘侧同源解析）：
-/// 1) CLI `--workdir` 或 settings.json `workspaceDir` 配置 → `resolve_work_dir_in`
-///    （相对路径锚定本进程 exe 目录）；
-/// 2) 均未配置时优先选择新快照，兼容旧目录中的快照。
+/// Locate the read-only snapshot using the desktop's work directory precedence.
+/// Resolve an explicit override or the saved setting first.
+/// Relative paths use the executable directory as their base.
+/// Without an override, prefer the current snapshot location and recognize legacy files.
 fn discover_data_dir() -> PathBuf {
     use duthub_core::store::{config_dir_in, default_work_dir_in, resolve_portable_work_dir_in};
 

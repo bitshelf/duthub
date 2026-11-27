@@ -1,9 +1,9 @@
-//! MCP 运行时桥接：desktop 状态 → `duthub_mcp::McpState`。
+//! Bridge desktop state into the MCP runtime.
 //!
-//! - HTTP 端点（默认 127.0.0.1:8797/mcp；开启局域网后为 0.0.0.0:8797）后台线程托管。
-//! - Workbench 每帧把 DUT 摘要 + 最近日志推入共享快照；快照写入循环约 2s 落盘
-//!   工作目录 `runtime/mcp-state.json`（stdio 快照子进程经同源解析读取）。
-//! - 审批令牌在 `RuntimeMcpState` 内单次消费。
+//! A background thread hosts HTTP, bound to loopback by default or all interfaces when LAN access is enabled.
+//! Workbench publishes DUT summaries and recent logs to a shared snapshot.
+//!   A background writer persists the snapshot about every two seconds for the stdio process.
+//! `RuntimeMcpState` consumes each approval token once.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -164,7 +164,10 @@ pub struct RuntimeMcpState {
 }
 
 impl RuntimeMcpState {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "runtime state constructor injects all Workbench services in one call"
+    )]
     pub fn new(
         device: Arc<DeviceService>,
         snapshot: Arc<std::sync::Mutex<duthub_mcp::snapshot::StateSnapshot>>,
@@ -240,10 +243,10 @@ impl RuntimeMcpState {
             .transpose()
     }
 
-    /// 控制动作统一走共用设备操作入口；授权错误带类别码便于 MCP 客户端感知。
-    /// Device 错误（动作真正执行失败）同时转弹窗提醒（需求⑤接入点③）；
-    /// `ApprovalRequired` 是审批协议的正常环节（客户端据此走 approval.request），
-    /// 不算异常、不弹窗。
+    /// Route control actions through the shared device entry point and return typed authorization errors.
+    /// An action that fails during device execution also queues an alert.
+    /// `ApprovalRequired` tells the client to request approval as part of normal operation.
+    /// That response does not queue an alert.
     fn control_execute(
         &self,
         dut_id: &str,
@@ -271,7 +274,7 @@ impl RuntimeMcpState {
             })
     }
 
-    /// `继电器写动作（relay_test）失败同样转弹窗提醒；只读查询（relay_status）不算动作`。
+    /// Relay write failures queue alerts. Read-only relay status queries do not.
     fn relay_test_execute(
         &self,
         dut_id: &str,
@@ -296,7 +299,7 @@ impl RuntimeMcpState {
             })
     }
 
-    /// 控制租约四件套的共享实现：`access` 未接线（异常构造）时明确报错。
+    /// Shared lease operations report an error when no access context was configured.
     fn lease_manager(&self) -> Result<&Arc<ControlLeaseManager>, String> {
         self.access
             .as_ref()
@@ -304,7 +307,7 @@ impl RuntimeMcpState {
             .ok_or_else(|| "控制租约经此状态源不可用（仅桌面 HTTP 运行时支持）".into())
     }
 
-    /// 弹窗提醒入队（去重/抑制/总开关都在 `AlertCenter` 内裁决）。
+    /// Queue a dialog alert through the alert center, which checks deduplication and suppression.
     fn report_control_failure(&self, dut_id: &str, action: &str, err: &str) {
         let (title, detail) = crate::alerts::control_action_alert_texts(dut_id, action, err);
         let _ = self
@@ -340,7 +343,7 @@ fn redact_host_dir(text: &str, host_dir: &std::path::Path) -> String {
     out
 }
 
-/// 租约错误 → `LeaseRequired/{code}: {message}`（与 server.rs 前缀约定一致）。
+/// Format lease errors with the same prefix as the MCP server.
 fn lease_err(err: &LeaseError) -> String {
     format!("LeaseRequired/{}: {}", lease_error_code(err), err.message())
 }
@@ -443,7 +446,11 @@ impl McpState for RuntimeMcpState {
         })
     }
 
-    // ── 控制租约四件套（方案 §6.2；与写入通道共享同一 ControlLeaseManager）────
+    fn serial_screen(&self, dut_id: &str) -> Option<String> {
+        self.device.serial_screen_text(dut_id)
+    }
+
+    // The lease tools share a control lease manager with serial writes.
 
     fn dut_acquire_control(
         &self,
@@ -466,6 +473,35 @@ impl McpState for RuntimeMcpState {
             generation: grant.generation,
             expires_at_unix_ms: grant.expires_at_unix_ms,
             holder: grant.holder,
+            session_name: grant.session_name,
+            acquired_at_unix_ms: grant.acquired_at_unix_ms,
+        })
+    }
+
+    fn dut_acquire_control_with_session(
+        &self,
+        dut_id: &str,
+        holder: duthub_core::LeaseHolder,
+        session_name: &str,
+        wait_ms: u64,
+    ) -> Result<LeaseGrantDto, String> {
+        let mgr = self.lease_manager()?;
+        let wait = if wait_ms > 0 {
+            Some(Duration::from_millis(wait_ms))
+        } else {
+            None
+        };
+        let grant = mgr
+            .acquire_with_session(dut_id, &holder, session_name, wait)
+            .map_err(|e| lease_err(&e))?;
+        Ok(LeaseGrantDto {
+            lease_id: grant.lease_id,
+            dut_id: grant.dut_id,
+            generation: grant.generation,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            holder: grant.holder,
+            session_name: grant.session_name,
+            acquired_at_unix_ms: grant.acquired_at_unix_ms,
         })
     }
 
@@ -480,6 +516,8 @@ impl McpState for RuntimeMcpState {
             generation: grant.generation,
             expires_at_unix_ms: grant.expires_at_unix_ms,
             holder: grant.holder,
+            session_name: grant.session_name,
+            acquired_at_unix_ms: grant.acquired_at_unix_ms,
         })
     }
 
@@ -501,6 +539,9 @@ impl McpState for RuntimeMcpState {
             dut_id: status.dut_id,
             state: state.to_string(),
             holder: status.holder,
+            session_name: status.session_name,
+            acquired_at_unix_ms: status.acquired_at_unix_ms,
+            occupied_secs: status.occupied_secs,
             remaining_secs: status.remaining_secs,
             generation: status.generation,
             queue_len: status.queue_len,
@@ -509,10 +550,21 @@ impl McpState for RuntimeMcpState {
     }
 
     fn serial_write(&self, dut_id: &str, text: &str, writer: WriteIdentity) -> Result<(), String> {
-        // 写身份由 server.rs 租约复核构造（归属当前凭据 + generation）；
-        // device 写入通道再做 [D]/[E] 双点复核（GUI 优先无条件生效）
+        // The MCP server checks that the credential owns the lease and constructs the write identity.
+        // The device rechecks at queue admission and at I/O. GUI priority applies at both points.
         self.device
             .write_line(dut_id, writer, text)
+            .map_err(|e| e.to_string())
+    }
+
+    fn serial_write_raw(
+        &self,
+        dut_id: &str,
+        bytes: &[u8],
+        writer: WriteIdentity,
+    ) -> Result<(), String> {
+        self.device
+            .write_bytes(dut_id, writer, bytes)
             .map_err(|e| e.to_string())
     }
 
@@ -831,7 +883,7 @@ impl McpState for RuntimeMcpState {
             .map_err(|e| e.to_string())
     }
 
-    /// 需求⑥：SKILL.md 落盘到 `<工作目录>/skill/duthub/`（与设置页按钮同一生成器）。
+    /// Export the skill under the work directory using the same generator as the settings button.
     fn skill_export_for_listener(&self, port: Option<u16>) -> Result<String, String> {
         duthub_mcp::skill::export_skill_for_listener(&self.work_dir, port)
             .map(|path| path.display().to_string())
@@ -1007,23 +1059,23 @@ impl UserNotifier for RuntimeMcpState {
     }
 }
 
-/// MCP 运行时监听器句柄集合（F1/T16）：主端点 + 附加/每 DUT 端点。
+/// Handles for the main MCP listener and any extra or DUT-specific listeners.
 ///
-/// `spawn_mcp_runtime` 返回本结构；Workbench 持有并在退出时 [`Self::shutdown`]，
-/// 先发停止信号再 join 服务线程，确保端口/线程在进程退出前释放。
+/// `spawn_mcp_runtime` hands these handles to Workbench.
+/// `Self::shutdown` signals the services before joining to release the ports and threads.
 #[derive(Default)]
 pub struct McpRuntimeHandles {
     snapshot_writer: Option<SnapshotWriter>,
     pub main: Option<ListenerHandle>,
     pub extras: Vec<ListenerHandle>,
-    /// W4a：绑定/启动失败记录 `(port, reason)`。bind 失败不再只有
-    /// eprintln —— Agent 接入页与连接管理 MCP 卡据此显示实际监听与失败
-    /// 原因，避免「配了端口却静默没监听」。
+    /// Capture binding or startup failures as port and reason pairs.
+    /// The Agent access and connection management pages show active endpoints and
+    /// why a configured port did not start.
     pub failures: Vec<(u16, String)>,
 }
 
 impl McpRuntimeHandles {
-    /// 关闭全部 HTTP 监听器（每个最多等待 500ms；超时后端口仍会随线程退出释放）。
+    /// Stop all HTTP listeners, waiting up to 500 ms for each. A timed-out listener releases its port when its thread exits.
     pub fn shutdown(&mut self) {
         if let Some(writer) = self.snapshot_writer.take() {
             writer.shutdown();
@@ -1037,7 +1089,7 @@ impl McpRuntimeHandles {
         }
     }
 
-    /// W4a：某端口的失败原因（UI 展示用）；未失败返回 None。
+    /// Return a port's startup failure for display, if present.
     pub fn failure_for_port(&self, port: u16) -> Option<&str> {
         self.failures
             .iter()
@@ -1101,18 +1153,26 @@ fn snapshot_content_digest(snapshot: &duthub_mcp::snapshot::StateSnapshot) -> St
     duthub_core::util::sha256_hex(&bytes)
 }
 
-/// `待启动端点：(is_main`, port, listener id, bound DUT id)。
-type EndpointSpec = (bool, u16, Option<Arc<str>>, Option<Arc<str>>);
+enum EndpointIdentity {
+    Main,
+    Extra {
+        listener_id: Arc<str>,
+        dut_id: Option<Arc<str>>,
+    },
+}
 
-/// 启动 MCP HTTP 端点（默认 `127.0.0.1:{port}`；`lan_requested` 时绑 `0.0.0.0`，
-/// 同一端口同时接受回环与局域网地址）与快照落盘循环（后台线程，失败仅打印 stderr）。
-/// 局域网绑定在认证关闭时 fail closed，回退 127.0.0.1。
-/// 主端点与各附加监听器的 [`ListenerHandle`] 随返回值交给调用方持有（T16）。
-/// W4a：绑定/启动失败记录进 [`McpRuntimeHandles::failures`]，不再静默丢失。
-#[allow(clippy::too_many_arguments)] // 与 RuntimeMcpState::new 同理由：运行时装配参数由 Workbench 一次性注入
+/// Start the HTTP listeners and the background snapshot writer.
+/// `lan_requested` binds to all interfaces, which includes loopback.
+/// If authentication is disabled, a LAN request falls back to loopback.
+/// Return the main and extra `ListenerHandle` values to the caller.
+/// Bind and startup failures are recorded in `McpRuntimeHandles::failures`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Workbench supplies these runtime dependencies together at startup"
+)]
 pub fn spawn_mcp_runtime(
     state: &Arc<dyn duthub_mcp::state::McpState>,
-    notifier: Option<&Arc<dyn duthub_mcp::notify::UserNotifier>>,
+    notifier: Option<Arc<dyn duthub_mcp::notify::UserNotifier>>,
     access: Option<&Arc<duthub_mcp::auth_http::AccessContext>>,
     port: u16,
     lan_requested: bool,
@@ -1124,30 +1184,40 @@ pub fn spawn_mcp_runtime(
     let auth_enabled = access.is_some_and(|ctx| ctx.auth.settings().enabled);
     let lan_access = lan_requested && auth_enabled;
     if lan_requested && !auth_enabled {
-        eprintln!("[mcp] 已配置局域网访问但认证未开启：回退 127.0.0.1（fail closed）");
+        eprintln!("[mcp] LAN access requires authentication. Binding to 127.0.0.1");
     }
     let bind_ip = if lan_access {
         Ipv4Addr::UNSPECIFIED
     } else {
         Ipv4Addr::LOCALHOST
     };
-    let endpoints: Vec<EndpointSpec> = std::iter::once((true, port, None, None))
-        .chain(listeners.into_iter().map(|listener| {
+    let notifiers = std::iter::repeat_n(notifier, listeners.len() + 1);
+    let endpoints = std::iter::once((port, EndpointIdentity::Main)).chain(
+        listeners.into_iter().map(|listener| {
             (
-                false,
                 listener.port,
-                Some(Arc::<str>::from(listener.id)),
-                listener.dut_id.map(Arc::<str>::from),
+                EndpointIdentity::Extra {
+                    listener_id: Arc::from(listener.id),
+                    dut_id: listener.dut_id.map(Arc::from),
+                },
             )
-        }))
-        .collect();
+        }),
+    );
     let mut handles = McpRuntimeHandles::default();
-    for (is_main, port, listener_id, listener_dut) in endpoints {
+    for ((port, identity), notifier) in endpoints.zip(notifiers) {
+        let (listener_id, listener_dut) = match identity {
+            EndpointIdentity::Main => (None, None),
+            EndpointIdentity::Extra {
+                listener_id,
+                dut_id,
+            } => (Some(listener_id), dut_id),
+        };
+        let is_main = listener_id.is_none();
         let bind_addr = SocketAddr::from((bind_ip, port));
         let listener = match std::net::TcpListener::bind(bind_addr) {
             Ok(listener) => listener,
             Err(error) => {
-                eprintln!("[mcp] 绑定 {bind_addr} 失败: {error}");
+                eprintln!("[mcp] Failed to bind {bind_addr}: {error}");
                 handles
                     .failures
                     .push((port, format!("绑定 {bind_addr} 失败: {error}")));
@@ -1163,7 +1233,7 @@ pub fn spawn_mcp_runtime(
             access.cloned(),
             listener_id,
             listener_dut,
-            notifier.cloned(),
+            notifier,
         ) {
             Ok(handle) => {
                 if is_main {
@@ -1173,7 +1243,7 @@ pub fn spawn_mcp_runtime(
                 }
             }
             Err(error) => {
-                eprintln!("[mcp] 启动 {bind_addr} 失败: {error}");
+                eprintln!("[mcp] Failed to start listener at {bind_addr}: {error}");
                 handles
                     .failures
                     .push((port, format!("启动 HTTP 服务失败: {error}")));

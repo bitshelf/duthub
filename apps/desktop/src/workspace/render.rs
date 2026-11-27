@@ -1,8 +1,19 @@
-use super::{Workbench, Window, Context, IntoElement, AppContext, Ordering, WindowExt, FluentBuilder, usb_debug_enabled, InteractiveElement, Styled, div, px, ParentElement, ViewMode, PaneDivider, StatefulInteractiveElement, icon_btn, theme, MouseMoveEvent, MouseButton, MouseDownEvent, ConfigPage, Notification, AlertItem, Palette, AlertSource, SharedString, icon, img, LinkState, Disableable, btn, i18n, BtnVariant, WindowControlArea, CommandState, Command, CommandItem, AnyElement, GarbleLevel, Div, kit_icon, In, DEFAULT_TERMINAL_FONT_SIZE, terminal_grid_for, terminal_selection_bg, KeyDownEvent, arrow_escape_prefix, typed_char, LogLine, Pixels, LineKind, Arc, SessionView, ModalKind, HashMap, store, archive_safe_name, boot_reference_path, demo_dut_template, render_connection, render_flash_tools, render_usb_debug, render_settings, ModalState, QuickCommand};
+use super::{
+    AlertItem, AlertSource, AnyElement, AppContext, Arc, Command, CommandItem, CommandState,
+    ConfigPage, Context, Disableable, Div, FluentBuilder, GarbleLevel, HashMap, In,
+    InteractiveElement, IntoElement, KeyDownEvent, LineKind, LinkState, LogLine, ModalKind,
+    ModalState, MouseButton, MouseDownEvent, MouseMoveEvent, Notification, Ordering, Palette,
+    PaneDivider, ParentElement, Pixels, QuickCommand, SessionView, SharedString,
+    StatefulInteractiveElement, Styled, ViewMode, Window, WindowControlArea, WindowExt, Workbench,
+    archive_safe_name, arrow_escape_prefix, boot_reference_path, demo_dut_template, div, i18n,
+    icon, icon_btn, img, kit_icon, px, render_connection, render_flash_tools, render_settings,
+    render_usb_debug, store, terminal_grid_for, terminal_selection_bg, theme, typed_char,
+    usb_debug_enabled,
+};
 
 impl Workbench {
     // ------------------------------------------------------------------
-    // 渲染
+    // Rendering
     // ------------------------------------------------------------------
 
     pub fn render_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -198,8 +209,10 @@ impl Workbench {
                     this.finish_shell_selection(cx);
                 }),
             )
-            // 下拉打开时：底层透明捕获层命中“空白处”点击 → 关闭下拉
-            // （下拉列表自身 occlude 在上层，内部交互不受影响）
+            // When the dropdown menu is opened: The underlying transparent capture layer encounters
+            // "blank space" during interaction → Close the dropdown menu.
+            // (The dropdown list itself overlaps with the upper layer, so any internal interactions
+            // remain unaffected.)
             .when(self.open_dd.is_some(), |el| {
                 el.child(
                     div()
@@ -216,9 +229,10 @@ impl Workbench {
             .child(split)
             .child(bottom);
 
-        // 浮层：菜单 / 配置壳 / 弹窗 / Toast / 下拉关闭背景
+        // Overlay: Menu / Configuration Shell / Pop-up / Toast / Drop-down Background Removal
         if self.menu_open {
-            // 空白捕获层：点菜单以外任意区域关闭（菜单面板自身 occlude 挡住本层）
+            // Blank Capture Layer: Click on any area outside the menu to close it (the menu panel
+            // itself will block this layer).
             root = root.child(
                 div()
                     .id("menu-backdrop")
@@ -232,7 +246,7 @@ impl Workbench {
                         }),
                     ),
             );
-            root = root.child(self.render_workspace_menu(p, cx));
+            root = root.child(Self::render_workspace_menu(p, cx));
         }
         if let Some((ctx_x, ctx_y)) = self.terminal_ctx {
             root = root.child(self.render_terminal_ctx_menu(ctx_x, ctx_y, p, cx));
@@ -244,10 +258,8 @@ impl Workbench {
         if let Some(page) = self.overlay {
             root = root.child(self.render_config_overlay(page, window, cx));
         }
-        // 异常弹窗提醒调度（需求⑤）：仅在没有活动 Dialog 时弹出（不与表单弹窗
-        // 叠加，避免 close_dialog 关错层）；「需要人工干预」弹窗禁用了 Esc/遮罩/
-        // 右上角 X 关闭，只能经按钮收尾，alert_dialog_open 若因外部关闭残留
-        //（如其他代码 close_all_dialogs）由本帧自愈复位。
+        // Keep alerts behind active forms. Explicit alert actions clear the dialog flag;
+        // the next render also recovers it if another path closes the dialog.
         // While hidden to the tray or minimized to the taskbar, the dialog stays
         // queued: the tick flashes the taskbar/tray icon instead, and the queue
         // is drained as soon as the window is visible on the desktop again.
@@ -255,22 +267,35 @@ impl Workbench {
             .tray
             .as_ref()
             .is_some_and(duthub_desktop::tray::TrayHandle::main_minimized);
+        if self.dismiss_active_alert_dialog {
+            self.dismiss_active_alert_dialog = false;
+            if self.alert_dialog_open && window.has_active_dialog(cx) {
+                self.alert_dialog_open = false;
+                self.active_alert_dialog = None;
+                window.close_dialog(cx);
+            }
+        }
         if !self.hidden && !minimized && self.alert_dialog_open && !window.has_active_dialog(cx) {
             self.alert_dialog_open = false;
+            self.active_alert_dialog = None;
         }
         if !self.hidden && !minimized && !self.alert_dialog_open && !window.has_active_dialog(cx) {
             let next = self.alerts.lock().unwrap().pop_next();
             if let Some(item) = next {
                 self.alert_dialog_open = true;
+                self.active_alert_dialog = Some((item.dut_id.clone(), item.source));
                 self.open_alert_dialog(item, window, cx);
                 // Flash the taskbar icon if the window is open on the desktop
                 // but currently behind another application (no-op when foreground).
-                if let Some(tray) = self.tray.as_ref() {
+                if !self.settings.alerts.mute_taskbar_alerts
+                    && let Some(tray) = self.tray.as_ref()
+                {
                     tray.flash_taskbar();
                 }
             }
         }
-        // kit Notification：渲染帧统一推送（Root 层管理生命周期/动画）
+        // Kit Notification: Unified push of rendered frames (Root layer management
+        // lifecycle/animation)
         if self.toasts_omitted > 0 {
             let omitted = std::mem::take(&mut self.toasts_omitted);
             let message = crate::i18n::message("toastOmitted", &[("count", &omitted.to_string())]);
@@ -282,11 +307,8 @@ impl Workbench {
         root
     }
 
-    /// 打开「需要人工干预」弹窗（kit Dialog，需求⑤）：
-    /// 标题固定，detail 展示来源与上下文；按钮 知道了 / 忽略此类（按 source
-    /// 抑制并落盘）/ 打开面板（仅 Agent 来源）。浮层内 kit Button 渲染异常
-    /// （坑 #2），按钮一律手绘 div；禁用 Esc/遮罩/X 关闭，关闭动作全部经按钮，
-    /// 保证 `alert_dialog_open` 生命周期可控。
+    /// Open the "Requires Human Intervention" dialog box (kit Dialog, requirement ⑤):
+    /// Open one alert at a time so each explicit close action owns the dialog.
     pub(super) fn open_alert_dialog(
         &mut self,
         item: AlertItem,
@@ -296,15 +318,9 @@ impl Workbench {
         let view = cx.entity();
         let p = self.p;
         window.open_dialog(cx, move |dialog, _window, cx| {
-            let (title, body) = view.update(cx, |w, cx| {
-                (
-                    crate::i18n::label("alertsTitle"),
-                    w.render_alert_dialog_body(&item, p, cx),
-                )
-            });
+            let body = view.update(cx, |_, cx| Self::render_alert_dialog_body(&item, p, cx));
             dialog
                 .w(px(440.))
-                .title(title)
                 .overlay_closable(false)
                 .keyboard(false)
                 .close_button(false)
@@ -313,78 +329,53 @@ impl Workbench {
         cx.notify();
     }
 
-    /// Modern alert dialog body: semantic icon badge + title/meta + accented
-    /// message card + hairline-separated footer actions.
     pub(super) fn render_alert_dialog_body(
-        &mut self,
         item: &AlertItem,
         p: &'static Palette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let source = item.source;
         let dut_id = item.dut_id.clone();
-        let at = crate::alerts::format_alert_time(item.at, crate::alerts::now_ms());
-        let tone = match item.level {
-            crate::alerts::AlertLevel::Error => p.red,
-            crate::alerts::AlertLevel::Warning => p.warn,
-            crate::alerts::AlertLevel::Info => p.accent,
+        let (glyph, tone) = match source {
+            AlertSource::Relay | AlertSource::Control => ("bolt", p.warn),
+            _ => {
+                let glyph = match source {
+                    AlertSource::Agent | AlertSource::AgentNotice => "spark",
+                    AlertSource::Media => "eye",
+                    AlertSource::UsbDebug => "usb",
+                    _ => "alert",
+                };
+                let tone = match item.level {
+                    crate::alerts::AlertLevel::Error => p.red,
+                    crate::alerts::AlertLevel::Warning => p.warn,
+                    crate::alerts::AlertLevel::Info => p.accent,
+                };
+                (glyph, tone)
+            }
         };
-        let tint = |alpha: f32| gpui_kit::Rgba { a: alpha, ..tone };
-        let glyph = match source {
-            AlertSource::Agent | AlertSource::AgentNotice => "spark",
-            AlertSource::Media => "eye",
-            AlertSource::UsbDebug => "usb",
-            AlertSource::Relay | AlertSource::Control => "bolt",
-            _ => "alert",
+        let title = if source == AlertSource::Relay {
+            crate::i18n::label("relayAlertDialogTitle").to_owned()
+        } else {
+            crate::alerts::alert_headline(source, &item.title, &item.detail)
         };
-
-        let mut meta = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(6.))
-            .child(
-                div()
-                    .px(px(8.))
-                    .py(px(2.))
-                    .rounded(px(999.))
-                    .bg(tint(0.14))
-                    .border_1()
-                    .border_color(tint(0.28))
-                    .text_size(px(11.))
-                    .font_weight(gpui_kit::FontWeight(550.0))
-                    .text_color(tone)
-                    .child(source.label()),
-            )
-            .child(div().text_size(px(11.)).text_color(p.faint).child("·"))
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .font_family(theme::MONO_FONT)
-                    .text_color(p.faint)
-                    .child(SharedString::from(at)),
-            );
-        if item.repeat > 0 {
-            meta = meta.child(
-                div()
-                    .px(px(6.))
-                    .py(px(1.))
-                    .rounded(px(999.))
-                    .bg(p.raised)
-                    .border_1()
-                    .border_color(p.line)
-                    .text_size(px(10.5))
-                    .font_family(theme::MONO_FONT)
-                    .text_color(p.muted)
-                    .child(SharedString::from(format!("+{}", item.repeat))),
-            );
-        }
+        let close = icon_btn("alert-close", "x", p)
+            .accessibility_label(crate::i18n::label("close"))
+            .tooltip(crate::i18n::label("close"))
+            .on_click(cx.listener(|this, _ev, window, cx| {
+                this.alert_dialog_open = false;
+                this.active_alert_dialog = None;
+                this.dismiss_active_alert_dialog = false;
+                window.close_dialog(cx);
+                cx.notify();
+            }));
 
         let header = div()
+            .relative()
             .flex()
-            .items_start()
+            .items_center()
             .gap(px(14.))
-            .w_full()
+            .min_h(px(56.))
+            .pr(px(34.))
             .child(
                 div()
                     .w(px(42.))
@@ -394,101 +385,36 @@ impl Workbench {
                     .items_center()
                     .justify_center()
                     .rounded(px(12.))
-                    .bg(tint(0.14))
+                    .bg(gpui_kit::Rgba { a: 0.20, ..tone })
                     .border_1()
-                    .border_color(tint(0.28))
-                    .child(icon(glyph).size(px(20.)).text_color(tone)),
+                    .border_color(gpui_kit::Rgba { a: 0.40, ..tone })
+                    .child(icon(glyph).size(px(22.)).text_color(tone)),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(gpui_kit::FontWeight(650.0))
-                            .line_height(px(21.))
-                            .text_color(p.text)
-                            .whitespace_normal()
-                            .child(SharedString::from(item.title.clone())),
-                    )
-                    .child(meta),
-            );
-
-        let mut body = div().flex().flex_col().gap(px(14.)).w_full().child(header);
-        if !item.detail.trim().is_empty() {
-            body = body.child(
-                div()
-                    .flex()
-                    .w_full()
-                    .min_w_0()
-                    .rounded(px(10.))
-                    .bg(p.bg)
-                    .border_1()
-                    .border_color(p.line)
-                    .overflow_hidden()
-                    .child(div().w(px(3.)).flex_shrink_0().bg(tone))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .px(px(14.))
-                            .py(px(12.))
-                            .text_size(px(13.))
-                            .line_height(px(20.))
-                            .text_color(p.text)
-                            .whitespace_normal()
-                            .child(SharedString::from(item.detail.clone())),
-                    ),
-            );
-        }
-
-        // Agent source carries an "Open pane" action to jump straight to the Agent panel.
-        let can_open_agent =
-            source == AlertSource::Agent && self.sessions.iter().any(|view| view.dut_id == dut_id);
-        let open_panel_btn = can_open_agent.then(|| {
-            let target = dut_id.clone();
-            div()
-                .id("alert-open-panel")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(34.))
-                .px(px(14.))
-                .rounded(px(8.))
-                .bg(p.raised)
-                .border_1()
-                .border_color(p.border)
-                .text_size(px(13.))
-                .text_color(p.text)
-                .cursor_pointer()
-                .hover(|s| s.bg(p.hover))
-                .child(crate::i18n::label("openPane"))
-                .on_click(cx.listener(move |this, _ev, window, cx| {
-                    if let Some(index) = this.sessions.iter().position(|view| view.dut_id == target)
-                    {
-                        this.active_session = index;
-                        this.term_grid = None;
-                        this.open_side_panel(crate::side_panel::Panel::Agent, window, cx);
-                    }
-                    this.alert_dialog_open = false;
-                    window.close_dialog(cx);
-                    cx.notify();
-                }))
-        });
+                    .text_size(px(19.))
+                    .font_weight(gpui_kit::FontWeight(650.0))
+                    .line_height(px(25.))
+                    .text_color(p.text)
+                    .whitespace_normal()
+                    .child(title),
+            )
+            .child(div().absolute().top(px(0.)).right(px(0.)).child(close));
 
         let mute_btn = div()
             .id("alert-suppress")
             .flex()
             .items_center()
             .justify_center()
-            .h(px(32.))
-            .px(px(10.))
+            .h(px(34.))
+            .px(px(14.))
             .rounded(px(8.))
-            .text_size(px(12.5))
+            .bg(p.raised)
+            .border_1()
+            .border_color(p.border)
+            .text_size(px(13.))
             .text_color(p.muted)
             .cursor_pointer()
             .hover(|s| s.bg(p.hover).text_color(p.text))
@@ -507,6 +433,8 @@ impl Workbench {
                     this.suppress_alert_source_globally(source);
                 }
                 this.alert_dialog_open = false;
+                this.active_alert_dialog = None;
+                this.dismiss_active_alert_dialog = false;
                 window.close_dialog(cx);
                 cx.notify();
             }));
@@ -525,34 +453,40 @@ impl Workbench {
             .text_color(p.accent_contrast)
             .cursor_pointer()
             .hover(|s| s.opacity(0.92))
+            .gap(px(6.))
+            .child(icon("check").size(px(15.)).text_color(p.accent_contrast))
             .child(crate::i18n::label("acknowledgeAlert"))
             .on_click(cx.listener(move |this, _ev, window, cx| {
                 this.alert_dialog_open = false;
+                this.active_alert_dialog = None;
+                this.dismiss_active_alert_dialog = false;
                 window.close_dialog(cx);
                 cx.notify();
             }));
 
-        let mut right_actions = div().flex().items_center().gap(px(8.));
-        if let Some(btn) = open_panel_btn {
-            right_actions = right_actions.child(btn);
-        }
-        right_actions = right_actions.child(ack_btn);
-
         let footer = div()
             .flex()
+            .flex_wrap()
             .items_center()
-            .justify_between()
-            .gap(px(10.))
+            .justify_end()
+            .gap(px(8.))
             .pt(px(12.))
             .border_t_1()
             .border_color(p.line)
             .child(mute_btn)
-            .child(right_actions);
+            .child(ack_btn);
 
-        body.child(footer).into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .w_full()
+            .child(header)
+            .child(footer)
+            .into_any_element()
     }
 
-    /// 首页：居中品牌 + 创建连接 / 设备工具 + 历史连接磁贴（两行五列，最多 10 个）。
+    /// Render the home view with connection actions, device tools, and up to ten recent connection tiles.
     pub(super) fn render_home(
         &mut self,
         p: &'static Palette,
@@ -568,7 +502,7 @@ impl Workbench {
             .w_full()
             .px(px(24.0));
 
-        // 品牌大图
+        // Brand images
         content = content.child(
             img("brand/app-256.png")
                 .size(px(96.0))
@@ -576,7 +510,8 @@ impl Workbench {
                 .shadow_md(),
         );
 
-        // 首页与标签栏共用连接表单，避免枚举顺序决定连接目标。
+        // The homepage and the tag column share the same connection form. This ensures that the
+        // order of enumeration determines the target of the connection.
         content = content.child(
             div()
                 .flex()
@@ -654,11 +589,13 @@ impl Workbench {
                 ),
         );
 
-        // 历史连接磁贴（两行五列；不足 10 个按实际数量显示，0 个不显示）
+        // Show up to ten recent connections in two rows of five. Hide the section when there are
+        // none.
         let tiles: Vec<(usize, &duthub_core::model::DutConfig)> =
             self.duts.file.duts.iter().enumerate().take(10).collect();
         if !tiles.is_empty() {
-            // 从中间向两边：flex wrap 居中，磁贴固定宽（每行最多 5 个）
+            // From the middle to both sides: Flex wrap should be centered. The width of magnetic
+            // tiles should be fixed (up to 5 tiles per row).
             let mut grid = div()
                 .flex()
                 .flex_wrap()
@@ -859,136 +796,8 @@ impl Workbench {
         if self.find_open {
             page = page.child(self.render_find_bar(window, p, cx));
         }
-        if let Some(session) = self.sessions.get(active)
-            && let Some(history) = &session.history
-        {
-            let older = history.skip + history.screen.rows.len();
-            let newer = history
-                .skip
-                .saturating_sub(duthub_device::term::HISTORY_PAGE_ROWS);
-            page = page.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.))
-                    .p(px(8.))
-                    .bg(p.surface)
-                    .child(
-                        btn(
-                            "terminal-history-older",
-                            i18n::label("terminalHistoryOlder"),
-                            &BtnVariant::Tiny,
-                            p,
-                        )
-                        .disabled(history.earlier == 0 || session.history_pending.is_some())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.request_terminal_history(older, true, cx);
-                        })),
-                    )
-                    .child(
-                        btn(
-                            "terminal-history-newer",
-                            i18n::label("terminalHistoryNewer"),
-                            &BtnVariant::Tiny,
-                            p,
-                        )
-                        .disabled(newer == 0 || session.history_pending.is_some())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.request_terminal_history(newer, true, cx);
-                        })),
-                    )
-                    .child(
-                        btn(
-                            "terminal-history-live",
-                            i18n::label("terminalHistoryLive"),
-                            &BtnVariant::TinyPrimary,
-                            p,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(session) = this.sessions.get_mut(this.active_session) {
-                                session.history = None;
-                                session.history_pending = None;
-                                session.selection = None;
-                            }
-                            this.terminal_scroll.scroll_to_bottom();
-                            window.focus(&this.input_focus, cx);
-                            cx.notify();
-                        })),
-                    ),
-            );
-        }
         page = page.child(self.render_terminal(active, p, window, cx));
         page
-    }
-
-    pub(super) fn request_terminal_history(
-        &mut self,
-        skip: usize,
-        show_empty_notice: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.sessions.get_mut(self.active_session) else {
-            return;
-        };
-        if session.source != "device" || session.history_pending.is_some() {
-            return;
-        }
-        let request = match self.device.read_terminal_history(&session.dut_id, skip) {
-            Ok(request) => request,
-            Err(error) => {
-                self.notify_toast(i18n::message(
-                    "terminalHistoryFailed",
-                    &[("error", &error.to_string())],
-                ));
-                cx.notify();
-                return;
-            }
-        };
-        let id = session.session_id.clone();
-        let request_id = uuid::Uuid::new_v4();
-        session.history_pending = Some(request_id);
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = request.await;
-            let _ = this.update(cx, |this, cx| {
-                let Some(session) = this
-                    .sessions
-                    .iter_mut()
-                    .find(|session| session.session_id == id)
-                else {
-                    return;
-                };
-                if session.history_pending != Some(request_id) {
-                    return;
-                }
-                session.history_pending = None;
-                match result {
-                    Ok(history) if !history.screen.rows.is_empty() => {
-                        session.history = Some(history);
-                        session.selection = None;
-                        if this
-                            .sessions
-                            .get(this.active_session)
-                            .is_some_and(|session| session.session_id == id)
-                        {
-                            this.terminal_scroll
-                                .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
-                        }
-                    }
-                    Ok(_) if show_empty_notice => {
-                        this.notify_toast(i18n::label("terminalHistoryEmpty"));
-                    }
-                    Ok(_) => {}
-                    Err(error) => this.notify_toast(i18n::message(
-                        "terminalHistoryFailed",
-                        &[("error", &error.to_string())],
-                    )),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     pub(super) fn render_titlebar(
@@ -996,8 +805,10 @@ impl Workbench {
         p: &'static Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // 单行集成工具行：整行 WCA::Drag（系统拖动 + 双击最大化），
-        // tabs/按钮子元素命中优先于拖动；右端为 46px 宽的 Windows 风格控制钮。
+        // Single-line integration tools: The entire line can be dragged using WCA::Drag
+        // (system-driven dragging + double-click for maximization).
+        // Tab/button sub-elements are prioritized over dragging operations. At the right end, there
+        // are control buttons in Windows-style layout, with a width of 46px.
         div()
             .flex()
             .items_center()
@@ -1017,7 +828,14 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let switched = self.active_session != index;
         self.active_session = index;
+        if switched
+            && let Some(session) = self.sessions.get_mut(index)
+            && session.scrollback.is_none()
+        {
+            session.scroll_to_bottom_pending = true;
+        }
         if self.view != ViewMode::Serial {
             self.connection_open = false;
             self.connection_dut_scope = None;
@@ -1042,22 +860,20 @@ impl Workbench {
             use nucleo_matcher::{Matcher, Utf32Str};
 
             let query = state.read(cx).query(cx);
-            let mut choices = view
-                .upgrade()
-                .map_or_default(|view| {
-                    let this = view.read(cx);
-                    this.sessions
-                        .iter()
-                        .enumerate()
-                        .map(|(index, session)| {
-                            (
-                                session.session_id.clone(),
-                                session.display_title(&this.duts.file.duts),
-                                this.view == ViewMode::Serial && index == this.active_session,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
+            let mut choices = view.upgrade().map_or_default(|view| {
+                let this = view.read(cx);
+                this.sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, session)| {
+                        (
+                            session.session_id.clone(),
+                            session.display_title(&this.duts.file.duts),
+                            this.view == ViewMode::Serial && index == this.active_session,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
 
             if !query.trim().is_empty() {
                 let pattern = Pattern::new(
@@ -1162,7 +978,7 @@ impl Workbench {
                 )
                 .into_any_element(),
         );
-        // 分隔线
+        // Separating lines
         out.push(
             div()
                 .w(px(1.0))
@@ -1172,13 +988,15 @@ impl Workbench {
                 .into_any_element(),
         );
 
-        // session tabs（h_full 顶接 titlebar 底边，激活 bg(term) 与终端连通）
+        // Session tabs (h_full extends to the bottom of the title bar; activates bg(term) and
+        // connects to the terminal.)
         let count = self.sessions.len();
         for index in 0..count {
             let is_active = self.view == ViewMode::Serial && index == self.active_session;
             let session = &self.sessions[index];
             let title = session.display_title(&self.duts.file.duts);
-            // 重连中的会话 tab 圆点标红（H1.4 重连状态显示）
+            // The session tab during reconnection is marked in red (H1.4: Display of reconnection
+            // status)
             let link_red = self.sessions[index].link == LinkState::Reconnecting;
             // Garbled serial bytes keep an amber dot (link loss stays red).
             let garbled = session.last_garbled_level == GarbleLevel::Garbled;
@@ -1237,8 +1055,10 @@ impl Workbench {
                         div()
                             .id(SharedString::from(format!("session-tab-close-{index}")))
                             .on_click(cx.listener(move |this, _ev, _win, cx| {
-                                // 阻断冒泡：否则父 tab 的 on_click 也会触发，
-                                // 把 active_session 设成删除前的旧索引（可能越界）
+                                // Blocking bubbling: Otherwise, the on_click event of the parent
+                                // tab will also be triggered. It's necessary to set the
+                                // active_session to its previous index before deletion (potentially
+                                // causing out-of-bounds issues).
                                 cx.stop_propagation();
                                 this.close_session_view(index, cx);
                             }))
@@ -1255,7 +1075,7 @@ impl Workbench {
                     .into_any_element(),
             );
         }
-        // ＋ 新建会话
+        // ＋ Create a new session
         out.push(
             div()
                 .id("new-session")
@@ -1276,7 +1096,8 @@ impl Workbench {
                 .into_any_element(),
         );
 
-        // 空档：占满 tab 与工具栏之间（TitleBar 拖动区）
+        // Empty state: The tab occupies the entire space between the toolbar (the area where the
+        // TitleBar is dragged).
         out.push(div().flex_1().h_full().into_any_element());
 
         if self.rec_on {
@@ -1291,7 +1112,8 @@ impl Workbench {
             );
         }
 
-        // Windows 风格窗口控制钮（46px 宽，16px 字形；系统命中区 Min/Max/Close）
+        // Windows-style window controls (46px in width, 16px in font size; minimum/maximum/close
+        // positions of the system-defined area)
         out.push(
             div()
                 .flex()
@@ -1326,7 +1148,8 @@ impl Workbench {
         out
     }
 
-    /// 单个窗口控制钮：宽 46 与 Windows 原生一致；close 悬停红底。
+    /// Single window controls: The width is 46 units, consistent with Windows native requirements.
+    /// The "Close" button has a red background when hovered over.
     pub(super) fn win_btn(
         id: &'static str,
         icon_name: &'static str,
@@ -1362,22 +1185,14 @@ impl Workbench {
         let total = if folded_query.is_empty() {
             0
         } else {
-            self.sessions
-                .get(self.active_session)
-                .map_or(0, |v| {
-                    let annotations = v.history.is_none().then_some(v.lines.as_slice());
-                    let terminal_rows = v
-                        .displayed_screen()
-                        .into_iter()
-                        .flat_map(|screen| &screen.rows);
-                    annotations
-                        .into_iter()
-                        .flatten()
-                        .map(|line| line.text.as_ref())
-                        .chain(terminal_rows.map(|row| row.text.as_str()))
-                        .filter(|line| line.to_lowercase().contains(&folded_query))
-                        .count()
-                })
+            self.sessions.get(self.active_session).map_or(0, |v| {
+                v.lines
+                    .iter()
+                    .map(|line| line.text.as_ref())
+                    .chain(v.displayed_rows().map(|row| row.text.as_str()))
+                    .filter(|line| line.to_lowercase().contains(&folded_query))
+                    .count()
+            })
         };
         let mut bar = div()
             .flex()
@@ -1436,22 +1251,29 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let query = self.find_query.to_lowercase();
-        // 跟随模式（原型 nearBottom）：上一帧视口贴近底部（或内容不足一屏）时，
-        // 新输出自动滚到底部；用户上翻阅读时不打断。
+        // Follow output only while the viewport is at the bottom.
         let near_bottom = {
             let state = self.terminal_scroll.0.borrow();
             let offset = state.base_handle.offset().y;
             let max = state.base_handle.max_offset().y;
-            // offset 向下滚动为负，到底时 offset.y ≈ -max；距底部距离 = max + offset
-            max <= px(0.) || (max + offset) < px(65.)
+            max <= px(0.) || max + offset <= px(1.)
         };
-        // real 会话（PuTTY 模式）：视口尺寸变化 → 下发 term.resize(cols, rows)
+        let scroll_on_output = self.settings.terminal.scroll_on_output;
+        if self
+            .sessions
+            .get_mut(active)
+            .is_some_and(|session| session.follow_terminal_tail(near_bottom, scroll_on_output))
+        {
+            self.terminal_scroll.scroll_to_bottom();
+        }
+        // Real session (PuTTY mode): When the viewport size changes, execute term.resize(cols,
+        // rows).
         let is_device = self
             .sessions
             .get(active)
             .is_some_and(|s| s.source == "device");
         let (font_family, font_size, cell_width) = self.terminal_font(window);
-        let row_height = font_size * (20.6 / DEFAULT_TERMINAL_FONT_SIZE);
+        let row_height = super::terminal::terminal_row_height(font_size, window);
         if is_device {
             let (left, right) = self.pane_widths(window.viewport_size().width);
             let width = left + right;
@@ -1465,8 +1287,9 @@ impl Workbench {
                 }
             }
         }
-        // 视口容器只承载焦点/按键/内边距；滚动交给内部的 uniform_list
-        // （虚拟化：仅可见行构建元素，此前每帧全量重建 4000+400 个 div）。
+        // The viewport container only handles focus/press/tolerance; scrolling is handled by the
+        // internal uniform_list. (Virtualization: Only row-building elements are visible.
+        // Previously, 4000 + 400 divs were recreated per frame.)
         let selection_bg = terminal_selection_bg(p, self.theme_mode);
         let mut viewport = div()
             .id("terminal-viewport")
@@ -1474,7 +1297,7 @@ impl Workbench {
             .flex_1()
             .flex_col()
             .min_h_0()
-            .px(px(19.))
+            .pl(px(19.))
             .pt(px(16.))
             .pb(px(40.))
             .text_size(font_size)
@@ -1498,23 +1321,13 @@ impl Workbench {
                 }),
             )
             .on_scroll(
-                cx.listener(move |this, event: &gpui_kit::ScrollEvent, _, cx| {
-                    if this.overlay.is_some() || event.delta.pixel_delta(row_height).y <= px(0.) {
-                        return;
-                    }
-                    if this.terminal_scroll.0.borrow().base_handle.offset().y < -px(1.) {
-                        return;
-                    }
-                    let Some(screen) = this.sessions.get(active).and_then(|view| {
-                        (view.source == "device" && view.history.is_none())
-                            .then_some(view.screen.as_ref())
-                            .flatten()
-                    }) else {
-                        return;
-                    };
-                    let skip = screen.rows.len();
-                    if skip >= this.device.terminal_buffer().1 {
-                        this.request_terminal_history(skip, false, cx);
+                cx.listener(move |this, event: &gpui_kit::ScrollEvent, window, cx| {
+                    if this.overlay.is_none() && !window.has_active_dialog(cx) {
+                        this.scroll_terminal_history(
+                            event.delta.pixel_delta(row_height).y,
+                            row_height,
+                            cx,
+                        );
                     }
                 }),
             )
@@ -1578,14 +1391,6 @@ impl Workbench {
                         cx.notify();
                     }
                     cx.stop_propagation();
-                    return;
-                }
-                // Reading terminal history must not send keys to the live device.
-                if this
-                    .sessions
-                    .get(active)
-                    .is_some_and(|session| session.history.is_some())
-                {
                     return;
                 }
                 let paste_shortcut = (k.modifiers.control && k.modifiers.shift && k.key == "v")
@@ -1677,25 +1482,24 @@ impl Workbench {
                 }
                 if k.key == "backspace" {
                     this.clear_terminal_selection(active);
+                    this.scroll_terminal_on_input(cx);
                     this.input.pop();
                     cx.notify();
                     return;
                 }
                 if let Some(ch) = typed_char(event).filter(|_| this.input.len() < 4096) {
                     this.clear_terminal_selection(active);
+                    this.scroll_terminal_on_input(cx);
                     this.input.push_str(&ch);
                     cx.notify();
                 }
             }));
-        let empty = self
-            .sessions
-            .get(active)
-            .is_none_or(|s| {
-                s.lines.is_empty()
-                    && s.screen
-                        .as_ref()
-                        .is_none_or(|sc| sc.rows.iter().all(|r| r.text.is_empty()))
-            });
+        let empty = self.sessions.get(active).is_none_or(|s| {
+            s.lines.is_empty()
+                && s.screen
+                    .as_ref()
+                    .is_none_or(|sc| sc.rows.iter().all(|r| r.text.is_empty()))
+        });
         if empty && !is_device {
             viewport = viewport.child(
                 div()
@@ -1714,14 +1518,11 @@ impl Workbench {
                     ),
             );
         } else if let Some(session) = self.sessions.get(active) {
-            // 虚拟化列表：注记行 + 网格行 + demo 输入行统一为固定行高的列表
-            // 项，只为可见范围构建元素。滚动/贴底跟随全部走 UniformList 句柄。
-            let rows_len = session.displayed_screen().map_or(0, |sc| sc.rows.len());
-            let annotations = if session.history.is_some() {
-                0
-            } else {
-                session.lines.len()
-            };
+            // Virtualization list: annotation rows, grid rows, and demo input rows are all
+            // organized into lists with a fixed row height. Elements are only created within the
+            // visible range. The UniformList handle is used for scrolling/auto-scrolling.
+            let rows_len = session.displayed_rows_len();
+            let annotations = session.lines.len();
             let item_count = annotations + rows_len + usize::from(!is_device);
             let weak = cx.entity().downgrade();
             let query = query.clone();
@@ -1735,7 +1536,7 @@ impl Workbench {
                     let Some(session) = this.sessions.get(active) else {
                         return Vec::new();
                     };
-                    let rows_len = session.displayed_screen().map_or(0, |sc| sc.rows.len());
+                    let rows_len = session.displayed_rows_len();
                     let selection = session.selection;
                     let mut items = Vec::with_capacity(range.end - range.start);
                     for idx in range {
@@ -1744,7 +1545,7 @@ impl Workbench {
                             let sel_range = selection
                                 .and_then(|sel| sel.row_range(idx, line.text.chars().count()));
                             items.push(
-                                this.terminal_line_item(
+                                Self::terminal_line_item(
                                     line,
                                     &query,
                                     sel_range,
@@ -1759,8 +1560,7 @@ impl Workbench {
                             let row_idx = idx - annotations;
                             let sel_range = selection.and_then(|sel| {
                                 let len = session
-                                    .displayed_screen()
-                                    .and_then(|sc| sc.rows.get(row_idx))
+                                    .displayed_row(row_idx)
                                     .map_or(0, |row| row.text.chars().count());
                                 sel.row_range(idx, len)
                             });
@@ -1799,29 +1599,27 @@ impl Workbench {
                 .flex_1()
                 .w_full(),
             );
+            return div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(viewport)
+                .child(
+                    div().absolute().inset_0().child(
+                        gpui_kit::component::scroll::Scrollbar::vertical(&self.terminal_scroll)
+                            .id("terminal-scrollbar")
+                            .mode(gpui_kit::component::scroll::ScrollbarMode::Always),
+                    ),
+                )
+                .into_any_element();
         }
-        let selecting = self
-            .sessions
-            .get(active)
-            .and_then(|session| session.selection)
-            .is_some_and(|selection| selection.dragging);
-        if near_bottom
-            && !selecting
-            && self
-                .sessions
-                .get(active)
-                .is_none_or(|session| session.history.is_none())
-        {
-            // Keep following live output at the bottom unless user is dragging a selection.
-            self.terminal_scroll.scroll_to_bottom();
-        }
-        viewport
+        viewport.into_any_element()
     }
 
     /// Render an annotation at the same fixed height as a terminal row.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn terminal_line_item(
-        &self,
         line: &LogLine,
         query: &str,
         selection: Option<(usize, usize)>,
@@ -1833,6 +1631,7 @@ impl Workbench {
         let hit = !query.is_empty() && line.text.to_lowercase().contains(query);
         let mut el = div()
             .h(row_height)
+            .pr(px(19.))
             .line_height(row_height)
             .text_size(font_size)
             .whitespace_nowrap()
@@ -1888,7 +1687,9 @@ impl Workbench {
             .iter()
             .filter(|rule| rule.enabled && !rule.regex.trim().is_empty())
             .filter_map(|rule| {
-                let compiled = if let Some(compiled) = cache.get(&rule.regex) { compiled.clone() } else {
+                let compiled = if let Some(compiled) = cache.get(&rule.regex) {
+                    compiled.clone()
+                } else {
                     let compiled = regex::Regex::new(&rule.regex).ok();
                     cache.insert(rule.regex.clone(), compiled.clone());
                     compiled
@@ -1909,7 +1710,10 @@ impl Workbench {
 
     /// Virtual list item: emulator grid row with ANSI colors, prompt highlight
     /// overlay, cursor inversion, and mouse selection background.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "GPUI terminal row renderer takes session, highlight, and selection state"
+    )]
     pub(super) fn terminal_row_item(
         session: &SessionView,
         idx: usize,
@@ -1921,15 +1725,13 @@ impl Workbench {
         font_size: Pixels,
         p: &'static Palette,
     ) -> AnyElement {
-        let Some(screen) = session.displayed_screen() else {
-            return div().h(row_height).into_any_element();
-        };
-        let Some(row) = screen.rows.get(idx) else {
+        let Some(row) = session.displayed_row(idx) else {
             return div().h(row_height).into_any_element();
         };
         let hit = !query.is_empty() && row.text.to_lowercase().contains(query);
         let mut el = div()
             .h(row_height)
+            .pr(px(19.))
             .line_height(row_height)
             .text_size(font_size)
             .whitespace_nowrap()
@@ -1938,11 +1740,7 @@ impl Workbench {
         if let Some(bg) = row.bg {
             el = el.bg(theme::rgba_hex(bg));
         }
-        let cursor_char = if screen.cursor_row == Some(idx as u32) {
-            screen.cursor_char
-        } else {
-            None
-        };
+        let cursor_char = session.displayed_cursor(idx);
         let segments = crate::highlight::row_segments_with_selection(
             &row.text,
             highlight_rules,
@@ -2043,6 +1841,7 @@ impl Workbench {
         };
         div()
             .h(row_height)
+            .pr(px(19.))
             .line_height(row_height)
             .text_size(font_size)
             .whitespace_nowrap()
@@ -2080,7 +1879,7 @@ impl Workbench {
                     .id(SharedString::from(format!("dock-cmd-{index}")))
                     .when(can_run, |button| {
                         button.on_click(cx.listener(move |this, _, _, cx| {
-                            this.input = value.clone();
+                            this.input.clone_from(&value);
                             this.send_input(cx);
                         }))
                     })
@@ -2247,10 +2046,12 @@ impl Workbench {
             return Err(crate::i18n::label("connectionMissing").into());
         };
         let removed_name = self.duts.file.duts[index].name.clone();
-        // W4a 显式清理序：strip MCP → 落盘删除 → 停 Agent/串口/A2A → 删
-        // Token → 删 Agent 目录。strip/persist 失败原样 Err 中止（DUT 保持
-        // 原状）；Token/目录失败记入 pending-cleanup 并告警，绝不谎称清理
-        // 完成——warnings 随成功路径带回给 toast。
+        // W4a explicit cleanup sequence: strip MCP → write to disk deletion → stop Agent/serial
+        // port/A2A → delete Token → delete Agent directory. If the strip/persist fails, it will
+        // result in an Err and a halt (DUT remains in its original state); if the Token/directory
+        // fails, it will be recorded as pending-cleanup and an alert will be issued. There is no
+        // attempt to falsely claim that the cleanup is complete – warnings are reported back to
+        // toast along with the successful path.
         let outcome = duthub_desktop::agent_ui::run_remove_dut(self, dut_id)?;
         crate::data::remove_connection(&mut self.duts.file, dut_id);
         self.a2a_tokens.remove(dut_id);
@@ -2273,6 +2074,7 @@ impl Workbench {
             .min(self.duts.file.duts.len().saturating_sub(1));
         self.clear_dut_endpoint_drafts();
         self.heartbeat_drafts.remove(dut_id);
+        self.boot_reference_edits.remove(dut_id);
         if let Some(index) = self.sessions.iter().position(|view| view.dut_id == dut_id) {
             self.close_session_view(index, cx);
         }
@@ -2280,9 +2082,10 @@ impl Workbench {
         self.agent_transcript_scroll.remove(dut_id);
         self.agent_transcript_seen.remove(dut_id);
         self.agent_prompt_clear.remove(dut_id);
-        // DUT 级 Agent 运行状态：停止请求已在 stop_and_join 发出，清掉
-        // UI 侧草稿/滚动状态；宿主的会话记录留在 HostManager（已进入终止态，
-        // 重启同 id 会话时被回收）。
+        // DUT level agent running status: Stop requests have been sent using the `stop_and_join`
+        // command. The draft/scrolling states on the UI side are cleared. The session records of
+        // the host remain in HostManager (once it enters the termination state, they will be
+        // reclaimed when sessions with the same ID are restarted).
         self.control.unregister_dut(dut_id);
         for warning in &outcome.warnings {
             self.notify_toast(i18n::message(
@@ -2302,30 +2105,36 @@ impl Workbench {
             return;
         };
         let dut_id = view.dut_id.clone();
-        // 关闭串口标签 → 该 DUT 的 Agent 会话只发停止请求（非阻塞；等待/杀树在宿主线程）。
+        // Close the serial port tab → The Agent session of this DUT only sends stop requests
+        // (non-blocking; waiting/killing processes in the host thread).
         self.stop_agent_session(&dut_id);
-        // demo 会话同样注册在 DeviceService（SessionKind::Demo），tab 关闭必须级联
-        // 关闭底层会话——否则 demo 任务/注册表句柄/端口锁泄漏，同一 DUT 重开恒 Busy；
-        // 注册表无此 dut 时返回 NotFound，忽略即可（NotFound 之外的错误同样不影响 tab 关闭）。
+        // The demo session is also registered under DeviceService (SessionKind::Demo). Closing the
+        // tab must be done in a cascading manner. If the underlying session is not closed properly,
+        // issues such as leaks of session handles or port locks may occur. This could lead to the
+        // DUT becoming constantly busy when it tries to reopen the tab. When there is no such DUT
+        // registered in the registry, a NotFound error will be returned; this can be ignored.
+        // Errors other than NotFound still do not affect the ability to close the tab.
         let _ = self.device.close_session(&dut_id);
         self.sessions.remove(index);
-        // 关闭位于活动会话左侧的 tab 时，活动索引随列表收缩前移
-        //（否则活动视图静默切到相邻会话——输入行会把命令写进另一个串口）
+        // When the tab located on the left side of the active session is closed, the active index
+        // moves forward as the list shrinks. Otherwise, the active view will silently switch to the
+        // adjacent session—the input line will write the command to another serial port.
         if index < self.active_session {
             self.active_session -= 1;
         }
         if self.active_session >= self.sessions.len() {
             self.active_session = self.sessions.len().saturating_sub(1);
         }
-        // 关闭全部会话 → 回首页
+        // Close all sessions → Return to the homepage.
         if self.sessions.is_empty() {
             self.view = ViewMode::Home;
         }
         cx.notify();
     }
 
-    /// 从 DUT 绑定打开会话（NewSession 弹窗回调）。
-    /// 直连真实串口（首页卡片 / ＋ 新建会话共用）：成功建 tab，失败只 toast 一次。
+    /// Open a session from the DUT (callback for the `NewSession` window). Directly connect to the
+    /// real serial port (home page card / + create a new session shared): If successful, a tab is
+    /// created; if failed, only a toast message is displayed.
     pub fn open_real_port(&mut self, port: &str, baud: u32, cx: &mut Context<Self>) {
         let dut_id = Self::dut_id_for_port(&self.duts, port);
         let dut = self.duts.file.duts.iter().find(|dut| dut.id == dut_id);
@@ -2355,8 +2164,9 @@ impl Workbench {
                     "serialConnectionCreated",
                     &[("port", port), ("baud", &baud.to_string())],
                 ));
-                // 保存为主页磁贴（Xshell 式：下次直连/修改复用）；磁贴名走
-                // 归档守卫（COM 口名直存会让下次 matched 命中后再炸一次）
+                // Saved as homepage magnet icon (Xshell-style: direct connection next
+                // time/modifiable for reuse). Name of the magnet icon: Archive Guardian. Direct
+                // storage via COM port ensures that it will be reloaded upon subsequent matches.
                 if !self.duts.file.duts.iter().any(|d| d.id == dut_id) {
                     let mut dut = demo_dut_template(&name, port);
                     dut.id = dut_id;
@@ -2378,7 +2188,8 @@ impl Workbench {
                 } else {
                     i18n::message("connectFailed", &[("error", &err.to_string())])
                 };
-                // 首开失败（端口被占/不支持）：toast + 弹窗提醒（需求⑤接入点②）
+                // Failed to open the port (Port is occupied/in use): Toast notifications will be
+                // displayed for notification (Requirement ⑤, Access Point ②)
                 self.report_serial_session_failure(
                     &dut_id,
                     port,
@@ -2391,7 +2202,8 @@ impl Workbench {
         cx.notify();
     }
 
-    /// 终端右键菜单：立即重连 / 重置终端 / 查找 / 复制 / 清屏。
+    /// Terminal context menu: Reconnect immediately / Reset the terminal / Search / Copy / Clear
+    /// screen.
     pub(super) fn render_terminal_ctx_menu(
         &mut self,
         x: f32,
@@ -2466,11 +2278,7 @@ impl Workbench {
                 }),
             ),
         );
-        if self
-            .sessions
-            .get(self.active_session)
-            .is_some_and(|view| view.history.is_none())
-        {
+        if self.sessions.get(self.active_session).is_some() {
             menu = menu.child(
                 item("tctx-paste", crate::i18n::label("paste")).on_mouse_down(
                     MouseButton::Left,
@@ -2496,15 +2304,13 @@ impl Workbench {
                         && let Some(view) = this.sessions.get(this.active_session)
                     {
                         // Device session: annotations + emulator grid; demo session: all lines.
-                        let mut parts: Vec<String> = if view.history.is_some() {
-                            Vec::new()
-                        } else {
-                            view.lines.iter().map(|l| l.text.to_string()).collect()
-                        };
-                        if let Some(screen) = view.displayed_screen() {
-                            parts.extend(screen.rows.iter().map(|r| r.text.clone()));
-                        }
-                        let text = parts.join("\n");
+                        let text = view
+                            .lines
+                            .iter()
+                            .map(|line| line.text.as_ref())
+                            .chain(view.displayed_rows().map(|row| row.text.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n");
                         crate::components::copy_text(cx, &text);
                     }
                     cx.notify();
@@ -2519,8 +2325,8 @@ impl Workbench {
                     this.terminal_ctx = None;
                     if let Some(view) = this.sessions.get_mut(this.active_session) {
                         view.lines.clear();
-                        view.history = None;
-                        view.history_pending = None;
+                        view.scrollback = None;
+                        view.scrollback_pending = None;
                         view.selection = None;
                     }
                     cx.notify();
@@ -2535,7 +2341,6 @@ impl Workbench {
     }
 
     pub(super) fn render_workspace_menu(
-        &mut self,
         p: &'static Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2904,7 +2709,7 @@ impl Workbench {
             )
     }
 
-    /// 主页磁贴单击：按已保存 DUT 配置直连。
+    /// Click on the homepage tile: Connect directly to the saved DUT configuration.
     pub fn connect_dut(&mut self, dut_index: usize, cx: &mut Context<Self>) {
         let Some(dut) = self.duts.file.duts.get(dut_index).cloned() else {
             return;
@@ -2914,7 +2719,8 @@ impl Workbench {
         } else {
             duthub_device::SessionKind::Real
         };
-        // Linux 设备路径在 Windows 上不可能打开：直接明确报错，不产生"重连中"僵尸会话
+        // Linux device paths cannot be accessed on Windows: The system immediately reports an
+        // error, preventing the creation of zombie sessions during reconnection attempts.
         #[cfg(target_os = "windows")]
         if kind == duthub_device::SessionKind::Real && dut.serial.port.starts_with("/dev/") {
             self.notify_toast(i18n::message(
@@ -2953,7 +2759,8 @@ impl Workbench {
                 } else {
                     i18n::message("connectFailed", &[("error", &err.to_string())])
                 };
-                // 首开失败（DUT 磁贴直连）：toast + 弹窗提醒（需求⑤接入点②）
+                // Failed to initialize the connection (DUT directly connected to the magnetic
+                // patch): Toast notification + pop-up reminder (Requirement ⑤, Access Point ②)
                 self.report_serial_session_failure(
                     &dut.id,
                     &dut.name,
@@ -2966,8 +2773,8 @@ impl Workbench {
         cx.notify();
     }
 
-    /// 打开 kit Dialog：外壳（遮罩/动画/标题栏）由 kit 管理，
-    /// 表单主体仍由 `render_modal_parts` 渲染（草稿状态留在 Workbench）。
+    /// Use the kit dialog for the frame, overlay, animation, and title. `render_modal_parts` draws
+    /// the form body, and the workbench retains its draft state.
     pub fn open_modal(&mut self, kind: ModalKind, window: &mut Window, cx: &mut Context<Self>) {
         for field in [
             In::CmdName,
@@ -3019,7 +2826,8 @@ impl Workbench {
                     draft3: String::new(),
                 })
             });
-            let (title, body) = view.update(cx, |w, cx| w.render_modal_parts(modal, p, window, cx));
+            let (title, body) =
+                view.update(cx, |w, cx| w.render_modal_parts(&modal, p, window, cx));
             dialog.title(title).child(body)
         });
         cx.notify();
@@ -3027,11 +2835,12 @@ impl Workbench {
 
     pub(super) fn render_modal_parts(
         &mut self,
-        modal: ModalState,
+        modal: &ModalState,
         p: &'static Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (SharedString, gpui_kit::AnyElement) {
+        type ConfirmFn = Box<dyn Fn(&mut Workbench, &mut Context<Workbench>) + 'static>;
         let (title, body): (&str, gpui_kit::AnyElement) = match &modal.kind {
             ModalKind::RemoveDut(id) => (
                 crate::i18n::label("deleteConnection"),
@@ -3072,7 +2881,8 @@ impl Workbench {
                     .into_any_element(),
             ),
             ModalKind::NewSession => {
-                // 列出本机真实串口（打开弹窗时已刷新），点击直连 115200
+                // List the local serial ports refreshed when the dialog opens. Select a port to
+                // connect at 115,200 baud.
                 let mut body = div().flex().flex_col();
                 if self.serial_ports.is_empty() {
                     body = body.child(
@@ -3123,15 +2933,16 @@ impl Workbench {
                 (crate::i18n::label("newSerialTab"), body.into_any_element())
             }
             ModalKind::NewCommand => {
-                let current_icon = self
-                    .modal
-                    .as_ref().map_or_else(|| "bolt".to_string(), |m| {
+                let current_icon = self.modal.as_ref().map_or_else(
+                    || "bolt".to_string(),
+                    |m| {
                         if m.draft3.is_empty() {
                             "bolt".to_string()
                         } else {
                             m.draft3.clone()
                         }
-                    });
+                    },
+                );
                 let mut picker = div().flex().flex_wrap().gap(px(6.)).mb(px(12.));
                 for name in [
                     "bolt", "terminal", "play", "power", "refresh", "check", "settings", "code",
@@ -3144,7 +2955,7 @@ impl Workbench {
                             .id(SharedString::from(format!("cmd-icon-{name}")))
                             .on_click(cx.listener(move |this, _ev, _win, cx| {
                                 if let Some(modal) = this.modal.as_mut() {
-                                    modal.draft3 = value.clone();
+                                    modal.draft3.clone_from(&value);
                                 }
                                 cx.notify();
                             }))
@@ -3248,7 +3059,6 @@ impl Workbench {
                 (crate::i18n::label("addPeerAgent"), body.into_any_element())
             }
         };
-        type ConfirmFn = Box<dyn Fn(&mut Workbench, &mut Context<Workbench>) + 'static>;
         let (confirm_label, on_confirm): (&str, ConfirmFn) = match &modal.kind {
             ModalKind::RemoveDut(id) => (
                 crate::i18n::label("delete"),
@@ -3438,7 +3248,8 @@ impl Workbench {
                             .hover(|s| s.opacity(0.9))
                             .on_click(cx.listener(move |this, _ev, window, cx| {
                                 on_confirm(this, cx);
-                                // 确认逻辑成功后置 modal=None（校验失败保留输入）
+                                // After the validation process is successful, set modal to None (if
+                                // the validation fails, the input values will be retained).
                                 if this.modal.is_none() {
                                     window.close_dialog(cx);
                                 }

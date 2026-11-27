@@ -196,7 +196,10 @@ mod platform {
     };
     use windows::core::{BOOL, GUID, PCWSTR};
 
-    use super::{TrayEvent, TrayNotification, TrayBackend, TrayOptions, TrayError, TrayNotifyLevel, TrayProbe};
+    use super::{
+        TrayBackend, TrayError, TrayEvent, TrayNotification, TrayNotifyLevel, TrayOptions,
+        TrayProbe,
+    };
     use crate::tray_ui::{self, FLASH_INTERVAL_MS, FLASH_MAX_MS, NotificationGate};
 
     /// Tray icon resource id (`assets/app.ico`). `build.rs` embeds it as ID 1.
@@ -244,6 +247,7 @@ mod platform {
     ///
     /// Dropping the handle removes the icon and stops the tray thread; `remove` is
     /// idempotent so an explicit call before the process exits is also fine.
+    #[derive(Debug)]
     pub struct TrayHandle {
         main_hwnd: isize,
         enabled: bool,
@@ -253,6 +257,7 @@ mod platform {
         done: Mutex<Option<Receiver<()>>>,
     }
 
+    #[derive(Debug)]
     struct Shared {
         guid: GUID,
         tray_hwnd: AtomicIsize,
@@ -361,13 +366,13 @@ mod platform {
                 "main window handle is null".to_string(),
             ));
         }
-        let exe_path = std::env::current_exe()
-            .map_or_default(|path| path.to_string_lossy().into_owned());
+        let exe_path =
+            std::env::current_exe().map_or_default(|path| path.to_string_lossy().into_owned());
         let guid = guid_from_bytes(tray_ui::identity_guid_bytes(&exe_path));
         let shared = Arc::new(Shared::new(
             guid,
-            options.tooltip.clone(),
-            (options.show_label.clone(), options.quit_label.clone()),
+            options.tooltip,
+            (options.show_label, options.quit_label),
         ));
 
         if self_test_requested() {
@@ -390,7 +395,7 @@ mod platform {
         let thread_shared = Arc::clone(&shared);
         let spawned = std::thread::Builder::new()
             .name("duthub-tray".to_string())
-            .spawn(move || tray_thread_main(thread_shared, cmd_rx, ready_tx, done_tx));
+            .spawn(move || tray_thread_main(&thread_shared, cmd_rx, &ready_tx, &done_tx));
         let thread = match spawned {
             Ok(thread) => thread,
             Err(err) => return Err(TrayError::ThreadSpawn(err.to_string())),
@@ -512,7 +517,8 @@ mod platform {
                 return;
             }
             let info = FLASHWINFO {
-                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                cbSize: u32::try_from(std::mem::size_of::<FLASHWINFO>())
+                    .expect("the fixed Win32 structure size fits in u32"),
                 hwnd: self.main_window(),
                 dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
                 uCount: 0,
@@ -531,7 +537,8 @@ mod platform {
                 return;
             }
             let info = FLASHWINFO {
-                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                cbSize: u32::try_from(std::mem::size_of::<FLASHWINFO>())
+                    .expect("the fixed Win32 structure size fits in u32"),
                 hwnd: self.main_window(),
                 dwFlags: FLASHW_STOP,
                 uCount: 0,
@@ -957,19 +964,19 @@ mod platform {
     // ---------------------------------------------------------------------------
 
     fn tray_thread_main(
-        shared: Arc<Shared>,
+        shared: &Arc<Shared>,
         commands: Receiver<TrayCommand>,
-        ready: SyncSender<Result<(), TrayError>>,
-        done: SyncSender<()>,
+        ready: &SyncSender<Result<(), TrayError>>,
+        done: &SyncSender<()>,
     ) {
         // SAFETY: Called once on the dedicated tray thread before any message loop starts.
-        let setup = unsafe { tray_setup(&shared, commands) };
+        let setup = unsafe { tray_setup(shared, commands) };
         match setup {
             Ok(ctx) => {
                 let _ = ready.send(Ok(()));
                 // SAFETY: `ctx` was created by `tray_setup` on this exact thread and its
                 // `HWND` and `HICON` handles are owned exclusively by this thread.
-                unsafe { tray_run(ctx) };
+                unsafe { tray_run(&ctx) };
             }
             Err(err) => {
                 let _ = ready.send(Err(err));
@@ -1012,9 +1019,7 @@ mod platform {
         // SAFETY: `wnd_class` holds a valid static wide class name, current module
         // instance, and `tray_wndproc` callback with the matching system ABI.
         if unsafe { RegisterClassW(&raw const wnd_class) } == 0 {
-            eprintln!(
-                "[tray] RegisterClassW returned 0; assuming the class is already registered"
-            );
+            eprintln!("[tray] RegisterClassW returned 0; assuming the class is already registered");
         }
 
         // Top-level (not HWND_MESSAGE) so broadcasts such as TaskbarCreated
@@ -1053,9 +1058,16 @@ mod platform {
 
         // SAFETY: `hinst` is the valid module handle for this executable; returned
         // `HICON`s are stored in `TrayCtx` and destroyed in `tray_run`.
-        let base_icon = unsafe { load_icon(hinst, RESOURCE_APP_ICON) }.ok_or_else(|| {
-            TrayError::IconAdd(format!("resource {RESOURCE_APP_ICON} failed to load"))
-        })?;
+        let Some(base_icon) = (unsafe { load_icon(hinst, RESOURCE_APP_ICON) }) else {
+            // SAFETY: CreateWindowExW returned this window on the current thread.
+            // No tray context has been published, and this is the only owner.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            return Err(TrayError::IconAdd(format!(
+                "resource {RESOURCE_APP_ICON} failed to load"
+            )));
+        };
         // SAFETY: Same module handle invariant; optional alert icon is destroyed in `tray_run`.
         let alert_icon = unsafe { load_alert_icon(hinst) };
 
@@ -1122,7 +1134,9 @@ mod platform {
         let shared = unsafe { LoadIconW(None, IDI_WARNING) };
         // SAFETY: `CopyIcon` clones the shared system icon into a private `HICON` that
         // can safely be destroyed via `DestroyIcon`.
-        if let Ok(Ok(copy)) = shared.map(|icon| unsafe { CopyIcon(icon) }) { Some(copy) } else {
+        if let Ok(Ok(copy)) = shared.map(|icon| unsafe { CopyIcon(icon) }) {
+            Some(copy)
+        } else {
             eprintln!("[tray] no alert icon available; the alert will use the balloon only");
             None
         }
@@ -1136,7 +1150,7 @@ mod platform {
     /// Must be called on the same thread that created `ctx` via [`tray_setup`], and
     /// at most once per `ctx`. After this function returns, `ctx`'s `HWND` and
     /// `HICON` handles have been destroyed and must not be reused.
-    unsafe fn tray_run(ctx: Rc<TrayCtx>) {
+    unsafe fn tray_run(ctx: &TrayCtx) {
         let mut msg = MSG::default();
         loop {
             // SAFETY: `msg` is uniquely borrowed and properly aligned; `GetMessageW`
@@ -1219,7 +1233,8 @@ mod platform {
                 WM_TRAY_CALLBACK => {
                     // NOTIFYICON_VERSION_4: low word of lParam = event, high word =
                     // icon id; wParam carries the anchor point for that event.
-                    self.on_icon_callback(wparam, lparam.0 as u32);
+                    let [low, high, ..] = lparam.0.to_le_bytes();
+                    self.on_icon_callback(wparam, u32::from(u16::from_le_bytes([low, high])));
                     Some(LRESULT(0))
                 }
                 WM_TIMER if wparam.0 == FLASH_TIMER_ID => {
@@ -1288,7 +1303,8 @@ mod platform {
         ) -> NOTIFYICONDATAW {
             // GUID-identified icons always use uID 0.
             let mut nid = NOTIFYICONDATAW {
-                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                cbSize: u32::try_from(std::mem::size_of::<NOTIFYICONDATAW>())
+                    .expect("the fixed Win32 structure size fits in u32"),
                 hWnd: self.tray_hwnd().unwrap_or_default(),
                 uID: 0,
                 uFlags: flags,
@@ -1303,8 +1319,7 @@ mod platform {
             nid
         }
 
-        fn on_icon_callback(&self, wparam: WPARAM, lparam: u32) {
-            let event = lparam & 0xffff;
+        fn on_icon_callback(&self, wparam: WPARAM, event: u32) {
             match event {
                 NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONUP => self.push_event(TrayEvent::Show),
                 WM_CONTEXTMENU | WM_RBUTTONUP => {
@@ -1365,8 +1380,7 @@ mod platform {
                 let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
                 let _ = DestroyMenu(menu);
             }
-            let command = command.0 as usize;
-            if command == 0 {
+            if command.0 == 0 {
                 // Dismissed: hand focus back to the notification area.
                 let nid = self.nid_with_flags(NIF_GUID);
                 // SAFETY: `nid` is fully initialized with `cbSize` and valid `hWnd`/GUID
@@ -1374,7 +1388,8 @@ mod platform {
                 unsafe {
                     let _ = Shell_NotifyIconW(NIM_SETFOCUS, &raw const nid);
                 }
-            } else if let Some(event) = menu_command_event(command) {
+            } else if let Some(event) = usize::try_from(command.0).ok().and_then(menu_command_event)
+            {
                 self.push_event(event);
             }
             self.menu_active.store(false, Ordering::SeqCst);
@@ -1525,7 +1540,12 @@ mod platform {
             // SAFETY: `hwnd` is the live tray host window owned by this thread;
             // `None` timer proc delivers `WM_TIMER` to `tray_wndproc`.
             unsafe {
-                SetTimer(Some(hwnd), FLASH_TIMER_ID, FLASH_INTERVAL_MS as u32, None);
+                SetTimer(
+                    Some(hwnd),
+                    FLASH_TIMER_ID,
+                    u32::try_from(FLASH_INTERVAL_MS).expect("the flash timer interval fits in u32"),
+                    None,
+                );
             }
         }
 
@@ -1557,7 +1577,7 @@ mod platform {
                 }
                 return;
             };
-            if started.elapsed().as_millis() as u64 >= FLASH_MAX_MS {
+            if started.elapsed() >= Duration::from_millis(FLASH_MAX_MS) {
                 self.stop_flash();
                 return;
             }
@@ -1724,7 +1744,8 @@ mod platform {
 
     fn query_icon_rect(tray_hwnd: isize, guid: GUID) -> Option<[i32; 4]> {
         let identifier = NOTIFYICONIDENTIFIER {
-            cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            cbSize: u32::try_from(std::mem::size_of::<NOTIFYICONIDENTIFIER>())
+                .expect("the fixed Win32 structure size fits in u32"),
             hWnd: HWND(tray_hwnd as *mut c_void),
             uID: 0,
             guidItem: guid,

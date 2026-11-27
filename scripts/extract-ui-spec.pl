@@ -1,8 +1,8 @@
 #!/usr/bin/perl
-# 从 duthub.html 提取 UI 行为规格的机器可核对部分：
-#   1. i18n 字符串表（zh-CN / en-US）→ docs/ui-spec/i18n.md
-#   2. 主题 token（:root CSS 变量，dark/light）→ docs/ui-spec/theme.md
-# 核对规则：zh 与 en 键集合必须一致；输出条目数写入文档头部供人工/脚本复核。
+# Extract machine-checkable UI specifications from the archived duthub prototype.
+#   Write localized strings for zh-CN and en-US to docs/ui-spec/i18n.md.
+#   Write the light and dark theme tokens from CSS variables to docs/ui-spec/theme.md.
+# Validate that the locales have identical keys and include counts for reviewers.
 use strict;
 use warnings;
 
@@ -25,7 +25,7 @@ sub extract_kv {
 
 my ($zh_body, $en_body);
 for my $line (@lines) {
-    # zh 行尾 "...'},", en 行尾 "...'}};"：循环剥离尾部结构字符 } ; ,
+    # Strip trailing object punctuation from both locale records.
     if ($line =~ /^\s*'zh-CN':\{(.+)$/) { $zh_body = strip_close($1); }
     elsif ($line =~ /^\s*'en-US':\{(.+)$/) { $en_body = strip_close($1); }
 }
@@ -40,13 +40,13 @@ sub strip_close {
 my $zh = extract_kv($zh_body);
 my $en = extract_kv($en_body);
 
-# 核对 1：zh / en 键集合一致
+# Verify that both locale tables use identical keys.
 my @missing_in_en = grep { !exists $en->{$_} } sort keys %$zh;
 my @missing_in_zh = grep { !exists $zh->{$_} } sort keys %$en;
 die "i18n 键不一致：en 缺 [@missing_in_en]，zh 缺 [@missing_in_zh]"
     if @missing_in_en || @missing_in_zh;
 
-# 核对 2：标记里用到的 data-i18n 键必须都在表里
+# Verify that each data-i18n key used by the markup exists.
 my %used;
 for my $line (@lines) {
     while ($line =~ /data-i18n="([A-Za-z0-9]+)"/g) { $used{$1} = 1; }

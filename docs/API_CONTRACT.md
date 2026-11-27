@@ -38,16 +38,17 @@ MCP 2026-07-28 客户端通过 `server/discover` 发现能力，并为每个请�
 
 | 工具 | 契约 |
 |---|---|
-| `dut_list`、`dut_info(dutId)` | 通用接入返回该 Token 已授权的 DUT；DUT 专用接入只返回绑定的 DUT 和绑定元数据 |
-| `dut_control_status(dutId)`、`heartbeat_get(dutId)` | 读取当前控制权和已记录的心跳 |
-| `serial_read(dutId, sinceSeq?, limit?)` | 只读接收数据。响应包含 `last_seq` 和 `cursorReset`，关闭的会话改查归档 |
-| `analyze_serial(dutId)` | 读取最近的诊断证据，结论由调用端根据证据生成 |
+| `dut_list`、`dut_status(dutId)` | 通用接入返回该 Token 已授权的 DUT；DUT 专用接入只返回绑定 DUT。统一返回机读 **`dutState`**（`ready`/`busy_gui`/`busy_agent`/`flashing`/`manual_takeover`/`needs_inspection`/`disconnected`）、**`nextActionHint`** 以及 `controlStatus`（含 `sessionName`、`acquiredAtUnixMs`、`occupiedSecs`） |
+| `serial_read(dutId, sinceSeq?, limit?, tail?, mode?, waitFor?, waitRegex?, timeoutMs?)` | 只读接收实时串口流或 VT100 渲染屏快照（`mode="screen"`，亦可通过 Resource `duthub://dut/{dutId}/serial/screen` 直读）。传入 `waitFor` / `waitRegex` 时基于 `sinceSeq` 游标无漏行等待（上限 30s），返回 `matched`/`matchedBy`/`elapsedMs`；关闭会话改查归档 |
 | `log_segments(dutId, offset?, limit?)`、`log_segment_read(dutId, segmentId, offset?)` | 分页读取 DUT 的文本日志归档。目录身份按稳定 DUT ID 校验；DUT 专用接入仅能读绑定 DUT |
-| `dut_files(dutId?, offset?, limit?)`、`dut_file_read(dutId, fileId, offset?)` | 列出工作目录中的 DUT 或其文件，按返回的文件 ID 读取 Base64 分块；DUT 专用接入的 `dut_files` 省略 `dutId` 时默认绑定 DUT，`dut_file_read` 的 `dutId` 必填 |
+| `dut_files(dutId?, category?, offset?, limit?)`、`dut_file_read(dutId, fileId, offset?)` | 列出工作目录中的 DUT 或其文件，返回六大标准目录分类（`image`、`TEST`、`压力&老化`、`串口日志`、`misc`、`feedback`）并支持按 `category` 过滤；按返回的文件 ID 读取 Base64 分块；DUT 专用接入的 `dut_files` 省略 `dutId` 时默认绑定 DUT，`dut_file_read` 的 `dutId` 必填 |
 | `adb_list_devices()` | 查询已运行的 127.0.0.1:5037 ADB 服务。只返回授权 DUT 的绑定，服务不可用则返回错误 |
 | `media_streams(dutId)` | 读取已启动的采集及状态；流 URL 应保密。带 `op` 时按需取数（需该 DUT 的 `capture` 授权）：`{"kind":"snapshot","source?","note?"}` 截取静帧；`{"kind":"recordStart","source?","note?"}` 开始录屏并返回 `recordingId`；`{"kind":"recordStop","recordingId"}` 取回产物 |
-| `skill_export()` | 返回 SKILL.md 正文，方便在聊天中引用 |
+| `skill_export()` | 返回嵌入的 `skills/duthub/SKILL.md` 正文（支持 `npx skills add bitshelf/duthub` 安装），不写盘 |
 | `notify_user(message, title?, level?, dutId?)` | **仅用户配置的 MCP 监听器**：在 duthub 用户界面弹出通知。不是设备写动作（无审批、无租约），但会唤起界面，受宿主告警开关、抑制与限流约束；`queued` 只表示已入待呈现队列，不代表用户已看到 |
+| `agent_feedback(category, title, detail, dutId?, severity?, toolName?, sessionName?)` | **仅用户配置的 MCP 监听器**：将 Agent 使用反馈以带元数据 Markdown 文件原子写入 `<DUT>/feedback/`（通用监听器省略 `dutId` 时写入 `<work_dir>/feedback/`），用于沉淀痛点与后续优化依据 |
+| `serial_exec(dutId, text?, keys?, triggerReset?, waitFor?, send?, thenSend?, expect?, expectRegex?, settleMs?, stallTimeoutMs?, timeoutMs?, markLabel?, ...)` | **仅用户配置的 MCP 监听器**（需 `serialWrite`，`triggerReset` 另需 `reset`）：发送串口文本或白名单逻辑按键（`keys`，先全量校验再发送，非法返回 `INVALID_KEY`），支持 `expect`/`expectRegex`/`settleMs` 静默稳定检测与 `stallTimeoutMs` 零回显停滞识别，返回 `matchedBy`/`bytesObserved`/`stalled`/`screenTail` |
+| `dut_control` / `adb_exec` | **仅用户配置的 MCP 监听器**：原子硬件控板/烧录/多 Agent 租约（`acquire_lease` 必填 `sessionName`）与限定 DUT 目录的 ADB 调试 |
 
 #### `notify_user` 契约
 

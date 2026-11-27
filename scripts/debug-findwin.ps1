@@ -1,4 +1,4 @@
-# 调试：复现 capture-window 的回调匹配逻辑
+# Debug the same window matching callback used by capture-window.ps1.
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;

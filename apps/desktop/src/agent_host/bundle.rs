@@ -1,6 +1,6 @@
 //! goose licence/release facts (compatibility surface).
 //!
-//! goose used to ship as an embedded asset (ADR-3). Since 2026-11-24 it is
+//! goose used to ship as an embedded asset (ADR-3). It is now
 //! installed from the "tool downloads" page through `duthub-tooldown`, the same
 //! way adb and ffmpeg are: no goose bytes are compiled into duthub any more, so
 //! there is nothing here to hash, install or unpack.
@@ -150,7 +150,7 @@ pub fn resolve(work_dir: &Path, over: Option<(&Path, &str)>) -> Result<PathBuf, 
             Ok(path.to_path_buf())
         }
         None => Err(BundleError::NotInstalled(format!(
-            "内嵌 goose 已移除（2026-11-24）：{} 不再安装构建期资产；\
+            "内嵌 goose 已移除：{} 不再安装构建期资产；\
              内置 goose 由 registry 按「已下载安装 > PATH」解析，请先完成工具下载",
             work_dir.display()
         ))),
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn manifest_json_is_a_parseable_distribution_record() {
-        let record = manifest().expect("manifest JSON 必须可解析");
+        let record = manifest().expect("The manifest JSON must be parseable.");
         assert_eq!(record["id"], "goose");
         assert_eq!(record["distribution"], "downloaded");
         assert_eq!(record["embedded"], false);
@@ -249,7 +249,7 @@ mod tests {
             record["source"]
                 .as_str()
                 .is_some_and(|url| url.contains("aaif-goose/goose")),
-            "来源必须是上游 release：{record}"
+            "The source must be from an upstream release: {record}."
         );
     }
 
@@ -259,7 +259,7 @@ mod tests {
         assert!(status.contains("未内置"), "{status}");
         assert!(
             !status.eq_ignore_ascii_case("NotSigned") && !status.eq_ignore_ascii_case("Valid"),
-            "未内置时不得宣称任何签名结论: {status}"
+            "Do not claim any signature results when it is not built-in. Result: {status}"
         );
 
         let license = license_text();
@@ -267,7 +267,7 @@ mod tests {
         assert!(license.contains("上游发行包"), "{license}");
         assert!(
             !license.contains("TERMS AND CONDITIONS"),
-            "不得再内嵌 Apache 全文"
+            "Apache full-text engine is no longer supported."
         );
 
         let notice = notice_text();
@@ -286,12 +286,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&work).unwrap();
-        let error = resolve(&work, None).expect_err("没有内嵌资产可解析");
+        let error = resolve(&work, None).expect_err("No embedded assets available for parsing.");
         assert!(matches!(error, BundleError::NotInstalled(_)), "{error}");
         assert!(error.to_string().contains("内嵌 goose 已移除"), "{error}");
         assert!(
             !work.join("agent").exists(),
-            "resolve 不得再往工作目录安装任何资产"
+            "Resolve to no longer install any assets in the working directory."
         );
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -312,7 +312,8 @@ mod tests {
         let sha = duthub_core::store::sha256_hex(b"candidate-bytes");
         assert_eq!(resolve(&work, Some((&exe, &sha))).unwrap(), exe);
         let wrong = "0".repeat(64);
-        let error = resolve(&work, Some((&exe, &wrong))).expect_err("哈希不匹配必须拒绝");
+        let error = resolve(&work, Some((&exe, &wrong)))
+            .expect_err("Hash match failed. Rejection required.");
         assert!(matches!(error, BundleError::Hash { .. }), "{error}");
         let _ = std::fs::remove_dir_all(&work);
     }

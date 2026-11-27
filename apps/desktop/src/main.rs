@@ -1,8 +1,9 @@
-//! duthub-desktop：GPUI 桌面端（UI 1:1 复刻原型 duthub.html）。
+//! duthub-desktop: GPUI desktop interface (a precise 1:1 replica of the duthub.html interface).
 //!
-//! `--self-test`：无交互冒烟——打开窗口、渲染若干帧、验证帧计数 > 0 后自动退出，
-//! 退出码 0/1 供回归脚本判定（docs/README.md）。
-//! release 构建 `--features no-console` 去掉控制台窗口（双击直接开 GUI）。
+//! `--self-test`: No interactive testing — opens a window, renders several frames, and
+//! automatically exits when the frame count is greater than 0. The exit code 0/1 is used by
+//! regression scripts for determination (docs/README.md). `release` build with `--features
+//! no-console` removes the console window (directly opens GUI by double-clicking).
 
 #![cfg_attr(feature = "no-console", windows_subsystem = "windows")]
 
@@ -33,6 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use anyhow::{Context as _, ensure};
 use gpui_kit::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -52,6 +54,35 @@ use workspace::Workbench;
 /// `MessageBoxW` notice and exits. The guard handle is kept alive by `main`
 /// for the life of the process (dropping it would let a second instance start
 /// while this one is hidden in the tray). `--self-test` skips the guard.
+struct BootstrapPaths {
+    config_root: std::path::PathBuf,
+    explicit_root: Option<std::path::PathBuf>,
+    data_dir: std::path::PathBuf,
+}
+
+/// Resolves the workspace root and initializes `.duthub/` exactly once at startup.
+fn bootstrap_data_dir() -> anyhow::Result<BootstrapPaths> {
+    let exe_dir = duthub_core::store::exe_dir()
+        .map_err(anyhow::Error::msg)
+        .context("Could not locate the executable directory")?;
+    let explicit_root =
+        duthub_core::store::explicit_workspace(&exe_dir, std::env::args_os().skip(1))
+            .map_err(anyhow::Error::msg)?;
+    let config_root = explicit_root.clone().unwrap_or(exe_dir);
+    ensure!(
+        explicit_root.is_none() || duthub_core::store::dir_writable(&config_root),
+        "Workspace is not writable: {}",
+        config_root.display()
+    );
+    let data_dir =
+        duthub_core::store::initialize_config_dir(&config_root).map_err(anyhow::Error::msg)?;
+    Ok(BootstrapPaths {
+        config_root,
+        explicit_root,
+        data_dir,
+    })
+}
+
 fn main() {
     // Contain the process tree before gpui or any child process exists: a
     // crash or a forced kill closes the leaked job handle, which terminates
@@ -60,12 +91,16 @@ fn main() {
     // failure is fail-open — warn and keep starting, since Capture::Drop still
     // covers graceful exits.
     if let Err(error) = duthub_desktop::agent_host::job::contain_current_process() {
-        eprintln!("进程容器 Job Object 创建失败（强杀时无法回收 ffmpeg 等子进程）: {error}");
+        eprintln!(
+            "Failed to create the Job Object. Forced termination may leave FFmpeg and other children running: {error}"
+        );
     }
     let self_test = std::env::args().any(|arg| arg == "--self-test");
-    // --trace：开启 Chrome Trace（Perfetto 兼容）性能记录，输出到工作目录 traces/
+    // --trace: Enable Chrome Trace (compatible with Perfetto) functionality. Output data to the
+    // traces/ directory in the working directory.
     let trace_enabled = std::env::args().any(|arg| arg == "--trace");
-    // --open-port COM31 [--open-baud 115200]：启动即打开真实串口会话（快速调试入口）
+    // --open-port COM31 [--open-baud 115200]: Enables the real serial port session (for quick
+    // debugging purposes)
     let args: Vec<String> = std::env::args().collect();
     let secondary_display = args.iter().any(|arg| arg == "--secondary-display");
     let release_gui_lease = args.iter().any(|arg| arg == "--release-gui-lease");
@@ -80,34 +115,23 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|b| b.parse::<u32>().ok())
         .unwrap_or(115_200);
-    // --workdir <目录> 覆盖保存的工作目录。默认以可执行文件目录为根。
+    // --workdir <Directory> Specifies the directory where the work is saved. By default, it uses
+    // the directory containing the executable file as the root directory.
     let frames = Arc::new(AtomicUsize::new(0));
     let core_lines = Arc::new(AtomicUsize::new(0));
 
-    // 配置目录（bootstrap）与设置只加载一次（load_settings 对损坏文件有改名备份副作用，
-    // 不能在 main 与 Workbench 各读一遍，否则损坏告警 toast 会丢失）。
-    let Ok(exe_dir) = duthub_core::store::exe_dir() else {
-        eprintln!("无法定位可执行文件目录");
-        exit(1);
-    };
-    let explicit_root =
-        duthub_core::store::explicit_workspace(&exe_dir, std::env::args_os().skip(1))
-            .unwrap_or_else(|error| {
-                eprintln!("{error}");
-                exit(1)
-            });
-    let config_root = explicit_root.as_deref().unwrap_or(&exe_dir);
-    if explicit_root.is_some() && !duthub_core::store::dir_writable(config_root) {
-        eprintln!("Workspace is not writable: {}", config_root.display());
-        exit(1);
-    }
-    let data_dir = match duthub_core::store::initialize_config_dir(config_root) {
-        Ok(dir) => dir,
+    let BootstrapPaths {
+        config_root,
+        explicit_root,
+        data_dir,
+    } = match bootstrap_data_dir() {
+        Ok(paths) => paths,
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("{error:#}");
             exit(1);
         }
     };
+    let config_root = config_root.as_path();
     let (mut settings, mut settings_err) = match duthub_core::store::load_settings(&data_dir) {
         Ok(s) => (s, None),
         Err(err) => (
@@ -151,7 +175,9 @@ fn main() {
     // returns — it must outlive a window hidden to the notification area.
     let _instance_guard = if self_test {
         None
-    } else if let Ok(guard) = duthub_desktop::tray::single_instance::acquire() { Some(guard) } else {
+    } else if let Ok(guard) = duthub_desktop::tray::single_instance::acquire() {
+        Some(guard)
+    } else {
         crate::i18n::Lang::from_setting(&settings.appearance.language).activate();
         duthub_desktop::tray::single_instance::show_already_running(
             crate::i18n::label("alreadyRunningTitle"),
@@ -159,7 +185,8 @@ fn main() {
         );
         exit(0);
     };
-    // 工作目录解析 + 创建 + 可写校验（不可用回退默认并提示）
+    // Working directory parsing + creation + writeable verification (disabled by default; prompts
+    // are available for those who need them).
     let (artifact_root, workdir_notice) = match duthub_core::store::ensure_portable_work_dir(
         config_root,
         settings
@@ -182,8 +209,9 @@ fn main() {
         }
     }
 
-    // 性能调试：--trace 开启 Chrome Trace 层（输出 <work_dir>/traces/*.json，
-    // 直接拖进 ui.perfetto.dev 查看）；RUST_LOG 控制常规日志过滤（默认 info）
+    // Enable Chrome Trace with `--trace`. Open the JSON trace from the work directory's traces
+    // subdirectory in ui.perfetto.dev. `RUST_LOG` sets the standard log filter and defaults to
+    // info.
     let _trace_guard = if trace_enabled {
         let trace_dir = work_dir.join("traces");
         if let Err(error) = duthub_core::store::ensure_portable_child(&work_dir, "traces") {
@@ -201,7 +229,7 @@ fn main() {
             .with(chrome_layer)
             .init();
         eprintln!(
-            "[trace] Chrome Trace 记录中 → {}",
+            "[trace] Recording Chrome Trace to {}",
             trace_dir.join("duthub-trace.json").display()
         );
         Some(guard)
@@ -215,11 +243,14 @@ fn main() {
     gpui_kit::application()
         .with_assets(icons::IconAssets)
         .run(move |cx: &mut App| {
-            // kit 全局初始化（theme/component 层），必须在开窗前调用
+            // Global initialization of the kit (at the theme/component level). This must be called
+            // before opening the window.
             gpui_kit::init(cx);
 
-            // 隐藏系统标题栏：单行集成工具行，右侧自绘 Windows 风格控制钮
-            // （WCA::Drag 命中区保留系统拖动与双击最大化行为）
+            // Hide the system title bar: Single-line integration tool bar, with control buttons in
+            // Windows-style design on the right side.
+            // (WCA::Drag area retains the system's drag-and-drop and double-click maximize
+            // functions.)
             let display_id = if secondary_display {
                 let primary = cx.primary_display().map(|display| display.id());
                 cx.displays().into_iter().map(|display| display.id())
@@ -247,11 +278,15 @@ fn main() {
                 ..Default::default()
             };
 
-            // 串口运行时（独立 tokio runtime；日志在工作目录 logs/ 下）。
-            // Agent 接入（MCP 层）：租约管理器 + 审计接收端与写入通道同源接线
-            //（TTL/auth 开关取 settings.agentAccess；settings 进程内只加载一次，坑 #9）。
-            // F10：桌面租约链必须与 DeviceService 同口径启用 GUI 会话生命周期
-            //（crates/duthub-device/src/lib.rs:91-95），否则 GUI 自动租约会被 TTL 过期。
+            // Serial port is running (independent tokio runtime; logs/ directory for logs storage).
+            // Agent integration (MCP layer): Lease manager + audit receiving end and writing
+            // channel are connected to the same source.
+            // (TTL/auth settings are determined by settings.agentAccess; settings is loaded only
+            // once within the process, issue #9).
+            // F10: The desktop lease chain must enable GUI session lifecycle along with
+            // DeviceService.
+            // (crates/duthub-device/src/lib.rs:91-95); otherwise, the automatic GUI lease will
+            // expire due to TTL expiration.
             let audit = duthub_core::AuditSink::at_dir(work_dir.join("audit"));
             let lease = Arc::new(
                 duthub_core::ControlLeaseManager::new(Some(audit.clone()))
@@ -304,7 +339,7 @@ fn main() {
                         device.clone(),
                         frames_in_view,
                         core_lines_in_view,
-                        open_port.clone(),
+                        open_port.as_deref(),
                         open_baud,
                         workspace::StartupContext {
                             data_dir,
@@ -333,7 +368,7 @@ fn main() {
             });
 
             if let Err(err) = opened {
-                eprintln!("打开主窗口失败: {err:#}");
+                eprintln!("Failed to open the main window: {err:#}");
                 exit(1);
             }
             cx.activate(true);

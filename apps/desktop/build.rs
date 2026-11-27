@@ -1,5 +1,6 @@
 fn main() {
-    // Windows：嵌入应用图标（资源 ID 1 —— gpui load_icon 从此处加载）与版本信息
+    // Windows: Embed application icons (Resource ID 1 — gpui load_icon will be loaded from here)
+    // along with version information.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // GPUI constructs nested settings panels on the main thread. Debug
         // builds retain intermediate layout values and need more stack reserve.
@@ -9,6 +10,6 @@ fn main() {
         res.set("FileDescription", "duthub");
         res.set("ProductName", "Duthub");
         res.compile()
-            .expect("嵌入 Windows 资源失败（需要 app.ico 存在于 assets/）");
+            .expect("Failed to embed Windows resources. The app.ico file must be located in the assets/ directory.");
     }
 }

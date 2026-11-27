@@ -1,13 +1,13 @@
-//! 共用设备操作入口（控制单元）：GUI 与 MCP 的 Power/Reset/PowerKey 都经此执行。
+//! Shared device controls used by both the GUI and MCP.
 //!
-//! 控制服务的职责：
-//! 1. **授权**：审批令牌在此统一校验并消费（绑定 dut/action/参数）；
-//! 2. **绑定**：DUT 必须已配置控制单元（继电器 / SNMP PDU）；
-//! 3. **动作能力**：PDU 只支持电源通断；继电器按通道映射校验动作可用；
-//! 4. **解析**：把 DUT 配置解析成 [`ControlTarget`]（设备地址 + 驱动 + 通道）。
+//! The control service does the following.
+//! Check and consume an approval matched to the DUT, action, and parameters.
+//! Require a configured relay or SNMP PDU.
+//! Check each action against the configured channels and backend capabilities.
+//! Resolve the binding into a physical `ControlTarget`.
 //!
-//! [`duthub_core::ControlBackend`] 驱动只接收已解析的地址与动作，
-//! 不接触审批令牌 —— 授权职责不再分散到入口与驱动两处。
+//! The backend receives only resolved targets and actions.
+//! The control service owns approval validation.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -58,23 +58,23 @@ const MAX_BOOT_HOLD_MS: u64 = 10_000;
 const MIN_POWER_CYCLE_OFF_MS: u64 = 200;
 const MAX_POWER_CYCLE_OFF_MS: u64 = 10_000;
 
-/// 继电器动作完成后的分段标记接收端（日志分割）：参数 `(dut_id, label)`，
-/// 由宿主接到 [`crate::DeviceService::log_mark`]。会话未开时静默丢弃（标记是
-/// 附属注记，不应让控制动作本身报错）。动作已完成后的结果注记失败不拦截
-/// 任何东西——动作的成败由后端结果决定。
+/// Receives a log segment marker after a relay action.
+/// The host forwards the DUT ID and label to the serial log.
+/// Discard the marker when no serial session is open.
+/// An annotation failure does not change the backend's result.
 pub type LogMarkSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
-/// 供电前分段接收端：与 [`LogMarkSink`] 不同，返回 mark 落盘成败——LOG-5
-/// 「分段失败拦截派发」：分段未确认落盘时控制入口不得派发设备动作（不动
-/// 设备），失败由宿主实现（[`crate::DeviceService::log_control_boundary`]）
-/// 同步返回。
+/// Receives the pre-power segment marker and reports whether it reached disk.
+/// A failed marker prevents hardware dispatch.
+/// The host implements the synchronous boundary through the device service.
+/// The original caller receives the error.
 pub type PowerBoundarySink = Arc<dyn Fn(&str, &str) -> DeviceResult<()> + Send + Sync>;
 
-/// 继电器测试动作名：单通道 ON→STATUS→OFF 往返（写动作，走审批闸门）。
+/// Approval action for testing one relay channel with an ON, status, and OFF round trip.
 pub const ACTION_CHANNEL_TEST: &str = "control.test";
 
 impl ControlAction {
-    /// 审批动作名（与 `docs/API_CONTRACT.md` 一致）。
+    /// Approval action name from the API contract.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
@@ -87,7 +87,7 @@ impl ControlAction {
         }
     }
 
-    /// 动作的分段标记文本（`[mark] {label}` 的 label 部分）。
+    /// Label written in the action's segment marker.
     #[must_use]
     pub fn mark_label(&self) -> &'static str {
         match self {
@@ -102,7 +102,7 @@ impl ControlAction {
         }
     }
 
-    /// 参数绑定串：签发与消费必须产出完全一致的 JSON。
+    /// Issuing and consuming approval must serialize the parameters identically.
     #[must_use]
     pub fn args_json(&self) -> String {
         match self {
@@ -130,23 +130,23 @@ pub enum ControlEntryError {
     Device(#[from] DeviceError),
 }
 
-/// 共用设备操作入口。`dut_configs` 由宿主（桌面端每帧刷新）注册，
-/// 使入口能在不依赖 UI 状态的情况下解析 DUT 绑定。
+/// Shared device-control entry point.
+/// Registered DUT configurations keep address resolution independent of the UI.
 pub struct ControlService {
     backend: Option<Arc<dyn ControlBackend>>,
     approval: Arc<ApprovalManager>,
     dut_configs: Mutex<HashMap<String, DutConfig>>,
-    /// 分段标记接收端（日志分割）：动作成功/失败后写入 `[mark] …` 行。
-    /// OnceLock：宿主在构造后接一次，之后所有动作共用。
+    /// Sink for segment markers after control actions.
+    /// The host attaches the sink once and all actions share it.
     log_sink: OnceLock<LogMarkSink>,
     power_boundary: OnceLock<PowerBoundarySink>,
     power_outcome: OnceLock<LogMarkSink>,
     runtime: crate::RuntimeOwner,
     relay_writes: std::sync::RwLock<()>,
-    /// 控制租约复核（方案 M10：approval 校验前插 admit，不通过不消费令牌）。
-    /// 与 `DeviceService` 写入通道共用同一 `ControlLeaseManager` 实例。
+    /// Check control leases before consuming approval.
+    /// Share the lease manager with the serial write path.
     lease: Option<Arc<ControlLeaseManager>>,
-    /// 审计（control.execute / control.deny）。
+    /// Record successful and denied control requests.
     audit: Option<Arc<AuditSink>>,
 }
 
@@ -196,23 +196,23 @@ impl ControlService {
         }
     }
 
-    /// 接线控制租约复核（builder）。GUI 按钮路径走 [`Self::execute_by_id`]（Gui
-    /// 身份）；MCP 路径走 [`Self::execute_by_id_as`]（Agent 身份）。
+    /// Set the lease manager. The GUI calls `Self::execute_by_id`
+    /// and MCP supplies an Agent identity to `Self::execute_by_id_as`.
     #[must_use]
     pub fn with_lease_authority(mut self, lease: Arc<ControlLeaseManager>) -> Self {
         self.lease = Some(lease);
         self
     }
 
-    /// 接线审计接收端（control.execute / control.deny）。
+    /// Set the sink for control execution and denials.
     #[must_use]
     pub fn with_audit_sink(mut self, audit: Arc<AuditSink>) -> Self {
         self.audit = Some(audit);
         self
     }
 
-    /// [C'] 控制动作租约复核：Gui 无租约时现场获取短租约（执行后释放）；
-    /// Agent 凭 lease 通过；拒绝 → 审计 control.deny。
+    /// Acquire a temporary GUI lease when needed and release it after the operation.
+    /// Agents must supply their lease. Audit denied requests.
     fn admit_control(
         &self,
         dut_id: &str,
@@ -242,7 +242,7 @@ impl ControlService {
         }
     }
 
-    /// 临时租约收尾（幂等）+ 执行审计。
+    /// Release any temporary lease and audit the action outcome.
     fn finish_control(
         &self,
         dut_id: &str,
@@ -275,7 +275,7 @@ impl ControlService {
         }
     }
 
-    /// 挂分段标记接收端（日志分割；重复挂载忽略后者并返回 false）。
+    /// Attach the segment marker sink once. A repeated call returns false.
     pub fn set_log_sink(&self, sink: LogMarkSink) -> bool {
         self.log_sink.set(sink).is_ok()
     }
@@ -288,8 +288,8 @@ impl ControlService {
         self.power_outcome.set(sink).is_ok()
     }
 
-    /// 供电前分段：经宿主 sink 同步落盘。失败 → 拦截派发（LOG-5：分段必须
-    /// 先于控制指令落盘，未落盘不动设备）。
+    /// Persist the pre-power marker through the host callback.
+    /// Dispatch only after the marker is committed.
     fn begin_power_boundary(&self, dut_id: &str, on: bool) -> DeviceResult<()> {
         match self.power_boundary.get() {
             Some(sink) => sink(dut_id, if on { "Power ON" } else { "Power OFF" }),
@@ -297,7 +297,7 @@ impl ControlService {
         }
     }
 
-    /// 动作收尾：向日志写 `[mark] {label}`（成功/失败同写，失败带原因）。
+    /// Record completed and failed actions, including the failure reason when present.
     fn emit_action_mark<T>(&self, dut_id: &str, label: &str, outcome: Result<&T, &DeviceError>) {
         Self::emit_control_mark(self.log_sink.get(), dut_id, label, outcome);
     }
@@ -326,7 +326,7 @@ impl ControlService {
         }
     }
 
-    /// 注册/更新 DUT 配置（入口据此校验绑定与解析地址）。
+    /// Register or update the configuration used for binding and resolution.
     pub fn register_dut(&self, dut: DutConfig) {
         duthub_core::util::lock_unpoisoned(&self.dut_configs).insert(dut.id.clone(), dut);
     }
@@ -335,7 +335,7 @@ impl ControlService {
         duthub_core::util::lock_unpoisoned(&self.dut_configs).remove(dut_id);
     }
 
-    /// 按 DUT ID 执行（GUI 按钮路径，Gui 身份：人类在场）。
+    /// Execute a GUI control action for a DUT ID.
     pub fn execute_by_id(
         &self,
         dut_id: &str,
@@ -357,6 +357,14 @@ impl ControlService {
         self.execute_by_id(dut_id, action, &approval.token)
     }
 
+    pub(crate) fn execute_confirmed_reset(&self, dut_id: &str) -> Result<(), ControlEntryError> {
+        let action = ControlAction::Reset;
+        let approval = self
+            .approval
+            .issue(dut_id, action.name(), &action.args_json());
+        self.execute_by_id(dut_id, action, &approval.token)
+    }
+
     pub fn power_configured(&self, dut_id: &str) -> bool {
         self.backend.is_some()
             && self
@@ -367,7 +375,22 @@ impl ControlService {
                 .is_some_and(|dut| resolve_target(dut, &ControlAction::Power { on: true }).is_ok())
     }
 
-    /// 按 DUT ID 执行（显式身份）：MCP 写路径传 `WriteIdentity::agent(...)`。
+    pub fn reset_configured(&self, dut_id: &str) -> bool {
+        self.backend.is_some()
+            && self
+                .dut_configs
+                .lock()
+                .unwrap()
+                .get(dut_id)
+                .is_some_and(|dut| resolve_target(dut, &ControlAction::Reset).is_ok())
+    }
+
+    /// True when the DUT has either Power Supply or Reset control configured.
+    pub fn reboot_configured(&self, dut_id: &str) -> bool {
+        self.power_configured(dut_id) || self.reset_configured(dut_id)
+    }
+
+    /// Execute with an explicit identity. MCP supplies an Agent identity.
     pub fn execute_by_id_as(
         &self,
         dut_id: &str,
@@ -385,10 +408,10 @@ impl ControlService {
         self.execute(&dut, action, approval_token, writer)
     }
 
-    /// 共用入口主流程：绑定/能力 → 后端就绪 → **租约复核** → 授权 → 派发已解析动作。
+    /// Resolve binding and capability, verify the backend and lease, then authorize and dispatch.
     ///
-    /// 租约复核在 approval 校验之前（M10：admit 不通过不消费令牌——GUI 忙时
-    /// Agent 重试不烧审批令牌）。
+    /// A lease denial leaves the approval token available for retry.
+    /// An Agent can retry after a GUI holder releases control.
     pub fn execute(
         &self,
         dut: &DutConfig,
@@ -396,9 +419,9 @@ impl ControlService {
         approval_token: &str,
         writer: &WriteIdentity,
     ) -> Result<(), ControlEntryError> {
-        // 1) 绑定 + 动作能力校验 + 地址/通道解析（失败不消费令牌）
+        // Resolve the physical target and capability before touching the token.
         let target = resolve_target(dut, &action)?;
-        // 2) 驱动就绪校验（同样不消费令牌）
+        // Check backend readiness before touching the token.
         let backend = self
             .backend
             .clone()
@@ -415,21 +438,21 @@ impl ControlService {
             .relay_writes
             .try_read()
             .map_err(|_| DeviceError::Busy)?;
-        // 3) 租约复核（M10：不通过不消费令牌 → 先 admit 后 validate）
+        // Check the lease before validating approval.
         let admission = self
             .admit_control(&dut.id, writer)
             .map_err(ControlEntryError::from)?;
-        // 4) 授权：令牌绑定 dut + action + 参数，单次消费
+        // Consume the token once after matching the DUT, action, and parameters.
         let authorized =
             self.approval
                 .validate(approval_token, &dut.id, action.name(), &action.args_json());
         if let Err(err) = authorized {
-            // 令牌未消费成功 → 立即释放临时租约，不留悬挂占用
+            // Release the temporary lease if approval validation fails.
             self.finish_control(&dut.id, &admission, action.name(), false);
             return Err(ControlEntryError::Approval(err));
         }
-        // 5) 派发：驱动接收已解析的设备地址与动作；
-        //    成功/失败都写分段标记（日志分割，B2）
+        // Dispatch only the resolved target and action.
+        // Record both outcomes with segment markers.
         let label = action.mark_label();
         let action_name = action.name();
         let is_power = matches!(
@@ -437,8 +460,8 @@ impl ControlService {
             ControlAction::Power { .. } | ControlAction::PowerCycle { .. }
         );
         if let ControlAction::Power { on } = action {
-            // LOG-5：分段未确认落盘 → 拦截派发（不动设备），回收本次租约并
-            // 登记失败审计。令牌已在 validate 消费，重试需重新申请审批。
+            // If pre-power logging fails, block dispatch, release the lease, and audit the failure.
+            // Approval was already consumed, so a retry requires a fresh token.
             if let Err(err) = self.begin_power_boundary(&dut.id, on) {
                 self.finish_control(&dut.id, &admission, action_name, false);
                 return Err(ControlEntryError::Device(err));
@@ -517,8 +540,8 @@ impl ControlService {
         outcome.map_err(ControlEntryError::from)
     }
 
-    /// 继电器逐通道状态查询（只读，无需审批）：解析 DUT 继电器节点后派发后端。
-    /// 仅继电器类后端支持（PDU 报 Unsupported）；板卡不回答 STATUS 时返回空表。
+    /// Query relay channel status without approval.
+    /// PDU returns unsupported. A silent relay board yields an empty list.
     pub fn channel_status(&self, dut_id: &str) -> Result<Vec<(u8, bool)>, ControlEntryError> {
         let dut = self
             .dut_configs
@@ -647,7 +670,7 @@ impl ControlService {
         };
         let supply = channels.power == Some(channel);
         if supply {
-            // LOG-5：闭合分段未落盘 → 不派发（未动设备，无需 OFF 补偿）。
+            // A failed activation marker blocks ON, so no compensating OFF is required.
             if let Err(err) = self.begin_power_boundary(dut_id, true) {
                 self.finish_control(dut_id, &admission, operation, false);
                 return Err(err.into());
@@ -658,8 +681,8 @@ impl ControlService {
             let _ = released.blocking_recv();
         }
         // A failed ON can still have reached the relay. Always attempt OFF.
-        // 释放路径的分段失败不拦截 OFF：按住中的继电器必须始终尝试断开
-        //（红线：断开与闭合使用同一物理目标）。
+        // Always attempt OFF for a held relay even if its release marker fails.
+        // Use the same physical target for activation and release.
         if supply {
             let _ = self.begin_power_boundary(dut_id, false);
         }
@@ -680,9 +703,9 @@ impl ControlService {
         outcome.map_err(ControlEntryError::from)
     }
 
-    /// 继电器单通道 ON→STATUS→OFF 往返测试（写动作，GUI 按钮路径，Gui 身份）。
-    /// 授权走 [`ACTION_CHANNEL_TEST`] 闸门：令牌绑定 dut + 参数 `{"channel": N}`，
-    /// 单次消费；绑定/节点校验失败不消费令牌（与 [`Self::execute`] 同序）。
+    /// Energize, check, and release one channel from the GUI.
+    /// The single-use approval is bound to the DUT and channel.
+    /// Resolve the binding before consuming approval, as in `Self::execute`.
     pub fn channel_test(
         &self,
         dut_id: &str,
@@ -692,7 +715,7 @@ impl ControlService {
         self.channel_test_as(dut_id, channel, approval_token, &WriteIdentity::gui())
     }
 
-    /// 继电器单通道往返测试（显式身份）：MCP `relay_test` 传 Agent 身份。
+    /// Run a relay test with the caller's explicit identity.
     pub fn channel_test_as(
         &self,
         dut_id: &str,
@@ -725,7 +748,7 @@ impl ControlService {
             .relay_writes
             .try_read()
             .map_err(|_| DeviceError::Busy)?;
-        // 租约复核在 approval 校验之前（不通过不消费令牌，同 execute）
+        // Verify the lease before consuming approval.
         let admission = self
             .admit_control(&dut.id, writer)
             .map_err(ControlEntryError::from)?;
@@ -739,7 +762,7 @@ impl ControlService {
         let outcome = self
             .runtime
             .block_on(async move { backend.channel_test(&node, channel).await });
-        // 往返测试（relay_test）同样挂分段标记：ON→STATUS→OFF 的结论进日志
+        // Record the result of the ON, status, and OFF sequence as a segment marker.
         let label = format!("继电器 relay_test CH{channel}");
         self.emit_action_mark(&dut.id, &label, outcome.as_ref());
         self.finish_control(&dut.id, &admission, ACTION_CHANNEL_TEST, outcome.is_ok());
@@ -808,8 +831,8 @@ impl RelayBoardProbe for ControlRelayProbe {
     }
 }
 
-/// 解析继电器串口节点（逐通道状态/测试动作的目标地址）。
-/// PDU 不提供逐通道 STATUS 查询 → Unsupported（不伪造）。
+/// Resolve the relay port for status queries and test commands.
+/// An SNMP PDU has no equivalent per-channel status operation.
 fn relay_node(dut: &DutConfig) -> DeviceResult<String> {
     match &dut.relay {
         RelayConfig::Disabled | RelayConfig::UsbBoard { .. } => {
@@ -891,7 +914,7 @@ fn resolve_boot_trigger(dut: &DutConfig) -> DeviceResult<BootTrigger> {
     )))
 }
 
-/// 绑定 + 动作能力校验 + 目标解析。SNMP PDU 只提供电源通断（不伪造 Reset/PowerKey）。
+/// Validate the binding and capability, then resolve the physical target.
 pub fn resolve_target(dut: &DutConfig, action: &ControlAction) -> DeviceResult<ControlTarget> {
     match &dut.relay {
         RelayConfig::Disabled | RelayConfig::UsbBoard { .. } => {
@@ -956,7 +979,7 @@ pub fn resolve_target(dut: &DutConfig, action: &ControlAction) -> DeviceResult<C
                     channel: outlets.power,
                 })
             }
-            // PDU 不伪造 Reset / PowerKey（docs/DATA_MODEL.md）
+            // The SNMP PDU supports power switching only.
             ControlAction::Reset
             | ControlAction::PowerKey { .. }
             | ControlAction::EnterMaskrom { .. }
@@ -969,19 +992,20 @@ pub fn resolve_target(dut: &DutConfig, action: &ControlAction) -> DeviceResult<C
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use duthub_core::HeartbeatConfig;
     use duthub_core::model::{
-        AdbConfig, DutA2aConfig, DutMediaConfig, FlashConfig, HeartbeatConfig, McpConfig,
-        PduOutlets, RelayChannels, SerialConfig, SnmpConfig,
+        AdbConfig, DutA2aConfig, DutMediaConfig, FlashConfig, McpConfig, PduOutlets, RelayChannels,
+        SerialConfig, SnmpConfig,
     };
     use std::sync::Mutex as StdMutex;
 
-    /// 记录型假驱动：断言驱动只收到已解析的地址与动作，从不接触令牌。
+    /// Recording backend that receives the resolved address and action without the token.
     struct MockBackend {
         calls: StdMutex<Vec<String>>,
         fail_power: Option<bool>,
-        /// `channel_status` 按地址返回的通道表（未配置的地址报 Unsupported）。
+        /// Configured channel states by address. Unknown addresses return unsupported.
         status_map: StdMutex<HashMap<String, Vec<(u8, bool)>>>,
-        /// `channel_test` 按「地址:通道」返回的报告（未配置的键报 Unsupported）。
+        /// Configured test reports by address and channel. Unknown targets return unsupported.
         test_reports: StdMutex<HashMap<String, ChannelTestReport>>,
     }
 
@@ -1146,7 +1170,7 @@ mod tests {
         ));
         assert!(
             backend.calls.lock().unwrap().is_empty(),
-            "无令牌不得触达驱动"
+            "missing token must not reach the driver"
         );
     }
 
@@ -1278,7 +1302,7 @@ mod tests {
         let backend = MockBackend::new();
         let (svc, approval) = service(Some(backend.clone()));
         svc.register_dut(dut_with_relay("dut-a"));
-        // 令牌签给 dut-b / power=false，与本次操作不匹配
+        // The token authorizes a different DUT and power state.
         let token = approval.issue("dut-b", "control.power", r#"{"on":false}"#);
         let err = svc
             .execute_by_id("dut-a", ControlAction::Power { on: true }, &token.token)
@@ -1303,7 +1327,7 @@ mod tests {
             *calls,
             vec!["power addr=COM7 driver=CH340 ch=4 on=true".to_string()]
         );
-        // 单次消费：同一令牌重放必须拒绝
+        // Reject repeated use of the same token.
         assert!(matches!(
             svc.execute_by_id("dut-a", ControlAction::Power { on: true }, &token.token),
             Err(ControlEntryError::Approval(ApprovalError::Unknown))
@@ -1345,7 +1369,7 @@ mod tests {
             err,
             ControlEntryError::Device(DeviceError::Invalid(_))
         ));
-        // 绑定缺失时令牌不被消费，修正配置后可重试
+        // A missing binding leaves the token available after configuration is corrected.
         assert!(
             approval
                 .validate(&token.token, "dut-b", "control.power", r#"{"on":true}"#)
@@ -1376,7 +1400,7 @@ mod tests {
             *backend.calls.lock().unwrap(),
             vec!["power addr=192.168.1.100 driver=snmp-pdu ch=3 on=false".to_string()]
         );
-        // PDU 不伪造 Reset / PowerKey
+        // The PDU provides neither reset nor power-key operations.
         let token = approval.issue("dut-pdu", "control.reset", "{}");
         assert!(matches!(
             svc.execute_by_id("dut-pdu", ControlAction::Reset, &token.token),
@@ -1404,7 +1428,7 @@ mod tests {
             err,
             ControlEntryError::Device(DeviceError::Unsupported)
         ));
-        // 后端未接线不消费令牌
+        // A missing backend leaves approval unconsumed.
         assert!(
             approval
                 .validate(&token.token, "dut-a", "control.power", r#"{"on":true}"#)
@@ -1412,7 +1436,7 @@ mod tests {
         );
     }
 
-    // ── 继电器测试（channel_status 只读 / channel_test 走 control.test 闸门） ────
+    // Read-only relay status and approval-gated relay testing.
 
     fn roundtrip_report() -> ChannelTestReport {
         ChannelTestReport {
@@ -1460,7 +1484,7 @@ mod tests {
         ));
         assert!(
             backend.calls.lock().unwrap().is_empty(),
-            "拒绝路径不得触达后端"
+            "rejected calls must not reach the backend"
         );
     }
 
@@ -1470,22 +1494,22 @@ mod tests {
         let (svc, approval) = service(Some(backend.clone()));
         svc.register_dut(dut_with_relay("dut-a"));
 
-        // 无令牌 → Missing，不触达后端
+        // A missing token must be rejected before dispatch.
         assert!(matches!(
             svc.channel_test("dut-a", 1, ""),
             Err(ControlEntryError::Approval(ApprovalError::Missing))
         ));
-        // 令牌签给别的动作/参数 → Mismatch
+        // A token for other arguments or actions must be rejected.
         let wrong = approval.issue("dut-a", "control.power", r#"{"on":true}"#);
         assert!(matches!(
             svc.channel_test("dut-a", 1, &wrong.token),
             Err(ControlEntryError::Approval(ApprovalError::Mismatch))
         ));
-        // 正确令牌（dut + control.test + {"channel":1}）→ 放行
+        // A matching DUT, action, and channel permit dispatch.
         let token = approval.issue("dut-a", ACTION_CHANNEL_TEST, r#"{"channel":1}"#);
         let report = svc.channel_test("dut-a", 1, &token.token).unwrap();
         assert_eq!(report, roundtrip_report());
-        // 单次消费：重放拒绝且不再触达后端
+        // A reused token must not reach the backend.
         assert!(matches!(
             svc.channel_test("dut-a", 1, &token.token),
             Err(ControlEntryError::Approval(ApprovalError::Unknown))
@@ -1501,7 +1525,7 @@ mod tests {
         let backend = MockBackend::new().with_test_report("COM7", 2, roundtrip_report());
         let (svc, approval) = service(Some(backend));
         svc.register_dut(dut_with_relay("dut-a"));
-        // 令牌绑定 channel=1，请求 channel=2 → 参数绑定校验拒绝
+        // Approval for channel 1 does not authorize channel 2.
         let token = approval.issue("dut-a", ACTION_CHANNEL_TEST, r#"{"channel":1}"#);
         assert!(matches!(
             svc.channel_test("dut-a", 2, &token.token),
@@ -1521,7 +1545,7 @@ mod tests {
             svc.channel_test("dut-b", 1, &token.token),
             Err(ControlEntryError::Device(DeviceError::Invalid(_)))
         ));
-        // 绑定缺失：令牌不消费，修正配置后可重试
+        // Preserve the token when the binding is missing.
         assert!(
             approval
                 .validate(
@@ -1534,9 +1558,9 @@ mod tests {
         );
     }
 
-    // ── 分段标记挂钩（日志分割 B2：动作成功/失败后自动 [mark] 行） ─────────────
+    // Log markers for completed and failed relay actions.
 
-    /// 全路径失败的假驱动（失败标记测试用）。
+    /// Backend that fails every action to exercise failure markers.
     struct FailingBackend;
 
     #[async_trait]
@@ -1572,7 +1596,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((dut.to_string(), label.to_string())))),
-            "首次挂载必须成功"
+            "initial sink registration must succeed"
         );
         marks
     }
@@ -1584,7 +1608,7 @@ mod tests {
         let marks = attach_sink(&svc);
         assert!(
             !svc.set_log_sink(Arc::new(|_, _| ())),
-            "重复挂载应被忽略（OnceLock 语义）"
+            "duplicate registration must be ignored (OnceLock semantics)"
         );
         svc.register_dut(dut_with_relay("dut-a"));
         let token = approval.issue("dut-a", "control.power", r#"{"on":true}"#);
@@ -1593,9 +1617,9 @@ mod tests {
         assert_eq!(
             *marks.lock().unwrap(),
             vec![("dut-a".to_string(), "继电器 power ON".to_string())],
-            "成功动作必须写 [mark] 标记"
+            "successful action must emit a [mark] entry"
         );
-        // OFF 用不同标记文本
+        // OFF has a distinct marker label.
         let token = approval.issue("dut-a", "control.power", r#"{"on":false}"#);
         svc.execute_by_id("dut-a", ControlAction::Power { on: false }, &token.token)
             .unwrap();
@@ -1614,10 +1638,10 @@ mod tests {
                 .is_err()
         );
         let marks = marks.lock().unwrap();
-        assert_eq!(marks.len(), 1, "失败动作也要写标记");
+        assert_eq!(marks.len(), 1, "failed action must also emit a mark");
         assert!(
             marks[0].1.starts_with("继电器 power ON 失败: "),
-            "失败标记必须带原因：{}",
+            "failure mark must include reason: {}",
             marks[0].1
         );
     }
@@ -1628,12 +1652,15 @@ mod tests {
         let (svc, _approval) = service(Some(backend.clone()));
         let marks = attach_sink(&svc);
         svc.register_dut(dut_with_relay("dut-a"));
-        // 无令牌：授权闸门拒绝，未触达驱动 → 不算动作，无标记
+        // A missing token never reaches the driver or writes an execution marker.
         assert!(
             svc.execute_by_id("dut-a", ControlAction::Reset, "")
                 .is_err()
         );
-        assert!(marks.lock().unwrap().is_empty(), "授权拒绝不产生分段标记");
+        assert!(
+            marks.lock().unwrap().is_empty(),
+            "approval denial must not emit a mark"
+        );
         assert!(backend.calls.lock().unwrap().is_empty());
     }
 
@@ -1671,10 +1698,10 @@ mod tests {
         );
     }
 
-    // ── LOG-5：供电前分段失败拦截派发 ──────────────────────────────────────
+    // Pre-power logging errors must block hardware dispatch.
 
-    /// 供电前分段未落盘 → execute 不得派发（不动设备）；拦截只作用于 Power，
-    /// 非电源动作不经供电边界、正常派发。
+    /// Power switching requires a committed pre-power marker.
+    /// Other actions bypass that boundary.
     #[test]
     fn failed_power_boundary_intercepts_dispatch() {
         let backend = MockBackend::new();
@@ -1683,7 +1710,7 @@ mod tests {
             svc.set_power_boundary_sink(Arc::new(|_, _| {
                 Err(DeviceError::Invalid("会话日志分段数已达上限".into()))
             })),
-            "首次挂载必须成功"
+            "initial sink registration must succeed"
         );
         svc.register_dut(dut_with_relay("dut-a"));
         let token = approval.issue("dut-a", "control.power", r#"{"on":true}"#);
@@ -1692,25 +1719,29 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, ControlEntryError::Device(DeviceError::Invalid(_))),
-            "分段失败必须以 Device 错误上报：{err:?}"
+            "segment failure must report a Device error: {err:?}"
         );
         assert!(
             backend.calls.lock().unwrap().is_empty(),
-            "分段失败不得触达驱动（不动设备）"
+            "segment failure must not reach the driver"
         );
-        // 非电源动作不经供电边界：分段失败不影响其派发
+        // A failing pre-power boundary does not block a different action.
         let token = approval.issue("dut-a", "control.reset", "{}");
         svc.execute_by_id("dut-a", ControlAction::Reset, &token.token)
             .unwrap();
-        assert_eq!(backend.calls.lock().unwrap().len(), 1, "Reset 必须正常派发");
+        assert_eq!(
+            backend.calls.lock().unwrap().len(),
+            1,
+            "Reset must still dispatch normally"
+        );
     }
 
-    /// 按住测试的分段语义：闭合分段失败 → 不派发 ON（未动设备，无 OFF 补偿）；
-    /// 释放分段失败不拦截 OFF——按住中的继电器必须始终尝试断开（红线：断开
-    /// 与闭合使用同一物理目标）。
+    /// A failed activation marker prevents ON and needs no release.
+    /// A failed release marker still allows OFF.
+    /// Activation and release use the same physical target.
     #[test]
     fn hold_channel_boundary_failure_intercepts_on_but_never_off() {
-        // 场景一：闭合分段失败 → Err 且驱动零调用
+        // Fail the activation marker before calling the backend.
         let backend = MockBackend::new();
         let (svc, _approval) = service(Some(backend.clone()));
         assert!(svc.set_power_boundary_sink(Arc::new(|_, _| {
@@ -1721,14 +1752,14 @@ mod tests {
         let err = svc.hold_channel(&dut, 4, released).unwrap_err();
         assert!(
             matches!(err, ControlEntryError::Device(DeviceError::Invalid(_))),
-            "闭合分段失败必须上报 Device 错误：{err:?}"
+            "activation segment failure must report a Device error: {err:?}"
         );
         assert!(
             backend.calls.lock().unwrap().is_empty(),
-            "闭合分段失败不得触达驱动"
+            "activation segment failure must not reach the driver"
         );
 
-        // 场景二：仅释放分段失败 → ON 与 OFF 都必须派发
+        // With only the release marker failing, dispatch both ON and OFF.
         let backend = MockBackend::new();
         let (svc, _approval) = service(Some(backend.clone()));
         assert!(svc.set_power_boundary_sink(Arc::new(|_, label| {
@@ -1744,7 +1775,10 @@ mod tests {
         let worker = std::thread::spawn(move || svc.hold_channel(&dut, 4, released));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while backend.calls.lock().unwrap().is_empty() {
-            assert!(std::time::Instant::now() < deadline, "闭合未派发");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "activation was not dispatched"
+            );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         std::thread::sleep(std::time::Duration::from_millis(120));

@@ -1,8 +1,10 @@
-//! 模型绑定 → goose 环境变量（W2）。
+//! Model binding → goose environment variables (W2).
 //!
-//! 模型配置留在 duthub：复用 provider catalog（`settings.agent.providers`，
-//! 密钥在 OS 密钥库 `model/<credential id>`）与 legacy `agent.provider/slow` 字段。
-//! 只经环境变量注入 goose；Token 不写 goose 配置、不进日志。
+//! The model configuration is stored in duthub: it utilizes the provider catalog
+//! (`settings.agent.providers`). The key is kept in the OS key store at `model/<credential_id>`.
+//! Additionally, the legacy field `agent.provider/slow` is also used for storage purposes.
+//! Goose is only injected through environment variables; no configuration details related to Goose
+//! are written down, and all operations are logged.
 
 use std::fmt;
 use std::path::Path;
@@ -11,7 +13,7 @@ use duthub_agent::validate_model_base;
 use duthub_core::model::SettingsFile;
 use duthub_core::{Provider, model_provider_credential_id};
 
-/// 传给 goose 的模型绑定。`api_key` 只存在于内存与环境变量。
+/// The model is bound to goose. `api_key` exists only in memory and environment variables.
 #[derive(Clone, PartialEq, Eq)]
 pub struct GooseBinding {
     pub provider: Provider,
@@ -33,7 +35,7 @@ impl fmt::Debug for GooseBinding {
 }
 
 impl GooseBinding {
-    /// 脱敏后的显示值（UI/日志可用）。
+    /// Masked display values (available in UI/log formats).
     #[must_use]
     pub fn redacted_debug(&self) -> String {
         format!(
@@ -49,18 +51,21 @@ impl GooseBinding {
     }
 }
 
-/// 从 settings 解析当前模型绑定（密钥库读取真实 API Key）。
+/// Parsing the current model binding from settings (the actual API key is read from the key
+/// repository).
 pub fn resolve_binding(settings: &SettingsFile) -> Result<GooseBinding, String> {
     resolve_binding_with(settings, |credential_id| {
         duthub_core::get_key(credential_id).map_err(|error| error.to_string())
     })
 }
 
-/// 可注入密钥查询的解析实现（测试 / 嵌入方）。
+/// Implementation of parsing methods for querying with keys (for testing/integration purposes).
 ///
-/// F7：显式选中的 `agent.activeProviderId/activeModelId` 必须精确命中，未选择时
-/// 才按 legacy preferred + 启用顺序回退。单个 provider 的密钥库错误跳过并聚合，
-/// 只有完全没有可用绑定时才把聚合原因返回，不静默改选其他 provider。
+/// F7: The explicitly selected `agent.activeProviderId/activeModelId` must be exactly matched. If
+/// not selected, then the system will revert to the legacy preferred order and selection order.
+/// Errors related to the key store of a single provider can be ignored and aggregated. The reason
+/// for aggregation will only be returned if there are no available bindings at all. No silent
+/// switching to another provider will occur in such cases.
 pub fn resolve_binding_with<F>(settings: &SettingsFile, lookup: F) -> Result<GooseBinding, String>
 where
     F: Fn(&str) -> Result<Option<String>, String>,
@@ -77,7 +82,8 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-/// F7：用户显式选中的 provider/model 优先，缺失或不完整时给明确错误（不回退）。
+/// F7: Prioritize the providers/models explicitly selected by the user. If any are missing or
+/// incomplete, a clear error will be reported (no rollback is performed).
 fn resolve_active<F>(
     settings: &SettingsFile,
     provider_id: Option<&str>,
@@ -205,11 +211,14 @@ fn append_skipped(message: String, skipped: &[String]) -> String {
     }
 }
 
-/// F19：产品协议白名单与「Agent 模型」的 API 格式选项保持一致。
+/// F19: The product protocol allowlist must be consistent with the API format options of the "Agent
+/// model".
 ///
-/// `OpenAI` 兼容族（含 DeepSeek/Qwen 别名）与 Anthropic 由 `goose_env` 直接支持；
-/// Gemini 尚无产品接线（UI 不提供），legacy `agent.provider=gemini` 也显式拒绝，
-/// 避免「UI 禁用但 legacy 可进入」。
+/// `OpenAI`-compatible services (including DeepSeek/Qwen aliases) and Anthropic are directly
+/// supported by `goose_env`. There are no available products for Gemini yet (the UI does not offer
+/// any such options). The legacy configuration `agent.provider=gemini` is also explicitly disabled.
+/// This avoids the situation where the UI is unavailable, but the legacy configuration can still be
+/// used.
 #[must_use]
 pub fn protocol_supported(provider: Provider) -> bool {
     !matches!(provider, Provider::Gemini)
@@ -225,13 +234,14 @@ fn ensure_protocol_supported(provider: Provider) -> Result<(), String> {
     ))
 }
 
-/// F19：Host 启动前归一化绑定：trim 所有字段，并校验协议、Base URL、模型与密钥。
+/// F19: Normalization binding before host startup: Trim all fields, and verify the protocol, Base
+/// URL, model, and keys.
 pub fn normalize_binding(binding: &GooseBinding) -> Result<GooseBinding, String> {
     ensure_protocol_supported(binding.provider)?;
     let base_url = if binding.base_url.trim().is_empty() {
         binding.provider.default_base().to_owned()
     } else {
-        validate_model_base(&binding.base_url)?
+        validate_model_base(&binding.base_url).map_err(|error| error.to_string())?
     };
     if base_url.trim().is_empty() {
         return Err("OpenAI Compatible provider 必须显式填写 Base URL".into());
@@ -261,7 +271,7 @@ fn build_binding(
     let base_url = if base_url.trim().is_empty() {
         provider.default_base().to_owned()
     } else {
-        validate_model_base(base_url)?
+        validate_model_base(base_url).map_err(|error| error.to_string())?
     };
     if base_url.is_empty() {
         return Err("OpenAI Compatible provider 必须显式填写 Base URL".into());
@@ -277,12 +287,17 @@ fn build_binding(
     })
 }
 
-/// 生成 goose 需要的环境变量（不含继承环境；调用方用白名单叠加）。
+/// The environment variables required to generate "goose" (excluding inherited environments; use a
+/// whitelist for integration).
 ///
-/// 路径收敛要点（**不是 OS 强制边界**；受限令牌 / `AppContainer` 仍 deferred）：
-/// - `GOOSE_PATH_ROOT` 固定到每 DUT 目录，config/sessions 不落用户主目录；
-/// - `GOOSE_DISABLE_KEYRING=1`：goose 默认会尝试系统 keyring，在无交互会话中
-///   可能无限阻塞；duthub 的模型密钥只经环境变量注入，不落 goose 配置。
+/// Key points for path convergence (**not an OS-mandated boundary**; restricted tokens /
+/// `AppContainer` are still deferred):
+/// - `GOOSE_PATH_ROOT` is fixed to be within each DUT's directory; config/sessions is not located
+///   in the user's home directory.
+/// - `GOOSE_DISABLE_KEYRING=1`: By default, goose attempts to use the system keyring. In
+///   non-interactive sessions, this could lead to infinite blocking issues. The model keys stored in
+///   duthub are only injected via environment variables and do not affect goose configuration
+///   settings.
 pub fn goose_env(
     binding: &GooseBinding,
     goose_root: &Path,
@@ -310,13 +325,18 @@ pub fn goose_env(
             "GOOSE_PATH_ROOT".to_owned(),
             goose_root.to_string_lossy().into_owned(),
         ),
-        // F1：auto 模式下 goose 直接执行工具、永远不会发权限请求；
-        // approve 模式把 tool 权限请求交给 ACP 客户端（本客户端一律拒绝）。
+        // In the "auto" mode, goose directly executes tools without ever sending any permission
+        // requests. In the "approve" mode, permission requests for tools are handed over to the ACP
+        // client (this client refuses all such requests).
         ("GOOSE_MODE".to_owned(), "approve".to_owned()),
     ];
     let base = normalize_base(binding.provider, &binding.base_url);
     match binding.provider {
-        Provider::Openai | Provider::Deepseek | Provider::Qwen | Provider::Compatible => {
+        Provider::Openai
+        | Provider::OpenaiResponses
+        | Provider::Deepseek
+        | Provider::Qwen
+        | Provider::Compatible => {
             env.push(("OPENAI_API_KEY".to_owned(), binding.api_key.clone()));
             env.push(("OPENAI_BASE_URL".to_owned(), base));
         }
@@ -339,13 +359,18 @@ pub fn goose_env(
 
 fn goose_provider(provider: Provider) -> &'static str {
     match provider {
-        Provider::Openai | Provider::Deepseek | Provider::Qwen | Provider::Compatible => "openai",
+        Provider::Openai
+        | Provider::OpenaiResponses
+        | Provider::Deepseek
+        | Provider::Qwen
+        | Provider::Compatible => "openai",
         Provider::Anthropic => "anthropic",
         Provider::Gemini => "google",
     }
 }
 
-/// goose 自己拼版本段：Anthropic 去掉尾部 `/v1`，Google 去掉 `/v1beta`。
+/// Goose manually modifies the version numbers: Anthropic removes the `/v1` suffix, while Google
+/// removes the `/v1beta` suffix.
 fn normalize_base(provider: Provider, base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     match provider {
@@ -359,17 +384,14 @@ fn normalize_base(provider: Provider, base_url: &str) -> String {
     }
 }
 
-/// Managed config：只禁用 goose 内置本地扩展。
+/// Managed config: disables goose's built-in local extensions.
 ///
-/// 2026-11-21 对真实 `goose-acp 1.60.2` 实测：写入本段后 `session/new` 的
-/// `_meta.extensionResults` 从 4 项（Extension Manager / summon / developer / tom）
-/// 变为 `[]`。
-///
-/// 2026-11-25 用**通用 `goose.exe` 1.60.2** 复核：它还带 `apps` 与 `analyze` 两个
-/// 内置扩展，未关闭时工具面是 `[duthub, apps, analyze]`，会被
-/// `validate_extension_results`（要求恰好一个 duthub）按 fail-closed 拒绝，表现为
-/// 会话停在 Failed。工具面校验不放松，这里把后来新增的内置扩展一并关掉；goose
-/// 再新增内置扩展时应同步本表与校验测试（AGENTS #62）。
+/// Verified against `goose-acp 1.60.2`: writing this section clears the built-in extensions
+/// (`Extension Manager`, `summon`, `developer`, `tom`) from `session/new` `_meta.extensionResults`.
+/// Universal `goose.exe` 1.60.2 also ships built-in `apps` and `analyze` extensions; leaving them
+/// enabled would yield `[duthub, apps, analyze]` and fail `validate_extension_results` (which
+/// requires strictly one `duthub` extension). Update this list whenever a newer goose release
+/// adds built-in extensions.
 #[must_use]
 pub fn goose_config_yaml() -> &'static str {
     "# Managed by duthub. Do not edit: rewritten on every session start.\n\
@@ -388,7 +410,8 @@ extensions:\n\
 \x20\x20\x20\x20enabled: false\n"
 }
 
-/// 把 managed config 落到 `<goose_root>/config/config.yaml`（内容不变时不动 mtime）。
+/// Save the managed config in `<goose_root>/config/config.yaml` (do not change the mtime if the
+/// content remains unchanged).
 pub fn write_config(goose_root: &Path) -> Result<(), String> {
     let dir = duthub_core::store::ensure_agent_dir(goose_root, &["config"])
         .map_err(|error| error.to_string())?;
@@ -413,10 +436,7 @@ mod tests {
             base_url: base_url.into(),
             protocol: provider,
             enabled: true,
-            models: vec![ProviderModel {
-                id: "model-a".into(),
-                enabled: true,
-            }],
+            models: vec![ProviderModel::new("model-a", true)],
         }];
         settings
     }
@@ -445,10 +465,7 @@ mod tests {
                 base_url: "https://a.example.com/v1".into(),
                 protocol: Provider::Openai,
                 enabled: true,
-                models: vec![ProviderModel {
-                    id: "model-a".into(),
-                    enabled: true,
-                }],
+                models: vec![ProviderModel::new("model-a", true)],
             },
             ModelProvider {
                 id: "b".into(),
@@ -456,10 +473,7 @@ mod tests {
                 base_url: "https://b.example.com/v1".into(),
                 protocol: Provider::Openai,
                 enabled: true,
-                models: vec![ProviderModel {
-                    id: "model-b".into(),
-                    enabled: true,
-                }],
+                models: vec![ProviderModel::new("model-b", true)],
             },
         ];
         settings
@@ -471,7 +485,8 @@ mod tests {
 
     #[test]
     fn active_selection_wins_over_enabled_order() {
-        // F7：选中 B 就必须用 B 的 base_url/model/key，不能按启用顺序选 A。
+        // F7: Once B is selected, it must be used with B's base_url/model/key. You cannot choose A
+        // instead, as per the enabling order.
         let mut settings = two_providers();
         settings.agent.active_provider_id = Some("b".into());
         settings.agent.active_model_id = Some("model-b".into());
@@ -505,14 +520,15 @@ mod tests {
                 Ok(None)
             }
         })
-        .expect_err("选中的 provider 缺 key 时不得静默改选 A");
+        .expect_err("If the selected provider lacks a key, it must be changed to option A without any warnings.");
         assert!(error.contains("Provider B"), "{error}");
         assert!(error.contains("API Key 未保存"), "{error}");
     }
 
     #[test]
     fn provider_keyring_error_is_skipped_and_next_provider_wins() {
-        // F7：单个 provider 的密钥库错误不得中断后续 provider。
+        // F7: If there is an error with the key store of a single provider, the subsequent
+        // providers should not be interrupted.
         let settings = two_providers();
         let key_b = credential("b", "https://b.example.com/v1");
         let binding = resolve_binding_with(&settings, |id| {
@@ -531,7 +547,7 @@ mod tests {
     fn keyring_errors_are_aggregated_when_no_binding_is_usable() {
         let settings = two_providers();
         let error = resolve_binding_with(&settings, |_| Err("vault locked".into()))
-            .expect_err("没有可用绑定时必须报错");
+            .expect_err("An error must be reported when no binding options are available.");
         assert!(error.contains("vault locked"), "{error}");
         assert!(error.contains("Provider A"), "{error}");
         assert!(error.contains("Provider B"), "{error}");
@@ -609,13 +625,14 @@ mod tests {
         let env = goose_env(&binding, &root).unwrap();
         assert!(
             env.contains(&("GOOSE_DISABLE_KEYRING".into(), "1".into())),
-            "GOOSE_DISABLE_KEYRING=1 必须保留（避免 keyring 无限阻塞）"
+            "GOOSE_DISABLE_KEYRING=1 should be kept enabled (to prevent keyrings from causing infinite blocking issues)."
         );
         assert!(env.contains(&(
             "GOOSE_PATH_ROOT".into(),
             root.to_string_lossy().into_owned()
         )));
-        // 模型密钥只经环境变量注入，不进入配置/路径变量。
+        // The model key is only injected into the environment variables, and does not affect
+        // configuration/path variables.
         let key_values: Vec<&str> = env
             .iter()
             .filter(|(key, _)| key.contains("KEY"))
@@ -639,7 +656,7 @@ mod tests {
         assert!(env.contains(&("GOOSE_PROVIDER".into(), "anthropic".into())));
         assert!(
             env.contains(&("GOOSE_MODE".into(), "approve".into())),
-            "F1：必须用 approve 让权限请求回落到 ACP 拒绝"
+            "F1: It is necessary to use the \"approve\" command to send permission requests back to the ACP for rejection."
         );
 
         let google = GooseBinding {

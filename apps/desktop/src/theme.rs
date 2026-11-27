@@ -1,6 +1,8 @@
-//! 主题 token —— 1:1 移植 `docs/ui-spec/theme.md`（原型 `:root` dark + light）。
+//! Theme token — 1:1 migration of `docs/ui-spec/theme.md` (prototype: `:root` with both dark and
+//! light themes).
 //!
-//! `const fn` 复刻 `gpui_kit::rgb` 语义（hex → Rgba，alpha=1.0）。
+//! `const fn` replicates the semantics of `gpui_kit::rgb` (hexadecimal to Rgba format, with alpha
+//! value set to 1.0).
 
 use gpui_kit::Rgba;
 
@@ -10,24 +12,22 @@ pub enum ThemeMode {
     Light,
 }
 
-#[allow(dead_code)]
 impl ThemeMode {
     pub fn from_setting(value: &str) -> ThemeMode {
         match value {
             "light" => ThemeMode::Light,
-            _ => ThemeMode::Dark, // system：桌面端默认深色
+            _ => ThemeMode::Dark, // System: The desktop interface defaults to a dark color scheme.
         }
     }
 }
 
-/// 主题调色板（变量名与原型 CSS 变量一一对应）。
+/// Theme color palette (variable names correspond one-to-one with the original CSS variables).
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
     pub bg: Rgba,
-    #[allow(dead_code)]
     pub rail: Rgba,
     pub surface: Rgba,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "design token kept in complete Palette definition")]
     pub panel: Rgba,
     pub raised: Rgba,
     pub hover: Rgba,
@@ -40,7 +40,6 @@ pub struct Palette {
     pub accent_weak: Rgba,
     pub accent_contrast: Rgba,
     pub blue: Rgba,
-    #[allow(dead_code)]
     pub warn: Rgba,
     pub red: Rgba,
     pub term: Rgba,
@@ -48,9 +47,9 @@ pub struct Palette {
     pub prompt: Rgba,
     pub match_: Rgba,
     pub backdrop: Rgba,
-    // 原型 .dot 的 box-shadow 光环色 #48cbb91a
+    // The color of the box-shadow effect in the prototype .dot file is #48cbb91a.
     pub accent_ring: Rgba,
-    // 原型 .config-sidebar：color-mix(surface 86%, black)
+    // Original configuration: .config-sidebar; color-mix(surface 86%, black)
     pub sidebar: Rgba,
 }
 
@@ -69,7 +68,8 @@ const fn rgba_alpha(hex: u32, a: f32) -> Rgba {
     Rgba { r, g, b, a }
 }
 
-/// 终端网格快照的 0xRRGGBB → Rgba（SerialScreen 行色渲染用）。
+/// The 0xRRGGBB of the terminal grid snapshot is converted to Rgba (used for serial screen color
+/// rendering).
 pub fn rgba_hex(hex: u32) -> Rgba {
     rgba_alpha(hex, 1.0)
 }
@@ -129,7 +129,7 @@ pub const LIGHT: Palette = Palette {
 };
 
 impl ThemeMode {
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "palette lookup retained alongside ThemeMode")]
     pub fn palette(self) -> &'static Palette {
         match self {
             ThemeMode::Dark => &DARK,
@@ -145,8 +145,10 @@ use gpui_kit::component::theme::Theme as KitTheme;
 use gpui_kit::component::theme::ThemeMode as KitThemeMode;
 use gpui_kit::px;
 
-/// 品牌色注入 gpui-kit 全局主题：组件结构与行为交给 kit，配色沿用 V35 品牌 token。
-/// 必须在 `gpui_kit::init` 之后调用；设置页切换主题 / 导入 settings.json 时再次调用。
+/// Brand-specific colors are incorporated into the gpui-kit global theme settings. The component
+/// structure and behavior are handled by the kit, while the color scheme follows the V35 brand
+/// guidelines. This function must be called after `gpui_kit::init`; it should also be called when
+/// switching pages or importing the settings.json file.
 pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     let p = match mode {
         ThemeMode::Dark => &DARK,
@@ -159,14 +161,14 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     };
     t.font_family = UI_FONT.into();
     t.mono_font_family = MONO_FONT.into();
-    t.font_size = px(13.0); // 原型基准字号
+    t.font_size = px(13.0); // Original benchmark font size
     t.mono_font_size = px(12.5);
     t.radius = px(6.0);
     t.radius_lg = px(10.0);
     t.window_radius = px(8.0);
 
     let c = &mut t.colors;
-    // 基底
+    // base
     c.background = p.bg.into();
     c.foreground = p.text.into();
     c.border = p.border.into();
@@ -175,13 +177,13 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     c.overlay = p.backdrop.into();
     c.window_border = p.border.into();
     c.selection = p.accent_weak.into();
-    // 主按钮 / 链接
+    // Main Button / Link
     c.primary = p.accent.into();
     c.primary_foreground = p.accent_contrast.into();
     c.primary_hover = p.accent.into();
     c.primary_active = p.accent.into();
     c.link = p.blue.into();
-    // 次级 / 悬浮高亮（shadcn 语义 accent 即 hover 底）
+    // Secondary/Hover highlighting (Shadcn semantics: accent refers to hovering effects)
     c.secondary = p.raised.into();
     c.secondary_foreground = p.text.into();
     c.secondary_hover = p.hover.into();
@@ -190,7 +192,7 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     c.muted_foreground = p.muted.into();
     c.accent = p.accent_weak.into();
     c.accent_foreground = p.text.into();
-    // 按钮组 token（kit Button 按变体取用）
+    // Button group token (uses the variant of the Kit Button)
     c.button = p.raised.into();
     c.button_foreground = p.text.into();
     c.button_hover = p.hover.into();
@@ -207,7 +209,7 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     c.button_danger_foreground = p.bg.into();
     c.button_danger_hover = p.red.into();
     c.button_danger_active = p.red.into();
-    // 状态色
+    // Status colors
     c.danger = p.red.into();
     c.danger_foreground = p.bg.into();
     c.danger_hover = p.red.into();
@@ -224,10 +226,10 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     c.info_foreground = p.bg.into();
     c.info_hover = p.blue.into();
     c.info_active = p.blue.into();
-    // 弹层 / 卡片
+    // Layer / Cards
     c.popover = p.surface.into();
     c.popover_foreground = p.text.into();
-    // 标题栏 / 侧栏
+    // Title Bar / Sidebar
     c.title_bar = p.rail.into();
     c.title_bar_border = p.line.into();
     c.sidebar = p.sidebar.into();
@@ -243,7 +245,7 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     c.tab_active = p.term.into();
     c.tab_foreground = p.muted.into();
     c.tab_active_foreground = p.text.into();
-    // 列表 / 表格
+    // Lists / Tables
     c.list = p.surface.into();
     c.list_hover = p.hover.into();
     c.list_active = p.hover.into();
@@ -260,7 +262,7 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     c.table_row_border = p.line.into();
     c.table_foot = p.surface.into();
     c.table_foot_foreground = p.muted.into();
-    // 其余控件
+    // The remaining controls
     c.switch = p.faint.into();
     c.switch_thumb = p.text.into();
     c.progress_bar = p.accent.into();
@@ -280,7 +282,7 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     c.scrollbar = p.line.into();
     c.scrollbar_thumb = p.faint.into();
     c.scrollbar_thumb_hover = p.muted.into();
-    // 原色槽位（kit red/blue/green 直配）
+    // Primary color slots (directly connected to kit red, blue, and green)
     c.red = p.red.into();
     c.red_light = p.red.into();
     c.blue = p.blue.into();
@@ -288,8 +290,9 @@ pub fn apply_brand(cx: &mut gpui_kit::App, mode: ThemeMode) {
     c.green = p.accent.into();
     c.green_light = p.accent.into();
 
-    // 旧版 tokens 面（Notification/Dialog 等 legacy 组件直接读 tokens.*，
-    // 不随 colors 自动同步——缺了会出现白底白字）
+    // For older versions of tokens, legacy components such as Notification/Dialog directly access
+    // tokens.* These tokens do not synchronize automatically with colors—if they are missing, it
+    // will result in white text on a white background.
     let t2 = &mut t.tokens;
     t2.background = gpui_kit::Hsla::from(p.bg).into();
     t2.popover = gpui_kit::Hsla::from(p.surface).into();

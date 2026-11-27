@@ -60,7 +60,7 @@ fn access_context() -> Arc<AccessContext> {
 }
 
 // ---------------------------------------------------------------------------
-// Test goose fixture (2026-11-24: goose is downloaded, no longer embedded)
+// Test goose fixture (goose is downloaded, not embedded)
 // ---------------------------------------------------------------------------
 
 /// External-program definition that runs an installed goose through the same
@@ -74,7 +74,7 @@ fn test_goose_agent() -> Option<AgentDefinition> {
             let path = PathBuf::from(raw);
             assert!(
                 path.is_absolute() && path.is_file(),
-                "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+                "DUTHUB_TEST_GOOSE must be an absolute path to an existing goose executable: {}",
                 path.display()
             );
             path
@@ -91,8 +91,8 @@ fn test_goose_agent() -> Option<AgentDefinition> {
 /// Loud skip: goose is no longer embedded, so ACP tests need an installed one.
 fn skip_without_goose() {
     eprintln!(
-        "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-         或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+        "SKIP: goose is not installed (goose is no longer embedded) — \
+         download goose from Tool Downloads or set DUTHUB_TEST_GOOSE to the goose executable"
     );
 }
 
@@ -163,25 +163,27 @@ fn degraded_session_persists_legacy_session_id_and_resume_json() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-degraded"),
-        "降级会话未就绪：{:?} stderr={}",
+        "degraded session did not become ready: {:?} stderr={}",
         host.view("dut-degraded").map(|view| view.status()),
         host.view("dut-degraded")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
 
     let view = host.view("dut-degraded").unwrap();
     let session_id = view.session_id().expect("session id");
-    assert_ne!(session_id, "stale-legacy-id", "stale id 不得被沿用");
+    assert_ne!(
+        session_id, "stale-legacy-id",
+        "stale session id must not be reused"
+    );
     assert!(
         transcript_contains(&view, "已降级为新会话"),
-        "必须显示降级注记：{:?}",
+        "degraded note must appear in transcript: {:?}",
         view.transcript_snapshot()
     );
     assert_eq!(
         std::fs::read_to_string(&paths.session_id).unwrap().trim(),
         session_id,
-        "新会话 id 必须写回 legacy session-id"
+        "new session id must be written back to legacy session-id"
     );
     let resume: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&paths.resume).unwrap()).unwrap();
@@ -195,7 +197,7 @@ fn degraded_session_persists_legacy_session_id_and_resume_json() {
     assert!(wait_terminal(&mut host, "dut-degraded"));
     assert!(
         !paths.resume.exists() && !paths.session_id.exists(),
-        "显式停止必须删除两个 resume 标记"
+        "explicit stop must remove both resume markers"
     );
     drop(host);
     let _ = std::fs::remove_dir_all(&work);
@@ -227,23 +229,26 @@ fn resume_state_rejects_agent_or_program_hash_mismatch() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-resume-mismatch"),
-        "跨 Agent 标记被拒后应新建会话：{:?}",
+        "new session should start after rejecting cross-agent marker: {:?}",
         host.view("dut-resume-mismatch").map(|view| view.status())
     );
     let view = host.view("dut-resume-mismatch").unwrap();
     assert_ne!(
         view.session_id().as_deref(),
         Some("cross-agent-session"),
-        "不得恢复其他 Agent 的会话"
+        "must not resume another agent's session"
     );
     assert!(
         transcript_contains(&view, "不匹配"),
-        "必须显示不匹配注记：{:?}",
+        "mismatch note must appear in transcript: {:?}",
         view.transcript_snapshot()
     );
     let rewritten: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&paths.resume).unwrap()).unwrap();
-    assert_eq!(rewritten["agentId"], "goose", "新会话必须重写标记");
+    assert_eq!(
+        rewritten["agentId"], "goose",
+        "new session must overwrite resume marker"
+    );
     host.stop("dut-resume-mismatch");
     assert!(wait_terminal(&mut host, "dut-resume-mismatch"));
     drop(host);
@@ -265,14 +270,14 @@ fn resume_state_rejects_agent_or_program_hash_mismatch() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-resume-mismatch"),
-        "程序哈希不匹配后应新建会话：{:?}",
+        "new session should start after program hash mismatch: {:?}",
         host.view("dut-resume-mismatch").map(|view| view.status())
     );
     let view = host.view("dut-resume-mismatch").unwrap();
     assert_ne!(view.session_id().as_deref(), Some("old-binary-session"));
     assert!(
         transcript_contains(&view, "不匹配"),
-        "必须显示程序哈希不匹配注记：{:?}",
+        "program hash mismatch note must appear in transcript: {:?}",
         view.transcript_snapshot()
     );
     host.stop("dut-resume-mismatch");
@@ -303,14 +308,14 @@ fn resumed_session_reexposes_mcp_tools() {
     .expect("session listener");
     let url = format!("http://127.0.0.1:{}/mcp", listener.port);
     let names = duthub_mcp::probe::list_tool_names(&url, &listener.token, Duration::from_secs(15))
-        .expect("只读会话 tool 面必须可探测");
+        .expect("read-only session tool surface must be probeable");
     assert!(
         names.iter().any(|name| name == "dut_list"),
-        "探测必须看到 duthub 工具面: {names:?}"
+        "probe must see duthub tool surface: {names:?}"
     );
     let denied =
         duthub_mcp::probe::list_tool_names(&url, "dth-wrong-token", Duration::from_secs(10))
-            .expect_err("错误 Token 必须让探测失败");
+            .expect_err("wrong token must cause probe to fail");
     assert!(denied.to_string().contains("失败"), "{denied}");
     listener::revoke(listener, &auth);
 
@@ -327,7 +332,7 @@ fn resumed_session_reexposes_mcp_tools() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-resume-probe"),
-        "首次会话未就绪：{:?}",
+        "initial session did not become ready: {:?}",
         host.view("dut-resume-probe").map(|view| view.status())
     );
     let original = host.view("dut-resume-probe").unwrap().session_id().unwrap();
@@ -350,17 +355,16 @@ fn resumed_session_reexposes_mcp_tools() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-resume-probe"),
-        "恢复后未通过 MCP 工具面复验：{:?} stderr={}",
+        "resumed session did not pass MCP tool surface re-verification: {:?} stderr={}",
         host.view("dut-resume-probe").map(|view| view.status()),
         host.view("dut-resume-probe")
-            .map(|view| view.stderr_tail())
-            .unwrap_or_default()
+            .map_or_default(|view| view.stderr_tail())
     );
     let view = host.view("dut-resume-probe").unwrap();
     assert_eq!(view.session_id().as_deref(), Some(original.as_str()));
     assert!(
         transcript_contains(&view, "MCP 工具面复验通过"),
-        "恢复路径必须重新探测工具面：{:?}",
+        "resume path must re-probe tool surface: {:?}",
         view.transcript_snapshot()
     );
     host.stop("dut-resume-probe");
@@ -390,7 +394,7 @@ fn unknown_extension_is_rejected() {
     ] {
         assert!(
             validate_extension_results(&bad).is_err(),
-            "未知/重复扩展必须拒绝: {bad}"
+            "unknown or duplicate extension must be rejected: {bad}"
         );
     }
 }
@@ -413,11 +417,11 @@ fn acp_eof_wakes_pending_initialize() {
     let started = Instant::now();
     let error = acp
         .initialize(Duration::from_secs(10))
-        .expect_err("stdout EOF 必须唤醒 initialize");
+        .expect_err("stdout EOF must wake pending initialize");
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(5),
-        "EOF 后 initialize 仍阻塞了 {elapsed:?}（error={error}）"
+        "initialize still blocked for {elapsed:?} after EOF (error={error})"
     );
     acp.close_stdin();
     acp.kill();
@@ -439,7 +443,7 @@ fn transcript_writer_flushes_on_finish_and_notes_cap_once() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(lines.len(), 2, "finish 必须刷出全部条目: {text}");
+    assert_eq!(lines.len(), 2, "finish must flush all entries: {text}");
     assert_eq!(lines[1]["text"], "world");
 
     let cap_path = dir.join("cap.jsonl");
@@ -452,14 +456,14 @@ fn transcript_writer_flushes_on_finish_and_notes_cap_once() {
     writer.finish();
     assert!(
         std::fs::metadata(&cap_path).unwrap().len() <= FILE_TRANSCRIPT_LIMIT,
-        "文件不得超过 8 MiB"
+        "transcript file must not exceed 8 MiB"
     );
     let notes = cap_view
         .transcript_snapshot()
         .iter()
         .filter(|entry| entry.text.contains("8 MiB"))
         .count();
-    assert_eq!(notes, 1, "上限注记只能出现一次");
+    assert_eq!(notes, 1, "cap note must appear only once");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -482,7 +486,7 @@ fn preassigned_temp_env_keys_rejected() {
     ] {
         assert!(
             duthub_core::agent_config::validate_env_key(key).is_err(),
-            "envKeys 不得包含 {key}"
+            "envKeys must not contain reserved key {key}"
         );
     }
     assert!(duthub_core::agent_config::validate_env_key("ACME_API_KEY").is_ok());
@@ -516,7 +520,7 @@ fn preassigned_temp_env_keys_rejected() {
             message.contains("保留变量") || message.contains("envKeys"),
             "unexpected failure: {message}"
         ),
-        other => panic!("保留变量必须拒绝启动，实际 {other:?}"),
+        other => panic!("reserved env var must block startup, got {other:?}"),
     }
     drop(host);
     let _ = std::fs::remove_dir_all(&work);
@@ -539,7 +543,8 @@ fn absolute_external_program_required() {
             trust_level: "mcp_only".into(),
             expected_sha256: Some("a".repeat(64)),
         };
-        let error = registry::resolve(&work, &agent).expect_err("相对路径必须拒绝");
+        let error =
+            registry::resolve(&work, &agent).expect_err("relative program path must be rejected");
         assert!(error.to_string().contains("绝对路径"), "{error}");
     }
     for absolute in ["C:/tools/acme.exe", r"c:\tools\acme.exe"] {
@@ -575,7 +580,10 @@ fn stop_and_join_reports_not_running_and_cleans_entry() {
         host.stop_and_join("dut-stop", Duration::from_secs(30)),
         StopJoin::Joined
     );
-    assert!(host.view("dut-stop").is_none(), "Joined 后 entry 必须移除");
+    assert!(
+        host.view("dut-stop").is_none(),
+        "entry must be removed after StopJoin::Joined"
+    );
     drop(host);
     let _ = std::fs::remove_dir_all(&work);
 }

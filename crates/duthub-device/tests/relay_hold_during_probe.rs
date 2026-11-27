@@ -88,7 +88,7 @@ fn dut_with_serial_relay() -> DutConfig {
         a2a: duthub_core::model::DutA2aConfig::default(),
         flash: duthub_core::model::FlashConfig::default(),
         media: duthub_core::model::DutMediaConfig::default(),
-        heartbeat: duthub_core::model::HeartbeatConfig::default(),
+        heartbeat: duthub_core::heartbeat::HeartbeatConfig::default(),
     }
 }
 

@@ -56,7 +56,9 @@ impl PortRegistry {
             .reserved
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(holder) = reserved.get(&port) { Err(PortTaken { by: holder.clone() }) } else {
+        if let Some(holder) = reserved.get(&port) {
+            Err(PortTaken { by: holder.clone() })
+        } else {
             reserved.insert(port, owner);
             Ok(())
         }

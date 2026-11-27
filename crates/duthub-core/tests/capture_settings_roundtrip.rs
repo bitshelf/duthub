@@ -34,7 +34,7 @@ fn settings_json_with_tools(extra: serde_json::Value) -> String {
 }
 
 fn parse(raw: &str) -> SettingsFile {
-    serde_json::from_str(raw).expect("settings.json 必须可解析")
+    serde_json::from_str(raw).expect("settings.json must be valid JSON")
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn default_tools_settings_serialize_without_capture_section() {
     assert_eq!(
         serde_json::to_value(&tools).unwrap(),
         serde_json::json!({ "adbExecutable": "adb" }),
-        "默认 ToolsSettings 不得多序列化 idleSecs/capture 键"
+        "default ToolsSettings must not serialize idleSecs or capture keys"
     );
 }
 
@@ -73,10 +73,10 @@ fn idle_secs_roundtrips_as_camel_case() {
     assert_eq!(re["tools"]["capture"]["idleSecs"], serde_json::json!(90));
     assert!(
         re["tools"]["capture"].get("idle_secs").is_none(),
-        "不得出现 snake_case 键: {re}"
+        "snake_case key must not be serialized: {re}"
     );
 
-    // Typed → serialize → parse keeps the same value (the section also carries
+    // Typed -> serialize -> parse keeps the same value (the section also carries
     // the pre-existing, always-serialized ffmpeg/ffplay/listenIp keys).
     let again = parse(&serde_json::to_string(&settings).unwrap());
     assert_eq!(again.tools.capture, settings.tools.capture);
@@ -91,19 +91,19 @@ fn idle_secs_null_equals_missing_key() {
     assert_eq!(with_null.tools.capture.idle_secs, None);
     assert_eq!(
         with_null.tools.capture, without.tools.capture,
-        "null 与缺键必须是同一个默认值"
+        "null and missing key must produce the same default"
     );
     let re = serde_json::to_value(&with_null).unwrap();
     assert!(
         re["tools"].get("capture").is_none(),
-        "None 不得写回 idleSecs 或空 capture 段: {re}"
+        "None must not serialize idleSecs or an empty capture section: {re}"
     );
 }
 
 #[test]
 fn example_settings_have_default_capture() {
     let raw = std::fs::read_to_string(manifest_dir().join("../../docs/examples/settings.json"))
-        .expect("读 examples/settings.json");
+        .expect("read examples/settings.json");
     let settings = parse(&raw);
     assert_eq!(settings.tools.capture, CaptureSettings::default());
 }
@@ -149,13 +149,13 @@ fn newer_action_grants_load_and_are_not_written_back() {
     assert_eq!(
         re["agentAccess"]["agents"][0]["grants"][0]["actions"],
         serde_json::json!(["read", "capture"]),
-        "未知动作必须在加载期过滤掉，不得写回磁盘"
+        "unknown actions must be filtered out on load and never written back"
     );
     assert!(
         !serde_json::to_string(&settings)
             .unwrap()
             .contains("futureAction"),
-        "序列化结果不得含未知动作"
+        "serialized output must not contain unknown actions"
     );
 
     // The load path (not just serde) must accept the file instead of treating
@@ -163,7 +163,8 @@ fn newer_action_grants_load_and_are_not_written_back() {
     // whole configuration).
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("settings.json"), raw.to_string()).unwrap();
-    let loaded = duthub_core::store::load_settings(dir.path()).expect("较新配置必须能加载");
+    let loaded =
+        duthub_core::store::load_settings(dir.path()).expect("newer configuration must load");
     assert_eq!(
         loaded.agent_access.agents[0].grants[0].actions,
         vec![DutAction::Read, DutAction::Capture]
@@ -174,7 +175,10 @@ fn newer_action_grants_load_and_are_not_written_back() {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| name.contains("corrupt"))
         .collect();
-    assert!(backups.is_empty(), "不得备份/丢弃较新配置: {backups:?}");
+    assert!(
+        backups.is_empty(),
+        "newer configuration must not be backed up or discarded: {backups:?}"
+    );
 }
 
 #[test]

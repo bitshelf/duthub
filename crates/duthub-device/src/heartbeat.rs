@@ -1,13 +1,13 @@
-//! 会话心跳引擎（需求⑦）。
+//! Heartbeat scheduler for active serial sessions.
 //!
-//! - desktop 侧定时器（Workbench 50ms tick）调用 [`HeartbeatService::tick`]；
-//!   到期经 [`DeviceService::write_line`] 下发自定义心跳命令。
-//! - 响应收集：发送后记总线游标，超时窗口内（间隔 1s/5s 夹取）从会话缓冲读
-//!   新行，排除本机回显/驱动信令/分段标记后视为设备响应（原文保存 + 系统信息
-//!   启发式提取，见 `duthub_core::heartbeat::extract_sysinfo`）。
-//! - 丢联判定：连续 N 次（`loss_threshold`，默认 3）无响应 → 产出
-//!   [`duthub_core::heartbeat::HeartbeatAlert`]（队列，UI drain 后供弹窗阶段消费）。
-//! - Agent 改写命令/间隔：[`HeartbeatService::set_config`]（内存 + 持久化钩子）。
+//! The desktop calls `HeartbeatService::tick` from its timer.
+//! Each due probe dispatches the configured command through the serial service.
+//! Record the session's event cursor when dispatching the command.
+//! Use the response window to collect new device output and ignore local annotations.
+//! Retain the raw response and extract system information from it.
+//! Report a loss alert after the configured number of unanswered probes.
+//! The UI drains alerts for presentation.
+//! Agent updates use `HeartbeatService::set_config` to persist and publish changes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,15 +21,15 @@ use duthub_core::ipc::UiEvent;
 
 use crate::DeviceService;
 
-/// duts.json 持久化钩子（desktop 注入：load → 改 heartbeat 段 → 原子保存）。
-/// Err 时 [`HeartbeatService::set_config`] 不改内存配置（Agent 可感知失败）。
+/// Host callback that atomically persists the heartbeat section of the DUT configuration.
+/// A failed persistence callback leaves the runtime configuration unchanged.
 pub type HeartbeatPersistHook =
     Arc<dyn Fn(&str, &HeartbeatConfig) -> Result<(), String> + Send + Sync>;
 
-/// 响应原文保存上限（字符），防止 dmesg 类响应撑爆内存/快照。
+/// Maximum retained response size in characters.
 const LAST_RESPONSE_CAP: usize = 2000;
 
-/// 一次在途探测：发送时刻的总线游标 + 超时窗口截止时刻。
+/// Event cursor and response deadline for an in-flight probe.
 #[derive(Clone, Debug)]
 struct Flight {
     cursor_seq: u64,
@@ -87,7 +87,7 @@ impl HeartbeatBatch {
     }
 }
 
-/// 心跳引擎：配置 / 状态 / 在途探测 / 告警队列的单一归属。
+/// Owns per-DUT configuration, status, in-flight probes, and alerts.
 pub struct HeartbeatService {
     device: Arc<DeviceService>,
     configs: Mutex<HashMap<String, HeartbeatConfig>>,
@@ -95,7 +95,7 @@ pub struct HeartbeatService {
     flights: Mutex<HashMap<String, Flight>>,
     next_due: Mutex<HashMap<String, u64>>,
     alerts: Mutex<Vec<HeartbeatAlert>>,
-    /// tick 互斥（UI tick 与 MCP 线程的即时探测可能并发，串行化避免双发）
+    /// Serialize desktop timer ticks and immediate MCP probes to avoid double dispatch.
     ticking: Mutex<()>,
     persist: Mutex<Option<HeartbeatPersistHook>>,
     config_changed: AtomicBool,
@@ -116,9 +116,9 @@ fn truncate_chars(text: &str, cap: usize) -> String {
     text.chars().take(cap).collect()
 }
 
-/// 响应捕获窗（P2-029）：间隔 1s/5s 夹取；多段命令按段数扩展（每段 ≥2s、
-/// 总窗 ≤30s），避免 `a; b; c` 链的第 3 段输出被截断。
-/// 段数 = 按 `;` 与换行切分的非空段数（至少 1）。
+/// A single command gets a response window between one and five seconds.
+/// Allow at least two seconds per nonempty segment for multi-command probes.
+/// Count semicolon- and newline-separated segments and cap the total at 30 seconds.
 fn capture_window_ms(interval_ms: u64, command: &str) -> u64 {
     let segments = command
         .split([';', '\n', '\r'])
@@ -150,14 +150,14 @@ impl HeartbeatService {
         }
     }
 
-    /// 挂持久化钩子（builder）。
+    /// Attach the host's persistence callback.
     #[must_use]
     pub fn with_persist(self, hook: HeartbeatPersistHook) -> Self {
         *duthub_core::util::lock_unpoisoned(&self.persist) = Some(hook);
         self
     }
 
-    /// 同步运行时配置（UI 保存路径 / 启动装载；不触发持久化）。
+    /// Apply a configuration loaded or saved by the UI without writing it again.
     pub fn register(&self, dut_id: &str, config: HeartbeatConfig) {
         self.configs
             .lock()
@@ -165,7 +165,7 @@ impl HeartbeatService {
             .insert(dut_id.to_string(), config);
     }
 
-    /// 当前配置（未注册 = 默认：关闭、30s、`uname -a`）。
+    /// Return the configuration, or the default disabled probe every 30 seconds.
     pub fn config(&self, dut_id: &str) -> HeartbeatConfig {
         self.configs
             .lock()
@@ -175,17 +175,19 @@ impl HeartbeatService {
             .unwrap_or_default()
     }
 
-    /// 最近一次状态（None 尚未探测 / Some(ok)）。
+    /// Return the most recent result if a probe has completed.
     pub fn state(&self, dut_id: &str) -> Option<HeartbeatState> {
-        duthub_core::util::lock_unpoisoned(&self.states).get(dut_id).cloned()
+        duthub_core::util::lock_unpoisoned(&self.states)
+            .get(dut_id)
+            .cloned()
     }
 
     pub fn state_or_default(&self, dut_id: &str) -> HeartbeatState {
         self.state(dut_id).unwrap_or_default()
     }
 
-    /// Agent 改写心跳配置（命令/间隔/开关）：内存生效 + 持久化钩子落盘。
-    /// 失败（钩子报错）时内存配置保持不变，返回错误文案。
+    /// Persist and apply an Agent's heartbeat changes.
+    /// A persistence error leaves the active configuration unchanged.
     pub fn set_config(
         &self,
         dut_id: &str,
@@ -213,13 +215,13 @@ impl HeartbeatService {
             .lock()
             .unwrap()
             .insert(dut_id.to_string(), cfg.clone());
-        // 配置变更后取消在途探测：下一次 tick 立即按新命令发送（due 归零）
+        // Cancel the in-flight probe and make the new command due on the next tick.
         self.reset_schedule(dut_id);
         self.config_changed.store(true, Ordering::Release);
         Ok(cfg)
     }
 
-    /// 按 GUI 保存动作提交草稿。提交与 Agent 更新使用同一把锁，落盘后才启用编辑结果。
+    /// Save the GUI draft under the same lock as Agent updates and apply it after persistence.
     pub fn commit_configs(
         &self,
         drafts: &HashMap<String, HeartbeatConfig>,
@@ -264,18 +266,18 @@ impl HeartbeatService {
             .is_some_and(|state| std::mem::replace(&mut state.paused_by_lease, false))
     }
 
-    /// 取走全部丢联告警（弹窗阶段消费；当前 UI 先转 toast）。
+    /// Drain pending heartbeat loss alerts.
     pub fn drain_alerts(&self) -> Vec<HeartbeatAlert> {
         std::mem::take(&mut *duthub_core::util::lock_unpoisoned(&self.alerts))
     }
 
-    /// 产品入口：真实时钟 tick。返回本 tick 是否有状态变化（供 UI 决定重绘）。
+    /// Use the system clock and report whether the tick changed state.
     pub fn tick(&self) -> bool {
         self.tick_at(now_unix_ms())
     }
 
-    /// tick 主体（`now_ms` 可注入，测试不依赖真实时钟）。
-    /// `ticking` 互斥串行化并发 tick（UI 定时 + MCP 即时探测）。
+    /// Run one tick at a supplied time so tests control deadlines.
+    /// Hold the tick lock to serialize the UI and MCP entry points.
     pub fn tick_at(&self, now_ms: u64) -> bool {
         let _tick_guard = duthub_core::util::lock_unpoisoned(&self.ticking);
         let mut changed = self.config_changed.swap(false, Ordering::AcqRel);
@@ -295,7 +297,9 @@ impl HeartbeatService {
             let session_id = format!("sess-{dut}");
             let source = self.device.session_source(&dut);
             let session_open = source.is_some();
-            let flight = duthub_core::util::lock_unpoisoned(&self.flights).get(&dut).cloned();
+            let flight = duthub_core::util::lock_unpoisoned(&self.flights)
+                .get(&dut)
+                .cloned();
             if let Some(f) = flight {
                 if session_open {
                     let lines: Vec<String> = self
@@ -344,7 +348,7 @@ impl HeartbeatService {
                     }
                 }
                 if now_ms >= f.deadline_ms {
-                    // 窗口到期无响应（含会话中途关闭）→ 丢联一次
+                    // An unanswered dispatched probe counts as a loss once its window expires.
                     changed |= self.note_loss(&dut, &cfg, now_ms);
                     duthub_core::util::lock_unpoisoned(&self.flights).remove(&dut);
                     self.next_due
@@ -354,7 +358,7 @@ impl HeartbeatService {
                 }
                 continue;
             }
-            // 会话未打开：不发送、不计丢联（链路状态由断线重连徽标跟踪）
+            // A closed session receives no probe and does not accumulate new losses.
             if !session_open {
                 changed |= self.note_lease_pause(&dut, false);
                 continue;
@@ -373,12 +377,12 @@ impl HeartbeatService {
                 let sent = match &batch {
                     Some(batch) => self
                         .device
-                        .write_heartbeat_batch(&dut, writer, batch.clone()),
+                        .write_heartbeat_batch(&dut, &writer, batch.clone()),
                     None => self.device.write_line(&dut, writer, &cfg.command),
                 };
-                // P2-036：Busy/Lease 拒绝 = 探测被暂缓（不计丢联），置 per-DUT
-                // 暂缓标记供状态查询区分「刻意挂起」与「心跳失效」；
-                // 成功探测（Ok）与其他错误清除。
+                // A busy or lease denial defers the probe without counting a loss.
+                // Expose the deferral separately from a failed probe.
+                // A successful dispatch or a different error clears the flag.
                 changed |= self.note_lease_pause(
                     &dut,
                     matches!(&sent, Err(DeviceError::Lease(_) | DeviceError::Busy)),
@@ -396,7 +400,7 @@ impl HeartbeatService {
                         changed = true;
                     }
                     Err(DeviceError::NotFound | DeviceError::Lease(_) | DeviceError::Busy) => {
-                        // 未排入串口时没有发起探测，不把控制权冲突或队列拥堵误报成死机。
+                        // A command that never entered the serial queue does not count as a hardware timeout.
                         self.next_due
                             .lock()
                             .unwrap()
@@ -415,7 +419,7 @@ impl HeartbeatService {
         changed
     }
 
-    /// 记录一次成功响应（原文保存 + 系统信息提取 + 丢联清零）。
+    /// Store the response, update system information, and clear the loss count.
     pub fn note_response(&self, dut_id: &str, lines: &[String], now_ms: u64) -> bool {
         let joined = lines.join("\n");
         let mut states = duthub_core::util::lock_unpoisoned(&self.states);
@@ -428,7 +432,7 @@ impl HeartbeatService {
         true
     }
 
-    /// 记录一次无响应（丢联计数 +1；达到阈值产出告警事件，不重复刷屏）。
+    /// Increment the loss count and alert when it first reaches the threshold.
     pub fn note_loss(&self, dut_id: &str, cfg: &HeartbeatConfig, now_ms: u64) -> bool {
         let (loss_count, crossed) = {
             let mut states = duthub_core::util::lock_unpoisoned(&self.states);
@@ -495,7 +499,10 @@ mod tests {
         assert_eq!(cfg.interval_secs, 30);
         assert_eq!(cfg.command, "uname -a");
         assert_eq!(cfg.loss_threshold, 3);
-        assert!(!svc.tick_at(1000), "未注册/未启用的 DUT 不产生任何探测");
+        assert!(
+            !svc.tick_at(1000),
+            "unregistered/disabled DUT must not emit any probe"
+        );
     }
 
     #[test]
@@ -505,13 +512,13 @@ mod tests {
         device
             .open_session("dut-a", "COM3", 115_200, crate::SessionKind::Demo)
             .unwrap();
-        // demo 驱动启动日志（delay=0，短暂等待落缓冲）
+        // Wait briefly for the demo driver's startup messages to reach the buffer.
         std::thread::sleep(Duration::from_millis(150));
         svc.register("dut-a", cfg("uname -a", 1, 2));
 
-        // t=1000：到期发送（游标=当前缓冲末尾，启动日志不计入响应）
-        assert!(svc.tick_at(1000), "发送应有状态变化");
-        // write_line 是异步投递：轮询等 TX 回显落缓冲
+        // Dispatch at the due time and ignore output before the captured cursor.
+        assert!(svc.tick_at(1000), "probe dispatch should change state");
+        // Wait for the asynchronous serial write to appear in the buffer.
         let mut tx_seen = false;
         for _ in 0..50 {
             std::thread::sleep(Duration::from_millis(20));
@@ -522,8 +529,11 @@ mod tests {
                 break;
             }
         }
-        assert!(tx_seen, "心跳命令必须经 write_line 下发");
-        // 等模拟 shell 响应落缓冲，再 tick：窗口内收到响应
+        assert!(
+            tx_seen,
+            "heartbeat command must be dispatched via write_line"
+        );
+        // Wait for the demo shell response, then advance within the response window.
         std::thread::sleep(Duration::from_millis(250));
         assert!(svc.tick_at(1300));
         let state = svc.state_or_default("dut-a");
@@ -532,7 +542,7 @@ mod tests {
         assert_eq!(state.last_at_unix_ms, 1300);
         assert!(
             state.last_response.contains("aarch64 GNU/Linux"),
-            "响应原文必须保存：{}",
+            "raw response text must be preserved: {}",
             state.last_response
         );
         assert_eq!(state.sysinfo.hostname.as_deref(), Some("rk3576"));
@@ -633,29 +643,39 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         svc.register("dut-b", cfg("uname -a", 1, 2));
-        // 发送后立刻关闭会话（模拟设备失联）：窗口到期 → 丢联
+        // Close the session after sending to simulate a probe that never receives a reply.
         assert!(svc.tick_at(1000));
         device.close_session("dut-b").ok();
         std::thread::sleep(Duration::from_millis(120));
-        assert!(!svc.tick_at(1500), "窗口未到期不判定");
-        assert!(svc.tick_at(2500), "丢联判定应有状态变化");
+        assert!(
+            !svc.tick_at(1500),
+            "must not evaluate loss before response window expires"
+        );
+        assert!(svc.tick_at(2500), "loss detection should change state");
         let state = svc.state_or_default("dut-b");
         assert_eq!(state.last_ok, Some(false));
         assert_eq!(state.loss_count, 1);
-        assert!(svc.drain_alerts().is_empty(), "未达阈值不发告警");
-        // 再丢一次 → 达阈值 2 → 告警
+        assert!(
+            svc.drain_alerts().is_empty(),
+            "must not alert below loss threshold"
+        );
+        // A second unanswered probe reaches the configured threshold.
         svc.note_loss("dut-b", &cfg("uname -a", 1, 2), 3000);
         let state = svc.state_or_default("dut-b");
         assert_eq!(state.loss_count, 2);
         let alerts = svc.drain_alerts();
-        assert_eq!(alerts.len(), 1, "恰好达阈值时发一次告警");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "should emit one alert upon reaching threshold"
+        );
         assert_eq!(alerts[0].dut_id, "dut-b");
         assert_eq!(alerts[0].loss_count, 2);
         assert!(alerts[0].message.contains("2 次无响应"));
-        // 持续丢联不再刷屏（避免弹窗风暴）
+        // Further losses must not generate duplicate alerts.
         svc.note_loss("dut-b", &cfg("uname -a", 1, 2), 4000);
         assert_eq!(svc.drain_alerts(), [] as [duthub_core::HeartbeatAlert; 0]);
-        // 恢复响应后丢联清零
+        // A valid response clears the loss count.
         assert!(svc.note_response("dut-b", &["pong".into()], 5000));
         assert_eq!(svc.state_or_default("dut-b").loss_count, 0);
         assert_eq!(svc.state_or_default("dut-b").last_ok, Some(true));
@@ -671,7 +691,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         svc.register("dut-c", cfg("uname -a", 1, 3));
         assert!(svc.tick_at(1000));
-        // 注入本机注记行（TX / serial / mark）与设备提示符行
+        // Inject local annotations as well as a device prompt.
         device.log_mark("dut-c", "继电器 power ON").unwrap();
         std::thread::sleep(Duration::from_millis(250));
         assert!(svc.tick_at(1300));
@@ -679,7 +699,7 @@ mod tests {
         assert_eq!(state.last_ok, Some(true));
         assert!(
             !state.last_response.contains("[mark]"),
-            "mark/serial/TX 行不算设备响应：{}",
+            "mark/serial/TX lines must not count as device responses: {}",
             state.last_response
         );
         device.close_session("dut-c").ok();
@@ -697,19 +717,25 @@ mod tests {
         }));
         let want = cfg("cat /proc/uptime", 0, 5);
         let applied = svc.set_config("dut-p", want).unwrap();
-        assert_eq!(applied.interval_secs, 1, "间隔下限 1s 归一化");
+        assert_eq!(
+            applied.interval_secs, 1,
+            "interval must clamp to 1s minimum"
+        );
         assert_eq!(applied.command, "cat /proc/uptime");
-        assert_eq!(recorded.lock().unwrap().len(), 1, "钩子必须收到落盘配置");
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "persist hook must receive saved config"
+        );
         assert_eq!(svc.config("dut-p").command, "cat /proc/uptime");
-        // 钩子失败：内存配置保持不变
-        let failing =
-            svc.with_persist(Arc::new(
-                |_: &str, _: &HeartbeatConfig| Err("磁盘满".into()),
-            ));
+        // A failed persistence callback must preserve the active configuration.
+        let failing = svc.with_persist(Arc::new(|_: &str, _: &HeartbeatConfig| {
+            Err("disk full".into())
+        }));
         let err = failing
             .set_config("dut-p", cfg("uname -a", 30, 3))
             .unwrap_err();
-        assert!(err.contains("磁盘满"));
+        assert!(err.contains("disk full"));
     }
 
     #[test]
@@ -732,7 +758,7 @@ mod tests {
             !response_texts(&device, "dut-d")
                 .iter()
                 .any(|t| t == "[TX] uname -a"),
-            "关闭的心跳不得下发命令"
+            "disabled heartbeat must not send commands"
         );
         device.close_session("dut-d").ok();
     }
@@ -757,34 +783,34 @@ mod tests {
         device.close_session("dut-pause").unwrap();
     }
 
-    /// P2-029：多段命令的响应捕获窗按段数扩展（3 段 ≥ 6 秒，每段 2s），
-    /// 单命令维持 1s/5s 夹取，总窗上限 30s。
+    /// Allow at least two seconds per segment in a multi-command probe.
+    /// A single command uses the ordinary timing limits. All windows cap at 30 seconds.
     #[test]
     fn capture_window_extends_for_multi_segment_commands() {
-        // 3 段命令窗口不小于 6 秒
+        // A three-segment command needs at least six seconds.
         assert_eq!(
             capture_window_ms(1_000, "uname -a; cat /proc/uptime; head -n 2 /proc/meminfo"),
             6_000
         );
-        // 换行分段同样计段
+        // Newlines also separate segments.
         assert_eq!(
             capture_window_ms(1_000, "uname -a\ncat /proc/uptime"),
             4_000
         );
-        // 单命令仍按间隔夹取
+        // The single-command window remains clamped by the probe interval.
         assert_eq!(capture_window_ms(1_000, "uname -a"), 1_000);
         assert_eq!(capture_window_ms(30_000, "uname -a"), 5_000);
-        // 空段（连续分号/行尾空白）不计入
+        // Consecutive separators and trailing whitespace add no segments.
         assert_eq!(capture_window_ms(1_000, "a;;\n b"), 4_000);
-        // 总窗上限 30s
+        // Cap the response window at 30 seconds.
         assert_eq!(
             capture_window_ms(1_000, "a; b; c; d; e; f; g; h; i; j; k; l; m; n; o; p"),
             30_000
         );
     }
 
-    /// P2-036：探测因 Lease 被拒 → `paused_by_lease` `置位（不计丢联、last_ok`
-    /// 保持未探测）；租约释放后探测成功 → 标记清除。
+    /// A lease denial defers the probe without counting a loss or reporting a probe result.
+    /// The next successful dispatch after release clears the deferral.
     #[test]
     fn probe_deferred_by_lease_sets_paused_flag_until_success() {
         let dir = std::env::current_dir()
@@ -801,7 +827,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         let svc = HeartbeatService::new(device.clone());
         svc.register("dut-lease", cfg("uname -a", 1, 3));
-        // Agent 接管控制权（先释放打开会话时的 GUI 自动租约）→ System 心跳写被拒
+        // Release the automatic GUI lease and let an Agent take control, blocking system probes.
         lease.release_for_holder("dut-lease", &duthub_core::lease::LeaseHolder::Gui);
         let grant = lease
             .acquire(
@@ -813,18 +839,30 @@ mod tests {
                 None,
             )
             .unwrap();
-        // Lease 拒绝：置暂缓标记（状态变化），但不计丢联、last_ok 保持未探测
-        assert!(svc.tick_at(1000), "置暂缓标记应有状态变化");
+        // A denied system probe sets the deferral flag and leaves its result unset.
+        assert!(
+            svc.tick_at(1000),
+            "setting deferral flag should change state"
+        );
         let state = svc.state_or_default("dut-lease");
-        assert!(state.paused_by_lease, "Lease 拒绝必须置暂缓标记");
-        assert_eq!(state.loss_count, 0, "被租约拦截不计丢联");
-        assert_eq!(state.last_ok, None, "未发起探测不算失败");
-        // Agent 释放 → 下一次到期 tick 发送成功，标记清除
+        assert!(
+            state.paused_by_lease,
+            "lease denial must set paused_by_lease"
+        );
+        assert_eq!(
+            state.loss_count, 0,
+            "lease-blocked probe must not count as a loss"
+        );
+        assert_eq!(
+            state.last_ok, None,
+            "unstarted probe must not count as failed"
+        );
+        // Release the Agent lease and confirm that the next due dispatch clears the flag.
         lease.release("dut-lease", &grant.lease_id).unwrap();
-        assert!(svc.tick_at(2000), "发送成功应有状态变化");
+        assert!(svc.tick_at(2000), "successful dispatch should change state");
         assert!(
             !svc.state_or_default("dut-lease").paused_by_lease,
-            "成功探测必须清除暂缓标记"
+            "successful probe must clear paused_by_lease"
         );
         device.close_session("dut-lease").ok();
     }

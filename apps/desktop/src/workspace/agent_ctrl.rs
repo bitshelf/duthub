@@ -1,27 +1,31 @@
-use super::{Workbench, FluentBuilder, InteractiveElement, i18n, AgentRegistryEdit, In, AppContext, Context, PendingRegistrySave, agent_host, AlertSource, Arc, AgentHostEvents, Mutex, BindingSource, Window, Entity, InputState, InputEvent, AgentPromptEditor, provider_setting, store, PendingGooseSave};
+use super::{
+    AgentHostEvents, AgentPromptEditor, AgentRegistryEdit, AlertSource, AppContext, Arc,
+    BindingSource, Context, Entity, In, InputEvent, InputState, Mutex, PendingGooseSave,
+    PendingRegistrySave, Window, Workbench, agent_host, i18n, provider_setting, store,
+};
 
 impl Workbench {
     // ------------------------------------------------------------------
-    // 内嵌 goose Agent 会话（W3）：宿主生命周期 + 每 DUT 草稿/transcript
+    // Agent host lifecycle and per-DUT prompts and transcripts
     // ------------------------------------------------------------------
 
-    /// Agent 宿主是否可用：`--self-test` 禁用；缺少租约/审计上下文（异常构造）也不可用。
+    /// Whether the Agent host is available. Self-test and missing lease or audit dependencies disable it.
     pub(crate) fn agent_runtime_available(&self) -> bool {
         !self.agent_self_test && self.agent_access.is_some()
     }
 
-    /// 是否处于 `--self-test`（Agent 面板显示禁用原因）。
+    /// Whether self-test is active, for the disabled state in the Agent panel.
     pub(crate) fn agent_self_test_mode(&self) -> bool {
         self.agent_self_test
     }
 
-    /// 该 DUT 选中的 Agent id（默认 goose；选择存 sidecar）。
+    /// The selected Agent ID for the DUT. Default to goose and persist the choice in the sidecar.
     pub(crate) fn agent_id_for_dut(&self, dut_id: &str) -> String {
         self.agent_bindings.agent_id_for(dut_id)
     }
 
-    /// Transcript 行的说话者标签（W4c）：实际启动的 Agent 名优先（host.launch，
-    /// 反映正在运行的进程）；未启动时回退注册表中该 DUT 选择的定义名。
+    /// Use the launched Agent's name for transcript labels when available.
+    /// Before launch, use the selected Agent's registry name.
     pub(crate) fn transcript_agent_tag(&self, dut_id: &str) -> String {
         let launch = self
             .agent_host
@@ -32,7 +36,7 @@ impl Workbench {
         duthub_desktop::agent_ui::transcript_agent_tag(launch.as_ref(), selected_name.as_deref())
     }
 
-    /// 注册表里可启动的 ACP Agent（id,name）；UI 下拉用。
+    /// List the launchable ACP Agents for the selector.
     pub(crate) fn acp_agent_choices(&self) -> Vec<(String, String)> {
         self.agents
             .acp_agents()
@@ -47,7 +51,7 @@ impl Workbench {
         self.agents.agent(agent_id).cloned()
     }
 
-    /// 切换某 DUT 的 Agent；保存失败时不覆盖内存中的旧选择（fail closed）。
+    /// Save the DUT's new Agent selection before replacing the in-memory value.
     pub(crate) fn set_dut_agent_enabled(&mut self, dut_id: &str, enabled: bool) {
         if enabled && self.duts.saved_name(dut_id).is_none() {
             return;
@@ -85,7 +89,7 @@ impl Workbench {
         }
     }
 
-    /// 外部 goose 记录（path, sha256）；来源是注册表而非 UI 临时状态。
+    /// Read the external goose path and hash from the registry.
     pub(crate) fn goose_external(&self) -> Option<(String, String)> {
         let goose = self.agents.goose()?;
         let path = goose.program_path()?.to_owned();
@@ -116,7 +120,7 @@ impl Workbench {
         self.drafts.insert(In::AgentRegName, agent.name);
         self.drafts
             .insert(In::AgentRegProgram, agent.program.unwrap_or_default());
-        // W4b：args 以 JSON 数组进出编辑器（含空格/引号的参数逐字保留）。
+        // A JSON array preserves argument spaces and quotes through editing.
         self.drafts.insert(
             In::AgentRegArgs,
             duthub_desktop::agent_ui::args_to_json(&agent.args),
@@ -163,14 +167,14 @@ impl Workbench {
         self.agent_env_value_state = None;
     }
 
-    /// 保存注册表编辑器（新增/编辑 ACP Agent）。
+    /// Save a new or edited ACP Agent registry entry.
     ///
-    /// W4b：先过统一草稿门（`validate_agent_editor_draft`——args JSON、env
-    /// 保留键/键名规则、外部程序绝对路径），非法草稿 fail closed，不落盘。
-    /// W4c：外部程序的 SHA-256 / `--version` 探测移到后台执行器——保存先
-    /// 暂存 pending（带 generation），探测结果回来后才写 agents.json；内嵌
-    /// goose（program 为空）无需探测，直接落盘。`envKeys` 只保存键名（值在
-    /// keyring），不会把任何 token 写进 agents.json。
+    /// Validate the arguments, allowed environment keys, and absolute program path.
+    /// An invalid draft is never persisted.
+    /// Hash an external executable and probe its version on the background executor.
+    /// Commit the pending draft only when its current generation's probe succeeds.
+    /// The default goose entry needs no executable probe. Persist environment key names
+    /// and keep the values in the system credential store.
     pub(crate) fn save_agent_registry(&mut self, cx: &mut Context<Self>) {
         if self.pending_registry_save.is_some() {
             // A probe is already in flight; ignore re-entrant saves until it
@@ -235,7 +239,7 @@ impl Workbench {
             });
         definition.name = name;
         definition.kind = kind;
-        definition.program = draft.program.clone();
+        definition.program.clone_from(&draft.program);
         // The hash is filled in by the background probe before the save lands.
         definition.expected_sha256 = None;
         definition.args = draft.args;
@@ -360,12 +364,12 @@ impl Workbench {
     }
 
     // ------------------------------------------------------------------
-    // W4b：env 值编辑器（keyring 写入/删除；值永不回显明文）
+    // Masked environment value editor backed by the system credential store.
     // ------------------------------------------------------------------
 
-    /// 选中一个 env 键：清空掩码草稿并在后台读取该键的 keyring 状态。
-    /// 新增条目（id 在保存时才生成）不允许录入，避免留下孤儿凭据。
-    /// W4c：keyring 读取不再阻塞 UI 线程——先进入 `Pending`，结果按代数回填。
+    /// Clear the masked draft and look up the selected key in the background.
+    /// Require a saved Agent ID so the credential has an owner.
+    /// Set the pending state and apply the result only for the current lookup generation.
     pub(crate) fn select_agent_env_key(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(agent_id) = self
             .agent_registry_edit
@@ -389,7 +393,7 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let result = read.await;
             let _ = this.update(cx, |this, _cx| {
-                this.finish_agent_env_read(generation, &key, result);
+                this.finish_agent_env_read(generation, &key, &result);
             });
         })
         .detach();
@@ -402,17 +406,17 @@ impl Workbench {
         &mut self,
         generation: u64,
         key: &str,
-        read: Result<Option<String>, String>,
+        read: &Result<Option<String>, String>,
     ) {
         if self.agent_env_read_generation != generation
             || self.agent_env_selected.as_deref() != Some(key)
         {
             return;
         }
-        self.agent_env_value_state = Some(duthub_desktop::agent_ui::env_value_source(&read));
+        self.agent_env_value_state = Some(duthub_desktop::agent_ui::env_value_source(read));
     }
 
-    /// 把掩码草稿写入 keyring（覆盖既有值）。键必须仍在当前键名草稿中。
+    /// Save the masked draft to the credential store, replacing any prior value for a key still in the current draft.
     pub(crate) fn save_agent_env_value(&mut self, cx: &mut Context<Self>) {
         let Some(agent_id) = self
             .agent_registry_edit
@@ -465,8 +469,8 @@ impl Workbench {
         }
     }
 
-    /// 删除选中键的 keyring 凭据，并把键从键名草稿移除——注册表不再引用
-    /// 一个没有凭据的键（否则启动会在 `load_agent_env` 处 fail closed）。
+    /// Delete the credential and remove its key from the draft.
+    /// This prevents a registry entry from referencing a missing credential at launch.
     pub(crate) fn delete_agent_env_value(&mut self) {
         let Some(agent_id) = self
             .agent_registry_edit
@@ -505,7 +509,7 @@ impl Workbench {
         }
     }
 
-    /// 重新读取选中键的 keyring 状态（写入/删除后调用；W4c 后台执行）。
+    /// Refresh the selected key's credential state after writing or deleting it.
     pub(super) fn refresh_agent_env_value_state(&mut self, cx: &mut Context<Self>) {
         let Some((agent_id, key)) = self.agent_env_selected.clone().and_then(|key| {
             self.agent_registry_edit
@@ -526,17 +530,17 @@ impl Workbench {
         cx.spawn(async move |this, cx| {
             let result = read.await;
             let _ = this.update(cx, |this, _cx| {
-                this.finish_agent_env_read(generation, &key, result);
+                this.finish_agent_env_read(generation, &key, &result);
             });
         })
         .detach();
     }
 
-    /// 删除注册表条目；内置 goose 不可删除。引用该 Agent 的 DUT 回退 goose。
+    /// Delete a registry entry. The default goose is retained and becomes the fallback for affected DUTs.
     ///
-    /// W4b 顺序：注册表先落盘（删除即生效，重启不复活）→ 再删 keyring 中
-    /// `acp/<id>/env/<KEY>` 凭据；删除失败的键写入 pending-cleanup（下次启动
-    /// 重试）并弹告警，绝不谎称清理完成。
+    /// Persist the registry deletion before removing credentials from the system store.
+    /// Queue any failed credential deletions for retry on startup.
+    /// Report incomplete cleanup in an alert.
     pub(crate) fn delete_agent_registry(&mut self, agent_id: &str) {
         if agent_id == duthub_core::agent_config::DEFAULT_AGENT_ID {
             self.notify_toast(crate::i18n::label("agentRegistryBuiltin"));
@@ -637,8 +641,8 @@ impl Workbench {
         });
     }
 
-    /// 启用/停用注册表条目（停用后启动会被明确拒绝）。
-    /// W4b：禁止停用默认 goose 或最后一个启用条目。
+    /// Enable or disable an Agent entry. A disabled entry cannot be launched.
+    /// Keep the default goose and at least one enabled entry.
     pub(crate) fn toggle_agent_registry(&mut self, agent_id: &str) {
         if let Err(error) = duthub_desktop::agent_ui::validate_agent_toggle(&self.agents, agent_id)
         {
@@ -662,7 +666,7 @@ impl Workbench {
         }
     }
 
-    /// 取回/惰性构造 Agent 宿主（`--self-test` 下恒为 None）。
+    /// Get or lazily create the Agent host. Self-test leaves the host absent.
     pub(super) fn ensure_agent_host(&mut self) -> Result<&mut agent_host::HostManager, String> {
         if self.agent_self_test {
             return Err(crate::i18n::label("agentSessionSelfTest").to_owned());
@@ -687,12 +691,12 @@ impl Workbench {
         Ok(self.agent_host.as_mut().expect("agent host initialized"))
     }
 
-    /// 启动 DUT 的 Agent 会话（立即返回；解包/initialize/session-new 在工作线程）。
+    /// Start a DUT Agent session. Initialization runs on the host worker.
     ///
-    /// W4b：产品启动入口统一走 `host.start_entry` —— CLI profile 由它路由到
-    /// per-turn CLI 分支；模型绑定只在 goose ACP 时以 `FromSettings` 传入，
-    /// CLI 与第三方 ACP 永远拿到 `None`（自带认证，绝不转发 duthub 模型
-    /// Token），绑定解析失败由 `start_entry` 返回 `HostError::Invalid`。
+    /// Use the host's common entry point for ACP and per-turn CLI profiles.
+    /// Resolve the model binding from settings only for goose ACP.
+    /// CLI and third-party ACP programs supply their own credentials.
+    /// A binding resolution failure is reported as `HostError::Invalid`.
     pub fn start_agent_session(&mut self, dut_id: &str, cx: &mut Context<Self>) {
         if !self.agent_bindings.is_enabled(dut_id) {
             return;
@@ -734,16 +738,16 @@ impl Workbench {
         cx.notify();
     }
 
-    /// 非阻塞停止：只吊销 token/发停止意图/关 stdin；等待与杀进程树在工作线程（F12）。
+    /// Request a stop without blocking. The host worker waits for and terminates the process tree.
     pub fn stop_agent_session(&mut self, dut_id: &str) {
-        // 非阻塞停止（token 吊销/关 stdin 立即执行，等待/杀树在宿主线程）。
-        // 调用方自行 cx.notify()（删除清理序在无 cx 的 ops 上下文里也要走本入口）。
+        // Revoke the token and close stdin immediately. Waiting and tree termination stay on the worker.
+        // The caller handles the UI notification. Cleanup can also reach this entry without a UI context.
         if let Some(host) = self.agent_host.as_mut() {
             host.stop(dut_id);
         }
     }
 
-    /// 取消当前轮（进程保留，下一轮仍可继续）。
+    /// Cancel the current turn while keeping the process available for the next one.
     pub fn cancel_agent_turn(&mut self, dut_id: &str, cx: &mut Context<Self>) {
         if let Some(host) = self.agent_host.as_mut() {
             host.cancel(dut_id);
@@ -751,10 +755,10 @@ impl Workbench {
         cx.notify();
     }
 
-    /// 发送当前 DUT 草稿中的 prompt（仅 Ready；Enter 与「发送」按钮共用）。
+    /// Submit the current DUT's draft when the session is ready, from Enter or the Send button.
     ///
-    /// W4c：入队成功才登记「延后清空」请求（按 DUT 键控 + 值匹配）；入队
-    /// 失败保留草稿并把原文写进 transcript，让失败尝试可见、可重试。
+    /// After enqueueing, mark the matching draft for clearing in the next render.
+    /// On failure, keep the draft and record the attempted text in the transcript.
     pub fn send_agent_prompt(&mut self, dut_id: &str, cx: &mut Context<Self>) {
         if !self.agent_bindings.is_enabled(dut_id) {
             return;
@@ -774,16 +778,16 @@ impl Workbench {
         let outcome = duthub_desktop::agent_ui::prompt_send_outcome(host.prompt(dut_id, &text));
         match outcome {
             duthub_desktop::agent_ui::PromptSendOutcome::Enqueued => {
-                // 清空延到渲染帧（set_value 需要 Window）；仅当输入仍等于已
-                // 发送文本才清（等待帧里继续输入的草稿必须保留）。
+                // Defer editing the input until a window is available.
+                // Clear only when its current value still matches the submitted text.
                 self.agent_prompt_token += 1;
                 self.agent_prompt_clear
                     .insert(dut_id.to_owned(), (text, self.agent_prompt_token));
                 self.agent_transcript_seen.remove(dut_id);
             }
             duthub_desktop::agent_ui::PromptSendOutcome::Rejected { reason } => {
-                // 入队失败：草稿保留（不清空、不登记清空请求），原文写进
-                // transcript 让失败尝试可见、可重试。
+                // Keep a draft whose submission failed and leave no pending clear request.
+                // Record the attempted text in the transcript so it can be retried.
                 if let Some(view) = host.view(dut_id) {
                     view.push_entry(duthub_desktop::agent_host::TranscriptEntry::error(
                         crate::i18n::message(
@@ -798,9 +802,12 @@ impl Workbench {
         cx.notify();
     }
 
-    /// 50ms tick：回收已结束的 Agent 工作线程 + 转发 transcript/状态变化（流式重绘）。
+    /// Reap finished Agent workers and forward transcript and status changes on the 50 ms tick.
     pub fn agent_host_tick(&mut self) -> bool {
-        let host_dirty = self.agent_host.as_mut().is_some_and(duthub_desktop::agent_host::HostManager::tick);
+        let host_dirty = self
+            .agent_host
+            .as_mut()
+            .is_some_and(duthub_desktop::agent_host::HostManager::tick);
         let toasts: Vec<String> = {
             let mut queue = self.agent_host_toasts.lock().unwrap();
             queue.drain(..).collect()
@@ -810,7 +817,7 @@ impl Workbench {
         host_dirty | forwarded
     }
 
-    /// 取回/创建 DUT 的 prompt 输入实体（Enter 提交绑定 `send_agent_prompt`）。
+    /// Get or create the DUT's prompt input and bind Enter to `send_agent_prompt`.
     pub(crate) fn agent_prompt_state(
         &mut self,
         dut_id: &str,
@@ -837,11 +844,11 @@ impl Workbench {
         state
     }
 
-    /// 发送成功后清空该 DUT 的草稿（渲染帧调用：`set_value` 需要 Window）。
+    /// Clear the submitted draft during rendering, when the input can be updated through a window.
     ///
-    /// W4c：仅当输入框的当前值仍等于已发送文本才清空；等待帧里用户继续
-    /// 输入的草稿保留，且过期的清空请求随之移除。请求按 DUT 键控，切换
-    /// 标签不影响其他 DUT 的挂起请求。
+    /// Clear only if the input still matches the submitted text.
+    /// Discard a stale clear request and preserve text entered in the meantime.
+    /// Requests are keyed by DUT so changing tabs leaves other drafts alone.
     pub(crate) fn clear_agent_prompt_if_requested(
         &mut self,
         dut_id: &str,
@@ -865,7 +872,7 @@ impl Workbench {
         self.agent_prompt_clear.remove(dut_id);
     }
 
-    /// 当前显式选中的会话模型（provider/model 仍启用且协议受支持）。
+    /// Return the explicitly selected model if it is enabled and its protocol is supported.
     pub(super) fn active_agent_model(&self) -> Option<(String, String)> {
         let provider_id = self.settings.agent.active_provider_id.as_deref()?.trim();
         let model_id = self.settings.agent.active_model_id.as_deref()?.trim();
@@ -888,7 +895,7 @@ impl Workbench {
             .then(|| (provider_id.to_owned(), model_id.to_owned()))
     }
 
-    /// 目录中首个可用模型（仅在用户未显式选择时兜底记录，不参与会话解析优先级）。
+    /// Find the first available model for persisting a fallback when there is no explicit choice.
     pub(super) fn first_enabled_agent_model(&self) -> Option<(String, String)> {
         self.settings
             .agent
@@ -906,8 +913,8 @@ impl Workbench {
             })
     }
 
-    /// 落盘选中的 provider/model（camelCase `activeProviderId`/`activeModelId`），
-    /// 同步 legacy `agent.provider`/`agent.slow`；下一次 `start_agent_session` 立即生效。
+    /// Save the selected provider and model IDs and synchronize the legacy Agent fields.
+    /// The next Agent launch uses the saved choice.
     pub(super) fn persist_agent_model_binding(
         &mut self,
         provider_id: &str,
@@ -954,12 +961,12 @@ impl Workbench {
         store::save_settings_secured(&self.data_dir, &candidate)
             .map_err(|error| error.to_string())?;
         self.settings = candidate;
-        self.agent_model_provider = setting.to_owned();
-        self.agent_model_name = model_id.to_owned();
+        setting.clone_into(&mut self.agent_model_provider);
+        model_id.clone_into(&mut self.agent_model_name);
         Ok(())
     }
 
-    /// 「Agent 模型」点选会话模型：立即落盘选中 id，下一次启动按精确绑定解析。
+    /// Save the exact model choice for the next session launch.
     pub(crate) fn select_agent_model(&mut self, provider_id: &str, model_id: &str) {
         let provider_name = self
             .settings
@@ -979,8 +986,8 @@ impl Workbench {
         }
     }
 
-    /// 记录会话模型：优先保留当前显式选择；未选择时记录目录中首个启用模型。
-    /// goose 启动绑定由 `model_env::resolve_binding` 读取同一组 active id。
+    /// Keep the explicit choice when present, or record the first enabled model.
+    /// Goose resolves its binding from the same saved provider and model IDs.
     pub(crate) fn save_goose_model(&mut self) {
         let Some((provider_id, model_id)) = self
             .active_agent_model()
@@ -997,11 +1004,11 @@ impl Workbench {
         }
     }
 
-    /// 校验外部 goose 路径并写入 `agents.json` 的 goose 条目（程序 + SHA-256）。
-    /// 空输入 = 明确恢复内嵌（清除 program/expectedSha256）。
+    /// Validate and persist the external goose path and SHA-256 hash in `agents.json`.
+    /// An empty path clears the stored program and hash.
     ///
-    /// W4c：文件哈希 + `--version` 子进程探测全部移到后台执行器——保存动作
-    /// 只做轻校验（绝对路径）后暂存 pending，探测结果按代数回填再落盘。
+    /// Validate the absolute path before scheduling the hash and version check in the background.
+    /// Persist only after the current generation's check completes.
     pub(crate) fn save_goose_external(&mut self, cx: &mut Context<Self>) {
         let input = self.input_value(In::GoosePath).trim().to_owned();
         if input.is_empty() {
@@ -1106,7 +1113,7 @@ impl Workbench {
         self.agents_error = None;
     }
 
-    /// 清除外部 goose 记录（恢复内嵌路径）；同时作废在途的后台保存探测。
+    /// Clear the external goose entry and invalidate any pending program checks.
     pub(crate) fn clear_goose_external(&mut self) {
         self.goose_probe_generation += 1;
         self.pending_goose_save = None;

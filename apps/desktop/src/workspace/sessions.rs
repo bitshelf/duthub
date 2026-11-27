@@ -1,4 +1,8 @@
-use super::{Workbench, i18n, InteractiveElement, In, store, AppContext, FluentBuilder, InstallFinishedOutcome, ToolPurpose, tool_failure_label, SessionView, UiEvent, AlertSource, ChunkStyle, LineKind, parse_serial_open_baud, agent, LinkState, LogLine, SharedString, Ordering, broadcast};
+use super::{
+    AlertSource, ChunkStyle, In, InstallFinishedOutcome, LineKind, LinkState, LogLine, Ordering,
+    SessionView, SharedString, ToolPurpose, UiEvent, Workbench, agent, broadcast, i18n,
+    parse_serial_open_baud, store, tool_failure_label,
+};
 
 impl Workbench {
     // ------------------------------------------------------------------
@@ -112,7 +116,7 @@ impl Workbench {
             }
         }
         self.settings.tools.download.proxy.mode = mode;
-        self.settings.tools.download.proxy.url = url.clone();
+        self.settings.tools.download.proxy.url.clone_from(&url);
         self.tool_proxy_mode_draft = None;
         self.drafts.remove(&In::ProxyUrl);
         self.persist_settings();
@@ -229,7 +233,7 @@ impl Workbench {
     }
 
     // ------------------------------------------------------------------
-    // 设备事件吸收
+    // Device event absorption
     // ------------------------------------------------------------------
 
     pub(super) fn ensure_session(&mut self, session_id: &str, dut_id: &str) -> usize {
@@ -248,7 +252,7 @@ impl Workbench {
             source,
             0,
         ));
-        // 新会话需要一次 term.resize（网格尺寸缓存按会话重置）
+        // A new session requires a termResize (grid size is reset per session).
         self.term_grid = None;
         self.sessions.len() - 1
     }
@@ -270,10 +274,12 @@ impl Workbench {
         }
         let index = self.ensure_session(&session_id, &dut_id);
         let view = &mut self.sessions[index];
-        // 首开失败 payload（需求⑤接入点②）：view 借用期间先记下，出借后再入队
+        // Failed to enqueue at the beginning. Payload (Requirement ⑤ Access Point ②): Record it
+        // during the borrowing period, and then enqueue it later.
         let mut serial_open_failure: Option<(String, String)> = None;
-        // 整屏快照单独分流（唯一需要所有权的载荷：进 SessionView 的 Arc，
-        // 零深拷贝；其后 drain/首开失败逻辑对本事件均为空操作）
+        let mut serial_reconnected = false;
+        // Route a screen snapshot separately and move its `Arc` into `SessionView` without cloning
+        // the contents. The drain and first-open failure handlers have no work for this event.
         if let UiEvent::SerialScreen { screen } = env.event {
             // Alert on the edge into `Garbled` only: the snapshot arrives every
             // frame, so reporting on every garbled frame would rely on the 30s
@@ -313,7 +319,8 @@ impl Workbench {
                 } else {
                     None
                 };
-                // 链路状态推导（仅 device 会话）：驱动"[serial]"行即状态信令
+                // Link status derivation (only applicable to device sessions): The driver for the
+                // "[serial]" row contains the status information.
                 if view.source == "device" {
                     if *style == ChunkStyle::Normal {
                         view.crash_line_tail.push_str(text);
@@ -338,30 +345,36 @@ impl Workbench {
                         view.link = LinkState::Connected;
                         view.reconnect_attempts = 0;
                         view.baud = baud;
+                        serial_reconnected = true;
                     } else if text.starts_with("[serial] ") && text.contains("重连") {
                         view.link = LinkState::Reconnecting;
                         view.reconnect_attempts += 1;
                     } else if let Some(target) = crate::alerts::parse_serial_open_failure(text) {
-                        // 首开失败：驱动只报错一次并结束会话 task（坑 #7），
-                        // 即「task 死亡」——转弹窗提醒（需求⑤接入点②）。
-                        // view 借用仍在，payload 先记下、出 match 后再入队。
+                        // Failure to enqueue: The driver only reported an error once and ended the
+                        // session task (pit #7). In other words, the "task died" – it should be
+                        // redirected to a pop-up reminder (requirement ⑤, access point ②). The view
+                        // is still borrowed; save the payload first, and enqueue it after a match
+                        // occurs.
                         serial_open_failure = Some((target, text.clone()));
                     }
                 }
-                // device 会话（PuTTY 模式）：设备输出由仿真器网格（SerialScreen）
-                // 渲染，SerialChunk 只收注记行（[serial] 信令 / [mark] / 错误）；
-                // demo 会话保持原有全量行渲染。
+                // Annotation: Device sessions (PuTTY mode): Device output is rendered via the
+                // emulator's grid (SerialScreen). SerialChunks only contain annotation lines
+                // ([serial] signaling / [mark] / errors); Demo sessions maintain the original
+                // full-line rendering.
                 if view.should_queue_chunk_line(*style, opened_baud.is_some()) {
                     view.lines.push(LogLine {
                         text: SharedString::from(text.clone()),
                         kind,
                     });
+                    view.output_seq = view.output_seq.wrapping_add(1);
                 }
                 view.last_seq = env.seq;
                 self.core_lines.fetch_add(1, Ordering::Relaxed);
             }
             UiEvent::SerialDisconnected { reason } => {
-                // device 会话断线后驱动自动进入退避重连 → 状态条切"重连中"
+                // After a session disconnects, the device automatically enters backoff mode for
+                // reconnection → The status bar shows "Reconnecting".
                 if view.source == "device" {
                     view.crash_line_tail.clear();
                     view.link = LinkState::Reconnecting;
@@ -373,6 +386,7 @@ impl Workbench {
                     )),
                     kind: LineKind::Dim,
                 });
+                view.output_seq = view.output_seq.wrapping_add(1);
                 view.last_seq = env.seq;
             }
             _ => {}
@@ -381,14 +395,19 @@ impl Workbench {
             let drain = self.sessions[index].lines.len() - 4000;
             self.sessions[index].lines.drain(..drain);
         }
-        // 首开失败 → 弹窗提醒中心（去重窗口兜底重连风暴）
+        // Initial connection failed → Pop-up reminder in the center of the interface (attempting to
+        // reconnect via a separate window).
+        if serial_reconnected {
+            self.resolve_alert_for(&dut_id, AlertSource::Serial);
+        }
         if let Some((target, line)) = serial_open_failure {
             let dut_label = self
                 .duts
                 .file
                 .duts
                 .iter()
-                .find(|d| d.id == dut_id).map_or_else(|| dut_id.clone(), |d| d.name.clone());
+                .find(|d| d.id == dut_id)
+                .map_or_else(|| dut_id.clone(), |d| d.name.clone());
             self.report_serial_session_failure(
                 &dut_id,
                 &dut_label,
@@ -398,8 +417,10 @@ impl Workbench {
         }
     }
 
-    /// 接入点②（serial）：会话首开失败 / task 死亡 → 弹窗提醒中心。
-    /// detail 携带驱动原文（端口/波特率/失败原因），便于人工定位。
+    /// Access Point ② (Serial): Session initialization failed / Task terminated → Pop-up alert
+    /// appears in the center.
+    /// The "detail" field contains the original driver settings (port number, baud rate, reason for
+    /// failure), which helps in manual troubleshooting.
     pub(super) fn report_serial_session_failure(
         &mut self,
         dut_id: &str,
@@ -439,7 +460,11 @@ impl Workbench {
                         .map(|s| (s.session_id.clone(), s.last_seq))
                         .collect();
                     for (session_id, since) in views {
-                        for env in self.device.read_log(&session_id, since, lagged as usize) {
+                        for env in self.device.read_log(
+                            &session_id,
+                            since,
+                            usize::try_from(lagged).unwrap_or(usize::MAX),
+                        ) {
                             self.absorb_envelope(env);
                             handled += 1;
                             if handled >= 256 {
@@ -456,12 +481,14 @@ impl Workbench {
     }
 
     // ------------------------------------------------------------------
-    // 会话心跳（需求⑦）：定时驱动 + 告警 drain
+    // Session Heartbeat (Requirement ⑦): Timed Driver + Alarm Drain
     // ------------------------------------------------------------------
 
-    /// 心跳引擎单次驱动（50ms tick 调用）：到期下发命令、窗口内收响应、
-    /// 丢联达阈值发告警（toast 提示 + 转弹窗提醒中心，需求⑤接入点①）。
-    /// 返回是否有状态变化（供渲染循环决定重绘）。
+    /// Heartbeat engine drives once (50ms tick calls): issuing commands when deadlines approach,
+    /// responding within the window, and generating alerts when the connection threshold is reached
+    /// (toast notifications + redirecting to pop-up alerts, requirement ⑤ connects to point ①). It
+    /// returns whether there are any changes in status (used to determine repainting during
+    /// rendering loops).
     pub fn heartbeat_tick(&mut self) -> bool {
         let changed = self.heartbeat.tick();
         for alert in self.heartbeat.drain_alerts() {
@@ -471,7 +498,8 @@ impl Workbench {
                 .file
                 .duts
                 .iter()
-                .find(|d| d.id == alert.dut_id).map_or_else(|| alert.dut_id.clone(), |d| d.name.clone());
+                .find(|d| d.id == alert.dut_id)
+                .map_or_else(|| alert.dut_id.clone(), |d| d.name.clone());
             let (title, detail) = crate::alerts::heartbeat_alert_texts(&label, &alert.message);
             self.alerts.lock().unwrap().report_for(
                 &alert.dut_id,

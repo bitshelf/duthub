@@ -194,7 +194,7 @@ fn cmd_exe() -> PathBuf {
 /// DUT's sandbox cell.
 fn fake_agent(work: &Path, dut: &str, mode: &str, counter: &Path) -> AgentDefinition {
     let program = cmd_exe();
-    assert!(program.is_file(), "缺少 cmd.exe: {}", program.display());
+    assert!(program.is_file(), "missing cmd.exe: {}", program.display());
     let key = duthub_core::store::agent_dut_key(dut).expect("DUT id must map to a key");
     let cell_dir = work.join("agent").join("dut").join(key).join("sandbox");
     std::fs::create_dir_all(&cell_dir).unwrap();
@@ -286,12 +286,16 @@ fn restart_only_after_ready() {
             status_of(&host, "dut-no-ready"),
             Some(SessionStatus::Failed(_))
         )),
-        "initialize 失败必须进入 Failed：{:?}",
+        "initialize failure must enter Failed: {:?}",
         status_of(&host, "dut-no-ready")
     );
     // Longer than the first restart delay: a failed startup must not retry.
     std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(spawn_count(&early_counter), 1, "启动失败不得自动重启");
+    assert_eq!(
+        spawn_count(&early_counter),
+        1,
+        "startup failure must not auto-restart"
+    );
     assert!(
         events
             .failed
@@ -299,7 +303,7 @@ fn restart_only_after_ready() {
             .unwrap()
             .iter()
             .any(|(dut, _)| dut == "dut-no-ready"),
-        "启动失败必须回调 on_failed"
+        "startup failure must invoke on_failed"
     );
 
     // Ready then self-exit: initial start + three restarts, then Failed.
@@ -315,7 +319,7 @@ fn restart_only_after_ready() {
             status_of(&host, "dut-crash"),
             Some(SessionStatus::Failed(_))
         )),
-        "重启用尽后必须 Failed：{:?} stderr={}",
+        "must enter Failed after restart budget is exhausted: {:?} stderr={}",
         status_of(&host, "dut-crash"),
         host.view("dut-crash")
             .map_or_default(|view| view.stderr_tail())
@@ -323,7 +327,7 @@ fn restart_only_after_ready() {
     assert_eq!(
         spawn_count(&crash_counter),
         MAX_RESTARTS_PER_WINDOW + 1,
-        "首次启动 + 3 次自动重启"
+        "initial start + 3 automatic restarts"
     );
     let started = events
         .started
@@ -340,7 +344,10 @@ fn restart_only_after_ready() {
         .iter()
         .filter(|(dut, _)| dut == "dut-crash")
         .count();
-    assert_eq!(failed, 1, "只有预算耗尽才是最终 Failed");
+    assert_eq!(
+        failed, 1,
+        "only budget exhaustion triggers final Failed callback"
+    );
 
     let view = host.view("dut-crash").unwrap();
     let transcript = view.transcript_snapshot();
@@ -350,13 +357,13 @@ fn restart_only_after_ready() {
             .filter(|entry| entry.text.contains("秒后自动重启"))
             .count(),
         MAX_RESTARTS_PER_WINDOW,
-        "每次重启前写一条系统注记"
+        "each restart must write one system note"
     );
     assert!(
         transcript
             .iter()
             .any(|entry| entry.text.contains("已停止自动重启")),
-        "预算耗尽必须留下注记"
+        "budget exhaustion must leave a system note"
     );
 
     // The restart path must not leave a restartable view behind.
@@ -395,7 +402,7 @@ fn stop_cancels_pending_restart_without_new_spawn() {
     });
     assert!(
         matches!(status_of(&host, "dut-stop"), Some(SessionStatus::Ready)),
-        "会话未就绪：{:?} stderr={}",
+        "session did not become ready: {:?} stderr={}",
         status_of(&host, "dut-stop"),
         host.view("dut-stop")
             .map_or_default(|view| view.stderr_tail())
@@ -407,7 +414,7 @@ fn stop_cancels_pending_restart_without_new_spawn() {
             status_of(&host, "dut-stop"),
             Some(SessionStatus::Starting)
         )),
-        "未进入重启退避：{:?}",
+        "did not enter restart backoff: {:?}",
         status_of(&host, "dut-stop")
     );
 
@@ -415,19 +422,19 @@ fn stop_cancels_pending_restart_without_new_spawn() {
     host.stop("dut-stop");
     assert!(
         stop_started.elapsed() < Duration::from_secs(2),
-        "stop 不得阻塞 UI"
+        "stop must not block UI"
     );
     assert!(
         wait_until(Duration::from_secs(30), || matches!(
             status_of(&host, "dut-stop"),
             Some(SessionStatus::Stopped)
         )),
-        "stop 后必须停在 Stopped：{:?}",
+        "must stay in Stopped after stop: {:?}",
         status_of(&host, "dut-stop")
     );
     // Longer than the first backoff delay: no new process may appear.
     std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(spawn_count(&counter), 1, "stop 必须取消待执行的重启");
+    assert_eq!(spawn_count(&counter), 1, "stop must cancel pending restart");
     assert_eq!(
         events
             .started
@@ -437,7 +444,7 @@ fn stop_cancels_pending_restart_without_new_spawn() {
             .filter(|dut| *dut == "dut-stop")
             .count(),
         1,
-        "取消失败会重新 on_started"
+        "cancelling restart must not trigger another on_started"
     );
 
     drop(host);

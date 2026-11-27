@@ -1,10 +1,10 @@
-//! 有界事件总线 + 按会话环形缓冲（M1.4）。
+//! Bounded event bus with per-session ring buffers (M1.4).
 //!
-//! - `publish`：事件写入会话环形缓冲，并广播给所有订阅者。
-//! - 订阅者消费过慢会收到 `Lagged(n)`（tokio broadcast 语义），此时调用
-//!   `read_log(session_id, since_seq, limit)` 从缓冲补齐，不丢内核 panic 数据
-//!   （`docs/API_CONTRACT.md` 事件节）。
-//! - `seq` 全局单调，由总线分配。
+//! - `publish`: appends the event to the session ring buffer and broadcasts it to all subscribers.
+//! - Slow subscribers receive `Lagged(n)` (Tokio broadcast semantics) and can catch up via
+//!   `read_log(session_id, since_seq, limit)` without losing kernel panic output
+//!   (see `docs/API_CONTRACT.md`).
+//! - `seq` is globally monotonic and assigned by the bus.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -197,6 +197,21 @@ impl EventBus {
         let buffers = duthub_core::util::lock_unpoisoned(&self.buffers);
         buffers.get(session_id).map_or(0, |buffer| buffer.last_seq)
     }
+
+    /// Return the latest rendered VT100 screen snapshot retained for `session_id`.
+    pub fn latest_screen(
+        &self,
+        session_id: &str,
+    ) -> Option<std::sync::Arc<duthub_core::ipc::ScreenSnapshot>> {
+        let buffers = duthub_core::util::lock_unpoisoned(&self.buffers);
+        buffers
+            .get(session_id)
+            .and_then(|buffer| buffer.latest_screen.as_ref())
+            .and_then(|envelope| match &envelope.event {
+                UiEvent::SerialScreen { screen } => Some(std::sync::Arc::clone(screen)),
+                _ => None,
+            })
+    }
 }
 
 /// Convenience constructor for a `UiEvent::SerialChunk`.
@@ -253,9 +268,9 @@ mod tests {
         assert_eq!(log.len(), SESSION_BUFFER_CAP);
         let first_text = match &log[0].event {
             UiEvent::SerialChunk { text, .. } => text.clone(),
-            _ => panic!("应为 SerialChunk"),
+            _ => panic!("Expected SerialChunk"),
         };
-        // 最老的 500 条已被淘汰：缓冲首行应是 line-500
+        // The oldest 500 entries were evicted; the first buffered line should be line-500.
         assert!(first_text.contains("line-500"));
     }
 
@@ -285,8 +300,14 @@ mod tests {
             .collect();
         assert_eq!(seqs, [next.seq, last.seq]);
         assert_eq!(bus.read_log_tail("s1", usize::MAX)[0].seq, first.seq);
-        assert_eq!(bus.read_log_tail("s1", 0), [] as [duthub_core::EventEnvelope; 0]);
-        assert_eq!(bus.read_log_tail("missing", 2), [] as [duthub_core::EventEnvelope; 0]);
+        assert_eq!(
+            bus.read_log_tail("s1", 0),
+            [] as [duthub_core::EventEnvelope; 0]
+        );
+        assert_eq!(
+            bus.read_log_tail("missing", 2),
+            [] as [duthub_core::EventEnvelope; 0]
+        );
     }
 
     #[test]
@@ -304,7 +325,7 @@ mod tests {
     fn slow_subscriber_gets_lagged_then_catches_up() {
         let bus = Arc::new(EventBus::new(4));
         let mut rx = bus.subscribe();
-        // 快速生产 20 条，订阅者不消费 → broadcast 滞后
+        // Rapidly publish 20 events while the subscriber is idle so broadcast lags.
         for i in 0..20 {
             bus.publish("s1", "d1", chunk(format!("l{i}"), ChunkStyle::Normal));
         }
@@ -321,17 +342,22 @@ mod tests {
                     break;
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Closed) => panic!("总线不应关闭"),
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    panic!("The event bus must remain open")
+                }
             }
         }
-        assert!(lagged >= 1, "慢消费者必须收到 Lagged");
-        assert_eq!(received, 0, "Lagged 语义下旧事件不可靠，应走补读");
-        // 滞后期间缓冲仍在 → 从缓冲补齐全部 20 条
+        assert!(lagged >= 1, "slow subscriber must receive Lagged");
+        assert_eq!(
+            received, 0,
+            "stale events must not be delivered before Lagged catch-up"
+        );
+        // The ring buffer retains all 20 events for catch-up reads.
         let catch_up = bus.read_log("s1", 0, usize::MAX);
         assert_eq!(catch_up.len(), 20);
         assert_eq!(
             catch_up[0].seq, 1,
-            "缓冲补读从最初一条开始，不丢 panic 数据"
+            "catch-up read must start from the first event without losing panic output"
         );
     }
 
@@ -364,7 +390,10 @@ mod tests {
         let bus = EventBus::new(8);
         bus.publish("s1", "d1", chunk("x", ChunkStyle::Normal));
         bus.drop_session("s1");
-        assert_eq!(bus.read_log("s1", 0, usize::MAX), [] as [duthub_core::EventEnvelope; 0]);
+        assert_eq!(
+            bus.read_log("s1", 0, usize::MAX),
+            [] as [duthub_core::EventEnvelope; 0]
+        );
         assert_eq!(bus.last_seq("s1"), 0);
     }
 }

@@ -99,28 +99,38 @@ fn segment_files(work_dir: &Path, dut_id: &str) -> Vec<(String, PathBuf)> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if crate::dut_artifacts::open(root, dut_id, name, false).is_err() {
-                continue;
-            }
-            let Ok(dir) = crate::dut_artifacts::open(root, dut_id, name, false)
-                .and_then(|dir| crate::dut_artifacts::open_logs(&dir))
-            else {
+            let Ok(dut_dir) = crate::dut_artifacts::open(root, dut_id, name, false) else {
                 continue;
             };
-            if let Ok(files) = dir.entries() {
-                for file in files
-                    .flatten()
-                    .filter(|file| file.file_type().is_ok_and(|kind| kind.is_file()))
-                {
-                    let filename = file.file_name();
-                    if let Some(filename) = filename.to_str()
-                        && (filename == CONTINUOUS_SERIAL_LOG
-                            || crate::dut_artifacts::log_sequence(filename).is_some())
+            let log_dirs = [
+                (
+                    crate::dut_artifacts::SERIAL_LOGS_DIR,
+                    crate::dut_artifacts::open_logs(&dut_dir),
+                ),
+                (
+                    crate::dut_artifacts::LEGACY_LOGS_DIR,
+                    crate::dut_artifacts::open_legacy_logs(&dut_dir),
+                ),
+            ];
+            for (subdir, opened) in log_dirs {
+                let Ok(dir) = opened else {
+                    continue;
+                };
+                if let Ok(files) = dir.entries() {
+                    for file in files
+                        .flatten()
+                        .filter(|file| file.file_type().is_ok_and(|kind| kind.is_file()))
                     {
-                        paths.push((
-                            format!("dut/{name}/logs/{filename}"),
-                            entry.path().join("logs").join(filename),
-                        ));
+                        let filename = file.file_name();
+                        if let Some(filename) = filename.to_str()
+                            && (filename == CONTINUOUS_SERIAL_LOG
+                                || crate::dut_artifacts::log_sequence(filename).is_some())
+                        {
+                            paths.push((
+                                format!("dut/{name}/{subdir}/{filename}"),
+                                entry.path().join(subdir).join(filename),
+                            ));
+                        }
                     }
                 }
             }
@@ -196,8 +206,10 @@ fn open_segment(work_dir: &Path, dut_id: &str, id: &str, path: &Path) -> std::io
             .split_once('/')
             .ok_or(std::io::ErrorKind::InvalidData)?;
         let dir = crate::dut_artifacts::open(root, dut_id, name, false)?;
-        let dir = if file.starts_with("logs/") {
+        let dir = if file.starts_with(&format!("{}/", crate::dut_artifacts::SERIAL_LOGS_DIR)) {
             crate::dut_artifacts::open_logs(&dir)?
+        } else if file.starts_with(&format!("{}/", crate::dut_artifacts::LEGACY_LOGS_DIR)) {
+            crate::dut_artifacts::open_legacy_logs(&dir)?
         } else {
             dir
         };
@@ -253,12 +265,35 @@ mod tests {
             .unwrap();
         let entries = list(&archive, "a", 0, 20);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, format!("dut/RK3576/logs/{filename}"));
+        assert_eq!(
+            entries[0].id,
+            format!(
+                "dut/RK3576/{}/{filename}",
+                crate::dut_artifacts::SERIAL_LOGS_DIR
+            )
+        );
         assert!(list(&archive, "b", 0, 20).is_empty());
         assert!(read(&archive, "b", &entries[0].id, 0).is_err());
         assert_eq!(
             read(&archive, "a", &entries[0].id, 0).unwrap().text,
             "serial evidence"
+        );
+
+        // Legacy `logs/` files remain readable alongside the new `串口日志/` folder.
+        let (_, owner) =
+            crate::dut_artifacts::open_dut_for_write(portable.path(), "a", "RK3576").unwrap();
+        let legacy_dir = crate::dut_artifacts::open_subdir_for_write(&owner, "logs").unwrap();
+        let legacy_name = "RK3576-000_20260918_114500.txt";
+        crate::dut_artifacts::create_new(&legacy_dir, legacy_name)
+            .unwrap()
+            .write_all(b"legacy evidence")
+            .unwrap();
+        let combined = list(&archive, "a", 0, 20);
+        assert_eq!(combined.len(), 2);
+        let legacy_id = format!("dut/RK3576/logs/{legacy_name}");
+        assert_eq!(
+            read(&archive, "a", &legacy_id, 0).unwrap().text,
+            "legacy evidence"
         );
     }
 

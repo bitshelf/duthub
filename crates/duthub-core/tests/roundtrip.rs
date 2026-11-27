@@ -1,11 +1,12 @@
-//! v1 schema 往返测试：examples 里的真实样例必须能无损地 类型化 → 再序列化 → 语义相等。
+//! v1 schema round-trip tests: real examples must deserialize, re-serialize, and stay semantically
+//! equal without loss.
 
 use duthub_core::{DutsFile, SettingsFile};
 use std::path::PathBuf;
 
 fn manifest_dir() -> PathBuf {
-    // 运行时读取（cargo 注入）：env!() 在编译期烘焙绝对路径，
-    // 项目目录改名后旧二进制仍指向旧路径（cargo 指纹不含绝对路径）。
+    // Read at runtime (injected by cargo): `env!()` bakes an absolute path at compile time,
+    // which goes stale if the project directory is renamed (cargo fingerprints exclude paths).
     std::env::var("CARGO_MANIFEST_DIR")
         .map_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
 }
@@ -16,27 +17,32 @@ fn examples_dir() -> PathBuf {
 
 fn assert_roundtrip<T: serde::Serialize + serde::de::DeserializeOwned>(raw: &str, name: &str) {
     let parsed: T =
-        serde_json::from_str(raw).unwrap_or_else(|e| panic!("{name} 反序列化失败: {e}"));
-    let re = serde_json::to_value(&parsed).expect("序列化失败");
-    let original: serde_json::Value = serde_json::from_str(raw).expect("原始 JSON 应有效");
-    assert_eq!(original, re, "{name} 往返后语义不相等");
+        serde_json::from_str(raw).unwrap_or_else(|e| panic!("Failed to deserialize {name}: {e}"));
+    let re = serde_json::to_value(&parsed).expect("serialization failed");
+    let original: serde_json::Value =
+        serde_json::from_str(raw).expect("original JSON should be valid");
+    assert_eq!(
+        original, re,
+        "{name} was not semantically equal after round-trip"
+    );
 }
 
 #[test]
 fn settings_example_roundtrip() {
-    let raw = std::fs::read_to_string(examples_dir().join("settings.json")).expect("读文件");
+    let raw =
+        std::fs::read_to_string(examples_dir().join("settings.json")).expect("read settings.json");
     assert_roundtrip::<SettingsFile>(&raw, "settings.json");
 }
 
 #[test]
 fn duts_example_roundtrip() {
-    let raw = std::fs::read_to_string(examples_dir().join("duts.json")).expect("读文件");
+    let raw = std::fs::read_to_string(examples_dir().join("duts.json")).expect("read duts.json");
     assert_roundtrip::<DutsFile>(&raw, "duts.json");
 }
 
 #[test]
 fn relay_variants_parse() {
-    // disabled / snmp_pdu 不在 examples 里，用 DATA_MODEL.md 的形状补测
+    // `disabled` and `snmp_pdu` are not in examples; test their `DATA_MODEL.md` shapes directly.
     let disabled: duthub_core::model::DutConfig = serde_json::from_str(
         r#"{"id":"d2","name":"X","serial":{"host":"local","port":"COM3","baud":115200,"format":"8N1"},"relay":{"mode":"disabled"}}"#,
     )
@@ -53,7 +59,7 @@ fn relay_variants_parse() {
             assert_eq!(snmp.credential_ref, "win-cred: pdu-9");
             assert_eq!(outlets.power, 2);
         }
-        other => panic!("期望 SnmpPdu，得到 {other:?}"),
+        other => panic!("Expected SnmpPdu, got {other:?}"),
     }
 }
 
@@ -70,16 +76,17 @@ fn mcp_stdio_variant_parse() {
             assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("warn"));
         }
         other @ duthub_core::model::McpConfig::StreamableHttp { .. } => {
-            panic!("期望 Stdio，得到 {other:?}")
+            panic!("Expected Stdio, got {other:?}")
         }
     }
 }
 
 #[test]
 fn unknown_fields_tolerated() {
-    // 向前兼容：v2 新字段出现在 v1 文件里不应报错
+    // Forward compatibility: v2 fields in a v1 file must not fail deserialization.
     let raw = r#"{"version":1,"appearance":{"theme":"dark","language":"zh-CN","platform":"windows","futureField":1}}"#;
-    let parsed: SettingsFile = serde_json::from_str(raw).expect("未知字段应被容忍");
+    let parsed: SettingsFile =
+        serde_json::from_str(raw).expect("unknown fields should be tolerated");
     assert_eq!(parsed.appearance.theme, "dark");
 }
 

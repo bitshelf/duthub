@@ -1,10 +1,11 @@
-//! F3/F4/F5/F8：goose 会话生命周期回归。
+//! F3/F4/F5/F8: goose session lifecycle regressions.
 //!
-//! - start→stop→立即 start 不得出现两个 goose（同 DUT 共享 `GOOSE_PATH_ROOT`）；
-//! - 失败/终止后可以重启；
-//! - stop 不在 UI 线程做 stdin I/O；
-//! - MCP 不可达时扩展校验拒绝（F1 负向）；
-//! - 停止时孙进程随进程树消失（F5）。
+//! - start -> stop -> immediate start must never spawn two goose processes (same DUT shares
+//!   `GOOSE_PATH_ROOT`);
+//! - Sessions can restart after failure or termination;
+//! - `stop` performs no stdin I/O on the UI thread;
+//! - Unreachable MCP is rejected by extension validation (F1 negative case);
+//! - Descendant processes are terminated with the process tree on stop (F5).
 
 #![cfg(windows)]
 
@@ -167,7 +168,7 @@ fn binding() -> GooseBinding {
 }
 
 // ---------------------------------------------------------------------------
-// Test goose fixture (2026-11-24: goose is downloaded, no longer embedded)
+// Test goose fixture (goose is downloaded, not embedded)
 // ---------------------------------------------------------------------------
 
 /// `DUTHUB_TEST_GOOSE` (absolute path to a goose executable) wins, otherwise the
@@ -177,7 +178,7 @@ fn test_goose_program() -> Option<PathBuf> {
         let path = PathBuf::from(raw);
         assert!(
             path.is_absolute() && path.is_file(),
-            "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+            "DUTHUB_TEST_GOOSE must be an absolute path to an existing goose executable: {}",
             path.display()
         );
         return Some(path);
@@ -201,8 +202,8 @@ fn test_goose_agent() -> Option<AgentDefinition> {
 /// Loud skip: goose is no longer embedded, so ACP tests need an installed one.
 fn skip_without_goose() {
     eprintln!(
-        "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-         或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+        "SKIP: goose is not installed (goose is no longer embedded) — \
+         download goose from Tool Downloads or set DUTHUB_TEST_GOOSE to the goose executable"
     );
 }
 
@@ -252,35 +253,35 @@ fn start_stop_restart_serializes_sessions() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-life"),
-        "会话未就绪：{:?} {}",
+        "session did not become ready: {:?} {}",
         host.view("dut-life").map(|view| view.status()),
         host.view("dut-life")
             .map_or_default(|view| view.stderr_tail())
     );
     let first_session = host.view("dut-life").unwrap().session_id().unwrap();
 
-    // stop 必须在 UI 线程立即返回（不做 stdin 写/等待）。
+    // stop must return immediately on the UI thread (no stdin writes or waits).
     let started = Instant::now();
     host.stop("dut-life");
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(2),
-        "stop 不应阻塞 UI：{elapsed:?}"
+        "stop must not block the UI thread: {elapsed:?}"
     );
 
-    // 同一 DUT 在旧 worker 收尾前不允许再启动（否则两个 goose 共享 GOOSE_PATH_ROOT）。
+    // Reject a new start for the same DUT until the old worker finishes (avoids sharing GOOSE_PATH_ROOT).
     match host.start_with_agent("dut-life", Some(binding()), agent.clone()) {
         Err(HostError::AlreadyRunning(dut)) => assert_eq!(dut, "dut-life"),
-        Ok(()) => panic!("旧会话收尾前不得启动第二个 goose"),
+        Ok(()) => panic!("must not start a second goose before the previous session finishes"),
         Err(error) => panic!("unexpected start error: {error}"),
     }
 
     assert!(
         wait_terminal(&mut host, "dut-life", Duration::from_secs(30)),
-        "stop 后未进入终止态"
+        "session did not reach terminal state after stop"
     );
 
-    // 等 join 完成后允许重启；新的 session id 证明是全新会话。
+    // Allow restart once join completes; a new session id proves a fresh session.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         host.tick();
@@ -289,12 +290,12 @@ fn start_stop_restart_serializes_sessions() {
             Err(HostError::AlreadyRunning(_)) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(error) => panic!("failed 后无法重启: {error}"),
+            Err(error) => panic!("failed to restart after stop: {error}"),
         }
     }
     assert!(
         wait_ready(&mut host, "dut-life"),
-        "重启后未就绪：{:?}",
+        "restarted session did not become ready: {:?}",
         host.view("dut-life").map(|view| view.status())
     );
     let second_session = host.view("dut-life").unwrap().session_id().unwrap();
@@ -308,7 +309,7 @@ fn start_stop_restart_serializes_sessions() {
     ));
     assert!(
         !events.exited.lock().unwrap().is_empty(),
-        "on_exited 必须回调"
+        "on_exited callback must fire"
     );
     drop(host);
     let _ = std::fs::remove_dir_all(&work);
@@ -341,14 +342,14 @@ fn failed_session_can_restart_after_work_dir_is_fixed() {
                 Some(SessionStatus::Failed(_))
             )
         }),
-        "启动失败必须进入 Failed"
+        "startup failure must enter Failed state"
     );
     assert!(
         !events.failed.lock().unwrap().is_empty(),
-        "启动失败必须回调 on_failed"
+        "startup failure must invoke on_failed"
     );
 
-    // 修复工作目录后立即重启（entry 可能仍在 join，start 会返回 AlreadyRunning）。
+    // Restart immediately after fixing work_dir (entry may still be joining -> AlreadyRunning).
     std::fs::remove_file(&blocked).unwrap();
     std::fs::create_dir_all(&blocked).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -359,12 +360,12 @@ fn failed_session_can_restart_after_work_dir_is_fixed() {
             Err(HostError::AlreadyRunning(_)) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(error) => panic!("Failed 后无法重启: {error}"),
+            Err(error) => panic!("failed to restart after Failed state: {error}"),
         }
     }
     assert!(
         wait_ready(&mut host, "dut-failed"),
-        "修复后未就绪：{:?}",
+        "session did not become ready after fixing work_dir: {:?}",
         host.view("dut-failed").map(|view| view.status())
     );
     host.stop("dut-failed");
@@ -407,16 +408,16 @@ fn mcp_unreachable_is_rejected_by_extension_validation() {
                 entries
                     .iter()
                     .any(|entry| entry["name"] == "duthub" && entry["success"] == false),
-                "不可达 MCP 的扩展结果必须失败：{}",
+                "unreachable MCP extension result must fail: {}",
                 session.extension_results
             );
             assert!(
                 validate_extension_results(&session.extension_results).is_err(),
-                "不可达 MCP 必须被启动强校验拒绝"
+                "unreachable MCP must be rejected by startup validation"
             );
         }
         Err(error) => {
-            // goose 也可能直接在 session/new 返回错误；两种路径都必须是失败。
+            // goose may also return an error directly from session/new; either path must fail.
             let text = error.to_string();
             assert!(
                 text.contains("MCP") || text.contains("mcp") || text.contains("session/new"),

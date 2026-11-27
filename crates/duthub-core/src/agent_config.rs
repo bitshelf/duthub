@@ -1,14 +1,14 @@
-//! `agents.json`（外部 Agent 注册表）与每 DUT 的 Agent 绑定。
+//! External Agent registry and its per-DUT bindings.
 //!
-//! - 注册表位置：`<work_dir>/agents.json`，带 `version`，原子写（同目录临时文件 +
-//!   fsync + rename）；解析失败时改名备份并以错误 fail closed（不静默回退默认值）。
-//! - 缺失文件生成默认注册表（goose，`program = null` 表示使用「工具下载」安装的副本）。
-//! - 文件里**不存 token/密钥**：`envKeys` 只存键名，值从 OS 密钥库
-//!   `duthub/acp/<id>/env/<KEY>` 读取（沿用 `keys.rs` 的 keyring service）。
-//! - 每 DUT 选择单独存 `<work_dir>/agent-bindings.json`，避免改动既有
-//!   `duts.json` 的 schema（`DutConfig` 不新增字段，旧配置逐字往返）。
+//! Store the versioned registry under the work directory.
+//! Persist it atomically and back up an invalid file before returning the parse error.
+//! Initialize a missing registry with the default goose entry.
+//! Store environment variable names only.
+//! Their values come from the system credential store under `acp/<id>/env/<KEY>`.
+//! Store DUT choices separately in `agent-bindings.json`.
+//! This preserves the existing DUT configuration schema.
 //!
-//! 本模块只做类型与持久化；程序解析/哈希/版本探测在桌面端
+//! This module handles data and persistence. The desktop probes executable metadata.
 //! `agent_host::registry`。
 
 use std::collections::{BTreeMap, HashSet};
@@ -51,6 +51,7 @@ pub fn is_reserved_env_key(key: &str) -> bool {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AgentConfigError {
     #[error("Agent 配置 I/O 失败: {0}")]
     Io(String),
@@ -60,7 +61,7 @@ pub enum AgentConfigError {
     Invalid(String),
 }
 
-/// Agent 接入形态（本轮只实现 ACP；`cli` 仅存储并明确拒绝启动）。
+/// Transport used to launch an Agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
@@ -78,14 +79,14 @@ impl AgentKind {
     }
 }
 
-/// 单条 Agent 定义。字段只描述程序与元数据，**不得**包含任何 token/密钥。
+/// Program metadata for one Agent. Credentials are stored separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDefinition {
     pub id: String,
     pub name: String,
     pub kind: AgentKind,
-    /// `null`/缺省 = 使用「工具下载」安装的 goose（仅 goose 允许）；外部程序写绝对路径。
+    /// A missing goose executable path uses the installed tool. External paths must be absolute.
     #[serde(default)]
     pub program: Option<String>,
     #[serde(default)]
@@ -122,7 +123,7 @@ fn default_trust_level() -> String {
 }
 
 impl AgentDefinition {
-    /// 默认 goose 条目（`program = null`，解析到下载安装或 PATH 上的 goose）。
+    /// The default goose entry resolves to an installed executable or one on PATH.
     #[must_use]
     pub fn goose() -> Self {
         Self {
@@ -145,7 +146,7 @@ impl AgentDefinition {
         self.id == DEFAULT_AGENT_ID
     }
 
-    /// 外部程序路径（空串视为未配置）。
+    /// External executable path. An empty string is treated as missing.
     pub fn program_path(&self) -> Option<&str> {
         self.program
             .as_deref()
@@ -160,7 +161,7 @@ impl Default for AgentDefinition {
     }
 }
 
-/// `agents.json` 根对象。
+/// Root object of the Agent registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentsFile {
@@ -199,7 +200,7 @@ impl AgentsFile {
         self.agent_mut(DEFAULT_AGENT_ID)
     }
 
-    /// 可启动的 ACP 条目（UI 下拉；`cli` 明确不列出，避免误选后启动才报错）。
+    /// List launchable ACP entries for the desktop selector.
     pub fn acp_agents(&self) -> impl Iterator<Item = &AgentDefinition> {
         self.agents
             .iter()
@@ -207,7 +208,7 @@ impl AgentsFile {
     }
 }
 
-/// 默认注册表（goose）。
+/// Build the default registry with its goose entry.
 #[must_use]
 pub fn default_agents() -> AgentsFile {
     AgentsFile::default()
@@ -223,7 +224,7 @@ pub fn agent_bindings_path(work_dir: &Path) -> PathBuf {
     work_dir.join(AGENT_BINDINGS_FILE_NAME)
 }
 
-/// 加载注册表；缺失时**生成**默认 `agents.json`，损坏时备份并返回错误。
+/// Load the registry, initialize a missing file, and report corrupt files after backing them up.
 pub fn load_agents(work_dir: &Path) -> Result<AgentsFile, AgentConfigError> {
     let path = agents_path(work_dir);
     let raw = match std::fs::read_to_string(&path) {
@@ -250,7 +251,7 @@ pub fn load_agents(work_dir: &Path) -> Result<AgentsFile, AgentConfigError> {
     }
 }
 
-/// 原子保存注册表；保存前做语义校验（重复 id / 非法键名等 fail closed）。
+/// Validate the registry and save it atomically.
 pub fn save_agents_atomic(work_dir: &Path, file: &AgentsFile) -> Result<(), AgentConfigError> {
     validate_agents(file)?;
     save_json_atomic(work_dir, &agents_path(work_dir), file)
@@ -365,13 +366,13 @@ fn validate_sha256(expected: &str) -> Result<(), AgentConfigError> {
     Ok(())
 }
 
-/// keyring 条目名：`acp/<agent id>/env/<KEY>`（service 固定 `duthub`）。
+/// Credential entry name under the duthub service.
 #[must_use]
 pub fn agent_env_entry(agent_id: &str, key: &str) -> String {
     format!("acp/{agent_id}/env/{key}")
 }
 
-/// 以可注入查询实现读取 Agent 环境变量（值只来自 keyring，不来自注册表）。
+/// Read Agent environment values using an injected credential lookup.
 pub fn load_agent_env_with<F>(
     agent: &AgentDefinition,
     lookup: F,
@@ -420,7 +421,7 @@ pub fn get_agent_env(agent_id: &str, key: &str) -> Result<Option<String>, AgentC
     get_agent_env_with(agent_id, key, crate::keys::get_raw_entry)
 }
 
-/// 可注入查询的 [`get_agent_env`]（W4b 的注册表编辑走同一校验）。
+/// Look up a single environment value using an injected reader.
 pub fn get_agent_env_with<F>(
     agent_id: &str,
     key: &str,
@@ -444,7 +445,7 @@ pub fn set_agent_env(agent_id: &str, key: &str, value: &str) -> Result<(), Agent
     set_agent_env_with(agent_id, key, value, crate::keys::set_raw_entry)
 }
 
-/// 可注入存储的 [`set_agent_env`]。
+/// Save an environment value using an injected writer.
 pub fn set_agent_env_with<F>(
     agent_id: &str,
     key: &str,
@@ -479,7 +480,7 @@ pub fn delete_agent_env(agent_id: &str, key: &str) -> Result<(), AgentConfigErro
     delete_agent_env_with(agent_id, key, crate::keys::delete_raw_entry)
 }
 
-/// 可注入删除的 [`delete_agent_env`]。
+/// Delete an environment credential using an injected remover.
 pub fn delete_agent_env_with<F>(
     agent_id: &str,
     key: &str,
@@ -498,7 +499,7 @@ where
     })
 }
 
-/// 每 DUT 的 Agent 选择（sidecar；`dut_id → agent_id`）。
+/// Per-DUT selection of an Agent ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentBindingsFile {
@@ -520,7 +521,7 @@ impl Default for AgentBindingsFile {
 }
 
 impl AgentBindingsFile {
-    /// 该 DUT 的 Agent id；未配置/空白回退默认 goose。
+    /// Return this DUT's Agent ID or the default goose entry.
     #[must_use]
     pub fn agent_id_for(&self, dut_id: &str) -> String {
         self.bindings
@@ -587,7 +588,7 @@ impl AgentBindingsFile {
     }
 }
 
-/// 加载每 DUT 绑定；缺失 → 默认（全部回退 goose），损坏 → 备份 + fail closed。
+/// Load the bindings. A missing file uses defaults and a corrupt file is backed up.
 pub fn load_agent_bindings(work_dir: &Path) -> Result<AgentBindingsFile, AgentConfigError> {
     let path = agent_bindings_path(work_dir);
     let raw = match std::fs::read_to_string(&path) {
@@ -654,7 +655,10 @@ mod tests {
         assert_eq!(file.agents.len(), 1);
         assert!(file.goose().is_some());
         assert!(file.goose().unwrap().program.is_none());
-        assert!(agents_path(&dir).is_file(), "缺失时必须生成 agents.json");
+        assert!(
+            agents_path(&dir).is_file(),
+            "agents.json must be generated when missing"
+        );
         assert_eq!(load_agents(&dir).unwrap(), default_agents());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -788,7 +792,10 @@ mod tests {
             "GOOSE_DISABLE_KEYRING",
         ] {
             assert!(is_reserved_env_key(key), "{key}");
-            assert!(validate_env_key(key).is_err(), "保留变量 {key} 必须拒绝");
+            assert!(
+                validate_env_key(key).is_err(),
+                "reserved env key {key} must be rejected"
+            );
         }
         assert!(validate_env_key("ACME_API_KEY").is_ok());
         assert!(!is_reserved_env_key("ACME_API_KEY"));
@@ -823,7 +830,7 @@ mod tests {
         .unwrap();
         assert!(store.lock().unwrap().is_empty());
 
-        // 保留变量与空值在触达存储前就被拒绝。
+        // Reject reserved keys and empty values before calling the credential store.
         let called = std::sync::atomic::AtomicBool::new(false);
         assert!(
             set_agent_env_with("acme", "PATH", "x", |_, _| {
@@ -849,7 +856,7 @@ mod tests {
         assert_eq!(reloaded.agent_id_for("dut-a"), "acme");
         assert_eq!(reloaded.agent_id_for("dut-b"), DEFAULT_AGENT_ID);
         assert_eq!(reloaded.agent_id_for("missing"), DEFAULT_AGENT_ID);
-        // goose 是默认值，不写冗余条目。
+        // Omit an explicit binding for the default goose entry.
         assert!(!reloaded.bindings.contains_key("dut-b"));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,8 +1,8 @@
-//! 传输：stdio（`rmcp::transport::io::stdio`）与 Streamable HTTP。
+//! MCP transports for stdio and Streamable HTTP.
 //!
-//! HTTP 默认只绑 loopback；宿主显式开启局域网（`agentAccess.lanAccess`）时绑定
-//! `0.0.0.0`，同一端口同时接受回环与局域网地址。非回环绑定必须开启 Bearer 认证。
-//! 认证关闭时 HTTP 统一拒绝。
+//! HTTP binds to loopback by default.
+//! Explicit LAN mode binds all IPv4 interfaces and requires Bearer authentication.
+//! HTTP requests are denied when authentication is disabled.
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -29,8 +29,8 @@ use crate::notify::UserNotifier;
 use crate::server::{McpServerCore, plan_mode_error, plan_tool_allowed};
 use crate::state::McpState;
 
-/// stdio 传输：阻塞直到客户端断开。由独立进程（bin duthub-mcp）调用。
-/// stdio 视为本地管理员（偏差 5）：McpServerCore 不接 `AccessContext`。
+/// Serve stdio until the client disconnects.
+/// The local stdio subprocess uses the administrator context.
 pub async fn serve_stdio(
     state: Arc<dyn McpState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -154,8 +154,8 @@ async fn limit_mcp_request_body(
     }
 }
 
-/// Streamable HTTP 的 axum Router（route /mcp）。宿主自行 bind + serve。
-/// 在没有认证上下文时拒绝 HTTP 请求。
+/// Construct the Streamable HTTP router for the host's listening socket.
+/// Requests are rejected when no authentication context is present.
 pub fn http_router(state: Arc<dyn McpState>, access: Option<Arc<AccessContext>>) -> axum::Router {
     http_router_on(state, access, None)
 }
@@ -168,8 +168,8 @@ pub fn http_router_on(
     http_router_for_listener(state, access, listener_id, None, None, None)
 }
 
-/// DUT 专用监听器的 Router（端到端测试/嵌入宿主用）。不接通知器：
-/// `notify_user` 只属于用户配置的监听器。
+/// Create a DUT-scoped router without the user notifier.
+/// User-configured listeners opt in to notifications separately.
 pub fn http_router_on_dut(
     state: Arc<dyn McpState>,
     access: Option<Arc<AccessContext>>,
@@ -179,10 +179,10 @@ pub fn http_router_on_dut(
     http_router_on_dut_with_notifier(state, access, listener_id, listener_dut, None)
 }
 
-/// DUT 专用监听器的 Router，可附加宿主的用户通知器。
+/// Create a DUT-scoped router with an optional user notifier.
 ///
-/// `notifier = Some(..)` 时该端点暴露 14 个工具（13 个只读 Plan + `notify_user`）；
-/// `None` 时维持 13 个，`notify_user` 既不出现在 `tools/list` 也不可调用。
+/// With a notifier, the listener adds the notification tool to the 13 Plan tools.
+/// Without one, the notification tool is neither advertised nor callable.
 pub fn http_router_on_dut_with_notifier(
     state: Arc<dyn McpState>,
     access: Option<Arc<AccessContext>>,
@@ -225,10 +225,10 @@ fn http_router_for_listener(
     router.layer(axum::middleware::from_fn(limit_mcp_request_body))
 }
 
-/// 已启动 HTTP 监听器的生命周期句柄：会话结束 / 关闭时先 `shutdown` 再 `join`，
-/// 释放端口与线程（T07）。
+/// Own a live HTTP listener.
+/// Signal shutdown before joining the thread to release the port.
 pub struct ListenerHandle {
-    /// 实际对客户端展示/可连接的地址（通配绑定替换为探测到的局域网 IPv4）。
+    /// Address shown to clients. Wildcard binds use the detected LAN address.
     pub endpoint: SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -244,8 +244,8 @@ impl std::fmt::Debug for ListenerHandle {
 }
 
 impl ListenerHandle {
-    /// 发送 shutdown 信号并等待服务线程退出。
-    /// 返回 `false` = 在 `timeout` 内 join 未完成（信号已发出，端口随后释放）。
+    /// Signal shutdown and wait for the service thread to exit.
+    /// False means the deadline elapsed after signaling the thread.
     #[must_use]
     pub fn shutdown_and_join_with_timeout(mut self, timeout: Duration) -> bool {
         if let Some(sender) = self.shutdown.take() {
@@ -267,17 +267,17 @@ impl ListenerHandle {
 
 impl Drop for ListenerHandle {
     fn drop(&mut self) {
-        // 未显式关闭就丢弃句柄：至少发出 shutdown 信号，避免线程无限期占用端口。
+        // Signal shutdown even when the owner drops the handle without joining.
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
         }
     }
 }
 
-/// 在已绑定（且校验过绑定策略）的 TCP listener 上启动 HTTP 服务线程。
+/// Start an HTTP service on a bound socket whose bind policy has been checked.
 ///
-/// `notifier = Some(..)` 时端点额外暴露 `notify_user`（仅供用户配置的监听器）；
-/// 桌面发起的 Agent 会话 listener 一律传 `None`。
+/// User-configured listeners may expose the user notification tool.
+/// Desktop-initiated Agent sessions omit the notifier.
 pub fn spawn_http_listener_on(
     listener: std::net::TcpListener,
     state: Arc<dyn McpState>,
@@ -326,10 +326,10 @@ pub fn spawn_http_listener_on(
     })
 }
 
-/// 绑定 `127.0.0.1:0`（临时端口）并启动 HTTP 服务线程（每会话 / 测试用）。
+/// Bind an ephemeral loopback port and start an HTTP service.
 ///
-/// 桌面发起的 Agent 会话走这条路径，因此永远不接通知器：`notify_user`
-/// 对它们不可见也不可调用。
+/// Desktop-initiated Agent sessions use this path without a user notifier.
+/// Their clients cannot list or call the user notification tool.
 pub fn spawn_http_listener_loopback(
     state: Arc<dyn McpState>,
     access: Option<Arc<AccessContext>>,
@@ -349,7 +349,7 @@ fn build_http_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| format!("MCP runtime 启动失败: {e}"))
 }
 
-/// 单一服务实现：阻塞版与带句柄版共用（保证路由/认证/日志形状一致）。
+/// Share routing, authentication, and logging between the blocking and managed server entry points.
 #[expect(
     clippy::too_many_arguments,
     reason = "one wiring call: server identity, transport options, endpoint and shutdown signal"
@@ -376,9 +376,7 @@ async fn serve_listener(
         .map_err(|e| format!("listener 迁移失败: {e}"))?;
     eprintln!(
         "[mcp] HTTP serving on {}",
-        listener
-            .local_addr()
-            .map_or_default(|a| a.to_string())
+        listener.local_addr().map_or_default(|a| a.to_string())
     );
     axum::serve(
         listener,
@@ -389,8 +387,8 @@ async fn serve_listener(
     .map_err(|e| format!("MCP HTTP 服务错误: {e}"))
 }
 
-/// 绑定策略：回环始终允许；非回环（含 `0.0.0.0` 通配）必须开启 Bearer 认证。
-/// 局域网模式由宿主显式绑定 `0.0.0.0`，认证关闭时这里 fail closed。
+/// Allow loopback binds and require Bearer authentication for other addresses.
+/// A wildcard bind requires the host to explicitly enable LAN access.
 pub fn assert_bind_allowed(addr: &SocketAddr, auth_enabled: bool) -> Result<(), String> {
     if addr.ip().is_loopback() || auth_enabled {
         return Ok(());
@@ -401,8 +399,8 @@ pub fn assert_bind_allowed(addr: &SocketAddr, auth_enabled: bool) -> Result<(), 
     ))
 }
 
-/// 对外展示地址：`0.0.0.0` 通配绑定替换为探测到的本机局域网 IPv4
-/// （探测失败回退 127.0.0.1）；具体地址原样返回。
+/// Replace an IPv4 wildcard with the detected LAN address for client display.
+/// Fall back to loopback when detection fails. Preserve concrete addresses.
 #[must_use]
 pub fn advertised_endpoint(addr: SocketAddr) -> SocketAddr {
     if !addr.ip().is_unspecified() {
@@ -464,11 +462,11 @@ mod tests {
         assert!(assert_bind_allowed(&loopback, false).is_ok());
         assert!(
             assert_bind_allowed(&lan, false).is_err(),
-            "局域网绑定必须要求认证"
+            "LAN bind must require authentication"
         );
         assert!(
             assert_bind_allowed(&wildcard, false).is_err(),
-            "通配绑定必须要求认证"
+            "wildcard bind must require authentication"
         );
         assert!(assert_bind_allowed(&lan, true).is_ok());
         assert!(assert_bind_allowed(&wildcard, true).is_ok());
@@ -513,7 +511,10 @@ mod tests {
         let wildcard: SocketAddr = "0.0.0.0:18797".parse().unwrap();
         let advertised = advertised_endpoint(wildcard);
         assert_eq!(advertised.port(), 18797);
-        assert!(!advertised.ip().is_unspecified(), "对外地址不能是 0.0.0.0");
+        assert!(
+            !advertised.ip().is_unspecified(),
+            "advertised address must not be 0.0.0.0"
+        );
 
         let loopback: SocketAddr = "127.0.0.1:18797".parse().unwrap();
         assert_eq!(advertised_endpoint(loopback), loopback);

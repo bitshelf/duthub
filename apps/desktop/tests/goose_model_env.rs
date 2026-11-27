@@ -1,7 +1,7 @@
-//! W2 验收：provider 环境变量真实生效（goose 用注入的 key/model/base URL 调用模型）。
+//! Verify that goose uses the provider credentials, model, and endpoint injected into its environment.
 //!
-//! 默认测试用本地假 OpenAI 兼容服务（离线、确定）；真实模型调用是 `#[ignore]`，
-//! 需要 owner 的 key（`DUTHUB_GOOSE_LIVE=1`）。
+//! Default tests use a local mock compatible with the `OpenAI` API. The live test is ignored
+//! by default and requires credentials and the `DUTHUB_GOOSE_LIVE` opt-in.
 #![cfg(windows)]
 
 use std::sync::{Arc, Mutex};
@@ -141,11 +141,11 @@ async fn chat_completions(
         .unwrap()
 }
 
-// ── 一个可达的假 MCP server（session/new 必须注入；完整 DiscoverResult 形状）──
+// -- Reachable fake MCP server (required by session/new; full DiscoverResult shape) --
 
 #[derive(Default)]
 struct McpRecorder {
-    _requests: Mutex<Vec<String>>,
+    requests: Mutex<Vec<String>>,
 }
 
 struct FakeMcp {
@@ -176,7 +176,7 @@ fn spawn_fake_mcp() -> FakeMcp {
 }
 
 async fn mcp_handler(State(recorder): State<Arc<McpRecorder>>, body: String) -> Response {
-    recorder._requests.lock().unwrap().push(body.clone());
+    recorder.requests.lock().unwrap().push(body.clone());
     let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let Some(id) = value.get("id") else {
         return StatusCode::ACCEPTED.into_response();
@@ -222,10 +222,7 @@ fn settings_with_catalog(base_url: &str) -> duthub_core::SettingsFile {
         base_url: base_url.into(),
         protocol: duthub_core::Provider::Openai,
         enabled: true,
-        models: vec![ProviderModel {
-            id: "fake-model".into(),
-            enabled: true,
-        }],
+        models: vec![ProviderModel::new("fake-model", true)],
     }];
     settings
 }
@@ -234,10 +231,11 @@ fn close(acp: AcpClient) {
     acp.close_stdin();
     let _ = acp.wait_timeout(Duration::from_secs(10));
     acp.kill();
+    drop(acp);
 }
 
 // ---------------------------------------------------------------------------
-// Test goose fixture (2026-11-24: goose is downloaded, no longer embedded)
+// Test goose fixture (goose is downloaded, not embedded)
 // ---------------------------------------------------------------------------
 
 /// `DUTHUB_TEST_GOOSE` (absolute path to a goose executable) wins, otherwise the
@@ -247,7 +245,7 @@ fn test_goose_program() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(raw);
         assert!(
             path.is_absolute() && path.is_file(),
-            "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+            "DUTHUB_TEST_GOOSE must be an absolute path to an existing goose executable: {}",
             path.display()
         );
         return Some(path);
@@ -260,8 +258,8 @@ fn test_goose_program() -> Option<std::path::PathBuf> {
 /// Loud skip: goose is no longer embedded, so ACP tests need an installed one.
 fn skip_without_goose() {
     eprintln!(
-        "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-         或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+        "SKIP: goose is not installed (goose is no longer embedded) — \
+         download goose from Tool Downloads or set DUTHUB_TEST_GOOSE to the goose executable"
     );
 }
 
@@ -295,12 +293,9 @@ fn provider_env_vars_drive_a_real_goose_turn() {
     assert!(env.contains(&("OPENAI_BASE_URL".into(), openai.base_url.clone())));
     assert!(env.contains(&("GOOSE_MODEL".into(), "fake-model".into())));
 
-    let exe = match test_goose_program() {
-        Some(exe) => exe,
-        None => {
-            skip_without_goose();
-            return;
-        }
+    let Some(exe) = test_goose_program() else {
+        skip_without_goose();
+        return;
     };
     let acp = AcpClient::spawn(&exe, &[], &paths.sandbox, &env, 64 * 1024).unwrap();
     acp.initialize(Duration::from_secs(20)).unwrap();
@@ -338,36 +333,36 @@ fn provider_env_vars_drive_a_real_goose_turn() {
     }
     assert!(
         done,
-        "真实 goose 未完成 prompt；stderr: {}\nprotocol: {protocol_errors:?}",
+        "real goose did not finish prompt; stderr: {}\nprotocol: {protocol_errors:?}",
         acp.stderr_tail()
     );
     assert!(
         chunks.contains("Hello from fake model"),
-        "未收到模型回复 chunks: {chunks:?}"
+        "model reply missing from chunks: {chunks:?}"
     );
     assert!(
         openai.recorder.has_model_call(&format!("Bearer {KEY}")),
-        "假 OpenAI 服务未收到带 Bearer key 的 /v1/chat/completions：{:?}",
+        "fake OpenAI server did not receive /v1/chat/completions with Bearer key: {:?}",
         openai.recorder.requests.lock().unwrap()
     );
     let stderr = acp.stderr_tail();
-    assert!(!stderr.contains(KEY), "stderr 泄漏 API key: {stderr}");
+    assert!(!stderr.contains(KEY), "stderr leaked API key: {stderr}");
 
     close(acp);
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// 真实模型调用（不计入门禁）：需要 owner 的 key。
+/// Live model call (excluded from gate): requires owner credentials.
 /// `DUTHUB_GOOSE_LIVE=1 DUTHUB_GOOSE_LIVE_PROVIDER=openai
 ///  DUTHUB_GOOSE_LIVE_BASE_URL=... DUTHUB_GOOSE_LIVE_MODEL=...
 ///  DUTHUB_GOOSE_LIVE_API_KEY=... cargo test -p duthub-desktop --test goose_model_env -- --ignored`
 #[test]
-#[ignore]
+#[ignore = "requires an installed Goose executable"]
 fn live_model_call() {
     assert_eq!(
         std::env::var("DUTHUB_GOOSE_LIVE").as_deref(),
         Ok("1"),
-        "需要 DUTHUB_GOOSE_LIVE=1 与 owner 的 key，未配置不得当作通过"
+        "requires DUTHUB_GOOSE_LIVE=1 and owner credentials; must not pass when unset"
     );
     let provider = std::env::var("DUTHUB_GOOSE_LIVE_PROVIDER")
         .ok()
@@ -386,12 +381,9 @@ fn live_model_call() {
     let paths = sandbox::prepare(&work, "dut-live").unwrap();
     model_env::write_config(&paths.goose_root).unwrap();
     let env = model_env::goose_env(&binding, &paths.goose_root).unwrap();
-    let exe = match test_goose_program() {
-        Some(exe) => exe,
-        None => {
-            skip_without_goose();
-            return;
-        }
+    let Some(exe) = test_goose_program() else {
+        skip_without_goose();
+        return;
     };
     let acp = AcpClient::spawn(&exe, &[], &paths.sandbox, &env, 64 * 1024).unwrap();
     acp.initialize(Duration::from_secs(20)).unwrap();
@@ -425,7 +417,10 @@ fn live_model_call() {
         std::thread::sleep(Duration::from_millis(100));
     }
     close(acp);
-    assert!(done, "真实模型调用未完成：{}", chunks);
-    assert!(!chunks.trim().is_empty(), "真实模型调用没有回复");
+    assert!(done, "live model call did not complete: {chunks}");
+    assert!(
+        !chunks.trim().is_empty(),
+        "live model call returned empty reply"
+    );
     let _ = std::fs::remove_dir_all(&work);
 }

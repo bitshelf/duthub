@@ -74,6 +74,7 @@ pub struct AuthContext<'a> {
 
 /// Authorization failures mapped one-to-one onto HTTP statuses by the router.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum AuthError {
     /// 401 — missing or invalid token.
     #[error("unauthorized")]

@@ -1,6 +1,10 @@
-use super::{Workbench, Palette, Context, IntoElement, Styled, div, px, ParentElement, StatefulInteractiveElement, AppContext, subtle, btn, SharedString, BtnVariant, Window, In, settings_panel, field, InteractiveElement, FlashPresetTest, Disableable, icon_btn, panel_head, settings_panel_with_header};
+use super::{
+    BtnVariant, Context, Disableable, FlashPresetTest, In, InteractiveElement, IntoElement,
+    Palette, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, Workbench,
+    btn, div, field, icon_btn, panel_head, px, settings_panel, settings_panel_with_header, subtle,
+};
 
-/// 烧录工具预设页（自设置独立成分类）。
+/// Pre-set page for burning tools (classified as a separate category).
 pub fn render_flash_tools(
     w: &mut Workbench,
     p: &'static Palette,
@@ -49,7 +53,11 @@ pub(crate) fn tool_install_controls(
     let busy = w.tool_installs.active(tool_id).is_some();
     let progress = w.tool_progress_view.get(tool_id).copied();
     let status = if busy {
-        if let Some(pct) = progress.and_then(|progress| progress_percent(progress.bytes, progress.total)) { crate::i18n::message("toolDownloading", &[("pct", &pct.to_string())]) } else {
+        if let Some(pct) =
+            progress.and_then(|progress| progress_percent(progress.bytes, progress.total))
+        {
+            crate::i18n::message("toolDownloading", &[("pct", &pct.to_string())])
+        } else {
             let bytes = format_bytes(progress.map_or(0, |progress| progress.bytes));
             crate::i18n::message("toolDownloadingBytes", &[("bytes", &bytes)])
         }

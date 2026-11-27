@@ -1,11 +1,16 @@
-//! Prompt 正则高亮（「串口」设置段消费端）——sermcp 式渲染期叠加层：
-//! 只读快照行文本，返回分段样式，由渲染层把分段染进行内 children。
-//! 不碰 RX/TX 数据流、不进 .log/审计（坑 #22 分层红线）。
+//! Prompt regular expression highlighting for "serial port" log segmentation consumption side ——
+//! sermcp-style rendering overlay layer:
+//! Read-only snapshot row text, returning segmented styles. The rendering layer processes the
+//! segments into internal children.
+//! Does not interfere with RX/TX data streams, and does not enter.log/audit (pit #22 hierarchical
+//! red line).
 //!
-//! 规则语义：按配置顺序生效，先到先得（与已收区间重叠的匹配整体丢弃）；
-//! 光标单元样式永远优先（反显块不被染色覆盖）。
+//! Rule semantics: Rules take effect in the order they are configured. The one that arrives first
+//! will be processed first (matches overlapping with already occupied intervals will be discarded).
+//! The style of the cursor unit always takes precedence over others (inverted blocks cannot be
+//! overwritten by other styles).
 
-/// 编译后的高亮规则（Workbench 按模式串缓存编译结果）。
+/// Compiled highlighting rules (Workbench caches the compilation results based on pattern strings).
 pub struct CompiledRule {
     pub regex: regex::Regex,
     pub color: String,
@@ -217,7 +222,8 @@ mod tests {
             .collect()
     }
 
-    /// prompt 行按规则染色：`root@rk3576:~#` 段拿规则色，命令部分保持默认。
+    /// The `prompt` line is colored according to the specified rules. The `root@rk3576:~#` section
+    /// uses a specific color scheme, while the command part remains unchanged.
     #[test]
     fn prompt_segment_gets_rule_color() {
         let compiled = rules(&[(r"[^ ]+@[^ :]+:.*[#\$]", "#edbe7a")]);
@@ -228,7 +234,7 @@ mod tests {
         assert!(!segments.iter().any(|s| s.is_cursor));
     }
 
-    /// 无匹配 → 单段原文默认色。
+    /// No match found → The default color of the original text is used.
     #[test]
     fn no_match_keeps_single_normal_segment() {
         let compiled = rules(&[(r"panic", "#ec8291")]);
@@ -238,7 +244,8 @@ mod tests {
         assert_eq!(segments[0].color, None);
     }
 
-    /// 多条规则按序生效、先到先得不重叠。
+    /// Multiple rules take effect in order, with the ones that arrive first taking precedence over
+    /// those that arrive later.
     #[test]
     fn rules_apply_in_order_without_overlap() {
         let compiled = rules(&[(r"root@host", "#a"), (r"root", "#b")]);
@@ -247,11 +254,12 @@ mod tests {
         assert_eq!(segments[0].color.as_deref(), Some("#a"));
     }
 
-    /// 光标单元反显优先：落在高亮区间内时该字符不被染色。
+    /// Priority for highlighting the cursor position: When the character is located within the
+    /// highlighted area, it will not be colored.
     #[test]
     fn cursor_cell_wins_over_highlight() {
         let compiled = rules(&[(r"abcdef", "#a")]);
-        // 光标在 idx=3（'d'）
+        // The cursor is located at idx=3 ('d')
         let segments = row_segments("abcdef", &compiled, Some(3));
         assert_eq!(texts(&segments), vec!["abc", "d", "ef"]);
         assert_eq!(segments[0].color.as_deref(), Some("#a"));
@@ -259,7 +267,8 @@ mod tests {
         assert_eq!(segments[2].color.as_deref(), Some("#a"));
     }
 
-    /// 光标越界（A1 修复的行尾虚拟空格）→ 补一段空格光标。
+    /// The cursor has crossed the boundary (fixed by row end virtual space in cell A1) → Add some
+    /// spaces to fill in the empty space around the cursor.
     #[test]
     fn cursor_beyond_text_becomes_virtual_space() {
         let compiled = rules(&[(r"x", "#a")]);
@@ -268,7 +277,7 @@ mod tests {
         assert!(segments[1].is_cursor);
     }
 
-    /// 中文宽字符按字符（非字节）分段。
+    /// Chinese wide characters are segmented by character (not byte).
     #[test]
     fn multibyte_text_splits_by_chars() {
         let compiled = rules(&[(r"中文", "#a")]);
@@ -276,13 +285,16 @@ mod tests {
         assert_eq!(texts(&segments), vec!["中文", "ok"]);
     }
 
-    // ---- 以下为 IO-7 不变量的补充锁定（行为面，不改既有六测） ----
+    // — Below is additional locking for the IO-7 invariants (behavioral aspects; no changes are
+    // made to the existing six tests.) —
 
-    /// 先到先得的「整体丢弃」语义：后规则与已收区间重叠时整个匹配弃用
-    ///（不是截断补染），区间外剩余文本保持默认色。
+    /// "First come, first served" approach for "total discard": When subsequent rules overlap with
+    /// the already processed areas, all matches are discarded. (No truncation or supplementary
+    /// coloring is performed.) Text remaining outside these areas remains in its default color.
     #[test]
     fn later_rule_overlapping_match_discarded_entirely() {
-        // 规则一 "bcd" 先收 [1,4)；规则二 "abcdef" 匹配 [0,6) 与之重叠 → 整体丢弃
+        // Rule 1: The pattern "bcd" matches the range [1,4). Rule 2: The pattern "abcdef" matches
+        // the range [0,6); both ranges overlap each other. Therefore, all matches are discarded.
         let compiled = rules(&[(r"bcd", "#b"), (r"abcdef", "#a")]);
         let segments = row_segments("abcdef", &compiled, None);
         assert_eq!(
@@ -310,7 +322,8 @@ mod tests {
         );
     }
 
-    /// 相邻同色区间（无间隔的两处命中）合并为单段。
+    /// Adjacent regions of the same color are merged into a single segment. This occurs when there
+    /// are no gaps between the two occurrences of the same color.
     #[test]
     fn adjacent_same_color_matches_merge() {
         let compiled = rules(&[(r"err", "#c")]);
@@ -318,11 +331,12 @@ mod tests {
         assert_eq!(cells(&segments), vec![("errerr", Some("#c"), false)]);
     }
 
-    /// 零宽匹配（`x*` 的空命中）不产生高亮区间，也不在真实命中之间插出
-    /// 空段或打断染色；真实命中照常染色。
+    /// Zero-width matches (i.e., empty hits of the `x*` pattern) do not result in any highlighted
+    /// regions. They also do not create any interruptions between actual hits. Empty segments or
+    /// breaks are not considered as valid hits. Actual hits are still treated as valid hits.
     #[test]
     fn zero_width_matches_never_highlight() {
-        // find_iter 对 "xax" 给出 "x"@0..1、""@1..1、"x"@2..3、""@3..3
+        // The find_iter function returns "x"@0..1, ""@1..1, "x"@2..3, ""@3..3 for the input "xax".
         let compiled = rules(&[(r"x*", "#a")]);
         let segments = row_segments("xax", &compiled, None);
         assert_eq!(
@@ -335,8 +349,10 @@ mod tests {
         );
     }
 
-    /// 光标落在高亮区间首/尾字符上：反显单元独立成段且不带规则色，
-    /// 区间其余部分各自保留规则色（样式优先级：光标 > 高亮 > 默认）。
+    /// The cursor is placed on the first/last character of the highlighted section: The
+    /// non-highlighted parts remain in their original color, while the highlighted parts are
+    /// displayed as separate segments without any specific color indication. The priority order for
+    /// styling is as follows: Cursor > Highlight > Default.
     #[test]
     fn cursor_at_highlight_edges_splits_range() {
         let compiled = rules(&[(r"abcdef", "#a")]);
@@ -352,8 +368,10 @@ mod tests {
         );
     }
 
-    /// 光标落在无高亮的普通字符上：恰好一个反显段（内容就是光标字符、
-    /// 无规则色），且两侧同色默认段不会横跨光标合并——反显块必须独立可见。
+    /// The cursor rests on an ordinary character without any highlighting. There is exactly one
+    /// inverted segment, which contains the character itself, along with segments of the same
+    /// color. These segments will not merge together around the cursor. The inverted segments must
+    /// be visible independently.
     #[test]
     fn cursor_on_plain_text_stays_isolated() {
         let compiled = rules(&[(r"nomatch", "#a")]);
@@ -364,8 +382,11 @@ mod tests {
         );
     }
 
-    /// 光标偏移按字符数收敛到行尾：`Some(len)`（行尾下一格）与更远的越界
-    /// 行为一致——正文段原样保留，末尾补一段单空格行尾虚拟空格反显。
+    /// The cursor offset converges towards the end of the line based on the number of characters
+    /// involved: `Some(len)` (one space away from the end of the line) and further beyond the
+    /// boundary. This behavior remains consistent—the main text segment is retained as it is, with
+    /// an additional single space added at the end to create a virtual space that can be visually
+    /// distinguished.
     #[test]
     fn cursor_at_end_and_beyond_both_get_virtual_space() {
         let compiled = rules(&[(r"x", "#a")]);
@@ -378,8 +399,9 @@ mod tests {
         }
     }
 
-    /// 空行：无光标时零分段（渲染层不画空 div）；有光标时只有一段单空格
-    /// 反显（空行光标同样走行尾虚拟空格）。
+    /// Blank lines: No cursor means zero log segmentation (no empty divs are drawn at the rendering
+    /// layer); with a cursor, there is only one single space.
+    /// Reverse display (blank line cursors also use virtual spaces at the end of the line).
     #[test]
     fn empty_line_segments() {
         let compiled = rules(&[(r".", "#a")]);
@@ -390,12 +412,14 @@ mod tests {
         );
     }
 
-    /// 多字节按字符（非字节）分段（强化版）：四字节 emoji 是一个光标单元，
-    /// 按字节切会把 emoji 撕进反显段——光标段必须包含完整字符。
+    /// Multi-byte segmentation by character (not byte-based) (enhanced version): A four-byte emoji
+    /// represents a single cursor unit. If segmented by bytes, the emoji will be split into
+    /// separate segments—the cursor segment must contain complete characters.
     #[test]
     fn multibyte_cursor_segment_keeps_whole_char() {
         let compiled = rules(&[(r"b", "#a")]);
-        // "a🎉b" = 3 个字符（'a'、'🎉'、'b'）；cursor_char=1 指向 emoji 本身
+        // "a🎉b" = 3 characters ('a', '🎉', 'b'); cursor_char is set to 1, indicating the emoji
+        // itself.
         let segments = row_segments("a🎉b", &compiled, Some(1));
         assert_eq!(
             cells(&segments),
@@ -423,13 +447,18 @@ mod tests {
         );
     }
 
-    /// 渲染期纯函数叠加的可观测契约：
-    /// ① 同一输入重复调用输出完全一致（无隐藏状态、无副作用积累）；
-    /// ② 分段拼接保全行文本——行内光标拼回原文，越界光标拼回原文 + 一个
-    ///    行尾虚拟空格。叠加层只读快照行文本、不改写内容，这正是「不碰
-    ///    RX/TX 数据流、不进 .log/审计」（坑 #22 分层红线）在本文件的可测
-    ///    面：纯函数签名（&str 入、Vec<Segment> 出、无 I/O）从结构上隔离
-    ///    数据流与日志，确定性 + 原文保全锁住「叠加」语义本身。
+    /// During the rendering period, the observable contract is achieved through pure function
+    /// superposition:
+    /// ① Repeated calls to the same input result in identical outputs (no hidden states, no side
+    /// effects accumulating);
+    /// ② The text within each segment is preserved—the cursor within a line is restored to its
+    /// original text, and the cursor beyond the boundary is restored to its original text plus one
+    /// additional virtual space at the end of the line. The overlay layer only reads snapshot text
+    /// without modifying the content. This is precisely what is meant by "not touching RX/TX data
+    /// streams, not entering .log/audit" (pit #22, hierarchical red line). In this document, it is
+    /// possible to measure this: Pure function signatures (input &str, output Vec<Segment>, no I/O)
+    /// structurally isolate the data stream from the logs, ensuring determinism while preserving
+    /// the original text and locking the "superposition" semantics.
     #[test]
     fn overlay_is_deterministic_and_preserves_text() {
         let compiled = rules(&[
@@ -453,7 +482,7 @@ mod tests {
                 assert_eq!(
                     cells(&segments),
                     cells(&again),
-                    "同输入两次调用结果不一致：line={line:?} cursor={cursor:?}"
+                    "The results of the two calls do not match: line={line:?} cursor={cursor:?}."
                 );
                 let joined: String = segments.iter().map(|s| s.text.as_str()).collect();
                 let expected = match cursor {
@@ -462,16 +491,18 @@ mod tests {
                 };
                 assert_eq!(
                     joined, expected,
-                    "分段拼接未保全行文本：line={line:?} cursor={cursor:?}"
+                    "Log segmentation: concatenating segments without preserving the original text of the lines: line={line:?} cursor={cursor:?}"
                 );
             }
         }
     }
 
-    /// 渲染期开销的机制性宽松上界：单行 ~4.7k 字符 × 4 条规则 × 20 次调用
-    /// 须在 1 秒内完成。真实成本是毫秒级，预算留百倍余量——只拦灾难性
-    /// 回溯或意外的非线性复杂度（高亮每帧每行都要跑，超界即渲染冻结），
-    /// 不是窄时序断言。
+    /// The mechanism-based relaxation upper bound for the rendering period: approximately 4.7k
+    /// characters per row × 4 rules × 20 calls. This must be completed within 1 second. The actual
+    /// cost is in milliseconds, and a budget of 100 times more is reserved—only catastrophic
+    /// backtracking or unexpected non-linear complexity should be encountered (highlighted: each
+    /// frame and each row requires processing, and rendering freezing occurs when the limit is
+    /// exceeded). This is not a narrow timing assertion.
     #[test]
     fn long_line_rendering_stays_cheap() {
         let compiled = rules(&[
@@ -485,7 +516,8 @@ mod tests {
         for _ in 0..100 {
             line.push_str(chunk);
         }
-        // 计时外先做一次正确性抽样：长行输出同样保全原文
+        // Perform a correctness test outside of the scheduled time: The same process applies for
+        // long-output scenarios.
         let probe = row_segments(&line, &compiled, None);
         let joined: String = probe.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined, line);
@@ -497,18 +529,20 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(1),
-            "长行渲染叠加超出宽松上界：20 次耗时 {elapsed:?}"
+            "Long rendering operations exceed the allowed upper limit of 20 times. Time taken: {elapsed:?}"
         );
     }
 
-    /// 内置默认规则必须可编译，并按 sermcp 语义给 prompt 分段上色
-    /// （user@host 绿、路径 蓝、行尾提示符 浅灰）。
+    /// The built-in default rules must be compileable, and the prompt should be segmented according
+    /// to the semantics of sermcp. The colors for user@host, paths, and prompt endings should be
+    /// light gray.
     #[test]
     fn default_rules_compile_and_color_prompt_parts() {
         let compiled: Vec<CompiledRule> = duthub_core::model::default_highlight_rules()
             .into_iter()
             .map(|rule| CompiledRule {
-                regex: regex::Regex::new(&rule.regex).expect("内置默认规则必须可编译"),
+                regex: regex::Regex::new(&rule.regex)
+                    .expect("Built-in default rules must be compileable."),
                 color: rule.color,
             })
             .collect();
@@ -517,30 +551,31 @@ mod tests {
             segments
                 .iter()
                 .any(|s| s.text == "root@rk3576" && s.color.as_deref() == Some("#7ec699")),
-            "user@host 应着绿色：{:?}",
+            "User@Host should be indicated in green: {:?}",
             cells(&segments)
         );
         assert!(
             segments
                 .iter()
                 .any(|s| s.text == ":/data" && s.color.as_deref() == Some("#56a8f5")),
-            "路径应着蓝色：{:?}",
+            "The paths should be marked in blue: {:?}",
             cells(&segments)
         );
-        // Android mksh 提示符：状态+host 绿色，行尾 `$ ` 着提示符色。
+        // Android mksh prompt: The status is green, and the `$` symbol at the end of the line
+        // indicates the prompt color.
         let android = row_segments("130|console:/ $ ", &compiled, None);
         assert!(
             android
                 .iter()
                 .any(|s| s.text.starts_with("130|console") && s.color.as_deref() == Some("#7ec699")),
-            "Android 状态+host 应着绿色：{:?}",
+            "The Android status should be displayed in green: {:?}",
             cells(&android)
         );
         assert!(
             android
                 .iter()
                 .any(|s| s.color.as_deref() == Some("#c8ccd4")),
-            "行尾提示符应着浅灰：{:?}",
+            "The end-of-line prompt should be displayed in a light gray color: {:?}",
             cells(&android)
         );
     }

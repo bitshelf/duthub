@@ -1,6 +1,7 @@
-//! `ListenerHandle` 生命周期回归（W1 / T07）：
-//! spawn 后可用 → shutdown + join 释放端口与线程；未显式关闭时 Drop 至少发
-//! shutdown 信号；runtime overlay 吊销后同一 listener 立即 401。
+//! `ListenerHandle` lifecycle regression (W1 / T07):
+//! usable after spawn -> shutdown + join releases the port and thread; `Drop` sends
+//! the shutdown signal when not shut down explicitly; revoking the runtime overlay
+//! immediately returns 401 on the same listener.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -91,7 +92,7 @@ async fn post_initialize(endpoint: SocketAddr, bearer: Option<&str>) -> Option<u
         .and_then(|status| status.parse().ok())
 }
 
-/// 服务线程启动与 accept 之间有竞争：重试到期限内拿到状态码。
+/// Race between server thread startup and accept: retry until a status code arrives before the deadline.
 async fn initialize_status(endpoint: SocketAddr, bearer: Option<&str>) -> u16 {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -100,13 +101,13 @@ async fn initialize_status(endpoint: SocketAddr, bearer: Option<&str>) -> u16 {
         }
         assert!(
             Instant::now() < deadline,
-            "listener 在 5s 内未开始接受连接: {endpoint}"
+            "listener did not begin accepting connections within 5s: {endpoint}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-/// shutdown/join 完成后端口必须可重新绑定（线程/端口回到基线）。
+/// The port must be re-bindable after shutdown/join completes (thread and port back to baseline).
 fn assert_port_released(endpoint: SocketAddr) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -116,7 +117,7 @@ fn assert_port_released(endpoint: SocketAddr) {
         }
         assert!(
             Instant::now() < deadline,
-            "关闭后端口未在 5s 内释放: {endpoint}"
+            "port was not released within 5s after shutdown: {endpoint}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -132,23 +133,23 @@ async fn spawned_listener_serves_shuts_down_and_releases_the_port() {
     let endpoint = handle.endpoint;
     assert!(endpoint.ip().is_loopback(), "{endpoint}");
 
-    // 无 Bearer / 错 Bearer → 401；会话 token → 放行到 rmcp。
+    // Missing or wrong Bearer -> 401; session token -> passes through to rmcp.
     assert_eq!(initialize_status(endpoint, None).await, 401);
     assert_eq!(initialize_status(endpoint, Some("dth-wrong")).await, 401);
     let status = initialize_status(endpoint, Some(&token)).await;
     assert!(
         status == 200 || status == 202,
-        "会话 token 必须通过 internal 认证（实际 {status}）"
+        "session token must pass internal authentication (got {status})"
     );
 
     assert!(
         handle.shutdown_and_join_with_timeout(Duration::from_secs(5)),
-        "shutdown 后必须能 join 服务线程"
+        "server thread must join after shutdown"
     );
     assert_port_released(endpoint);
 }
 
-/// 未显式调用 shutdown 时，Drop 也必须发出 shutdown 信号并释放端口。
+/// Even without an explicit shutdown call, `Drop` must signal shutdown and release the port.
 #[tokio::test]
 async fn dropping_the_handle_stops_the_listener() {
     let token = generate_token();
@@ -162,7 +163,7 @@ async fn dropping_the_handle_stops_the_listener() {
     assert_port_released(endpoint);
 }
 
-/// 吊销 runtime listener（先从 overlay 删除）→ 同一端口上的 token 立即 401。
+/// Revoking a runtime listener (removing it from the overlay) immediately returns 401 for its token.
 #[tokio::test]
 async fn revoked_runtime_listener_is_rejected_immediately() {
     let token = generate_token();
@@ -176,14 +177,14 @@ async fn revoked_runtime_listener_is_rejected_immediately() {
     assert_eq!(
         initialize_status(endpoint, Some(&token)).await,
         401,
-        "吊销后 token 必须立即失效"
+        "token must be rejected immediately after revocation"
     );
 
     assert!(handle.shutdown_and_join_with_timeout(Duration::from_secs(5)));
     assert_port_released(endpoint);
 }
 
-/// 多个 listener 可独立关闭：关掉一个不影响另一个，最终端口都回到基线。
+/// Multiple listeners shut down independently: stopping one does not affect the other, and both ports return to baseline.
 #[tokio::test]
 async fn multiple_listeners_shut_down_independently() {
     let first_token = generate_token();
@@ -209,7 +210,7 @@ async fn multiple_listeners_shut_down_independently() {
         401
     );
     assert!(first_handle.shutdown_and_join_with_timeout(Duration::from_secs(5)));
-    // 第一个已关闭，第二个仍可用。
+    // The first listener is shut down; the second remains available.
     assert_ne!(
         initialize_status(second_endpoint, Some(&second_token)).await,
         401

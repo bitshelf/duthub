@@ -1,4 +1,4 @@
-//! W2：agent_host 核心（bundle / sandbox / listener / transcript）集成测试。
+//! Integration tests for the Agent bundle, sandbox, listeners, and transcript.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -182,15 +182,15 @@ fn http_discover(port: u16, token: &str) -> std::io::Result<String> {
     Ok(response)
 }
 
-/// goose is installed from the tool downloads page since 2026-11-24: no bytes
-/// are compiled into duthub any more. `DUTHUB_TEST_GOOSE` (absolute path to a
+/// goose is installed from the tool downloads page: no bytes
+/// are compiled into duthub. `DUTHUB_TEST_GOOSE` (absolute path to a
 /// goose executable) wins, otherwise the product resolver decides.
 fn test_goose_program() -> Option<PathBuf> {
     if let Some(raw) = std::env::var_os("DUTHUB_TEST_GOOSE") {
         let path = PathBuf::from(raw);
         assert!(
             path.is_absolute() && path.is_file(),
-            "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+            "DUTHUB_TEST_GOOSE must point to an existing goose executable by absolute path: {}",
             path.display()
         );
         return Some(path);
@@ -203,8 +203,7 @@ fn test_goose_program() -> Option<PathBuf> {
 /// Loud skip: goose is no longer embedded, so ACP tests need an installed one.
 fn skip_without_goose() {
     eprintln!(
-        "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-         或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+        "SKIP: Goose is unavailable. Install it from Tool Downloads or set DUTHUB_TEST_GOOSE to the executable."
     );
 }
 
@@ -215,7 +214,7 @@ fn embedded_goose_assets_are_gone() {
     let assets = manifest_dir().join("assets").join("goose");
     assert!(
         !assets.exists(),
-        "内嵌 goose 资产目录必须删除: {}",
+        "The embedded goose asset directory must be absent: {}",
         assets.display()
     );
     for name in [
@@ -227,17 +226,17 @@ fn embedded_goose_assets_are_gone() {
     ] {
         assert!(
             !assets.join(name).exists(),
-            "内嵌资产 {name} 不得随仓库分发"
+            "Embedded asset {name} must be absent from the repository"
         );
     }
 
     // Source contract: the build must not re-embed a binary or a licence file.
     let source = std::fs::read_to_string(manifest_dir().join("src/agent_host/bundle.rs"))
-        .expect("读取 bundle.rs");
+        .expect("read bundle.rs");
     for forbidden in ["include_bytes!", "include_str!", "assets/goose"] {
         assert!(
             !source.contains(forbidden),
-            "bundle.rs 不得再内嵌资产（命中 {forbidden}）"
+            "bundle.rs must not embed assets: found {forbidden}"
         );
     }
 }
@@ -262,7 +261,7 @@ fn bundle_compat_accessors_report_not_embedded() {
     assert!(license.contains("上游发行包"), "{license}");
     assert!(
         !license.contains("TERMS AND CONDITIONS"),
-        "不得再内嵌 Apache 全文"
+        "The Apache license text should not be embedded here"
     );
 
     let notice = bundle::notice_text();
@@ -281,11 +280,11 @@ fn bundle_compat_accessors_report_not_embedded() {
 #[test]
 fn resolve_has_no_embedded_install_and_verifies_overrides() {
     let work = temp_dir("bundle");
-    let error = bundle::resolve(&work, None).expect_err("没有内嵌副本可解析");
+    let error = bundle::resolve(&work, None).expect_err("there is no bundled copy to resolve");
     assert!(error.to_string().contains("内嵌 goose 已移除"), "{error}");
     assert!(
         !work.join("agent").exists(),
-        "resolve 不得再往工作目录安装资产"
+        "resolve must not install assets into the work directory"
     );
 
     // External override: full SHA-256 recomputed at launch.
@@ -311,7 +310,7 @@ fn probe_version_of_the_installed_goose() {
             &line,
             duthub_desktop::agent_host::MIN_GOOSE_VERSION
         ),
-        "已安装 goose 的 --version 必须通过版本门槛：`{line}`"
+        "The installed goose must meet the version requirement: `{line}`"
     );
 }
 
@@ -328,12 +327,16 @@ fn locale_catalogs_have_identical_keys_and_about_copy() {
     };
     let zh = read("zh-CN.json");
     let en = read("en-US.json");
-    assert_eq!(zh.len(), en.len(), "locale 键数量必须一致");
+    assert_eq!(
+        zh.len(),
+        en.len(),
+        "Locales must have the same number of keys"
+    );
     for key in zh.keys() {
-        assert!(en.contains_key(key), "en-US 缺少 {key}");
+        assert!(en.contains_key(key), "en-US is missing {key}");
     }
     for key in en.keys() {
-        assert!(zh.contains_key(key), "zh-CN 缺少 {key}");
+        assert!(zh.contains_key(key), "zh-CN is missing {key}");
     }
     for key in ["aboutTitle", "gooseAuthenticodeNotSigned"] {
         for catalog in [&zh, &en] {
@@ -342,7 +345,7 @@ fn locale_catalogs_have_identical_keys_and_about_copy() {
                     .get(key)
                     .and_then(Value::as_str)
                     .is_some_and(|value| !value.is_empty()),
-                "缺少非空界面文案：{key}"
+                "Missing nonempty interface text: {key}"
             );
         }
     }
@@ -356,7 +359,7 @@ fn sandbox_prepare_uses_per_dut_layout() {
     assert!(paths.goose_root.is_dir());
     assert!(
         paths.temp.is_dir(),
-        "TEMP 目录必须位于 sandbox 下并预先创建"
+        "The TEMP directory must exist inside the sandbox"
     );
     assert!(paths.temp.starts_with(&paths.sandbox));
     assert!(
@@ -370,10 +373,10 @@ fn sandbox_prepare_uses_per_dut_layout() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// 子进程环境收敛（**路径收敛**，非 OS 强制边界）：
-/// - 不继承 `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HOME` 等用户目录键；
-/// - `TEMP`/`TMP` 指向该会话 sandbox 下的 `tmp/`，不是用户 `%TEMP%`；
-/// - 系统变量与调用方注入仍可用。
+/// Verify the child's scoped environment.
+/// User directory variables such as USERPROFILE and APPDATA are excluded.
+/// TEMP and TMP point into the session sandbox.
+/// System variables and permitted caller overrides remain available.
 #[cfg(windows)]
 #[test]
 fn acp_child_env_excludes_user_dirs_and_uses_sandbox_temp() {
@@ -388,7 +391,7 @@ fn acp_child_env_excludes_user_dirs_and_uses_sandbox_temp() {
         &paths.sandbox,
         &[
             ("DUTHUB_TEST_MARKER".into(), "1".into()),
-            // 调用方显式尝试覆盖 TEMP/TMP 也必须被沙箱路径压回去。
+            // Sandbox paths take precedence over explicit overrides of TEMP and TMP.
             (
                 "TEMP".into(),
                 std::env::temp_dir().to_string_lossy().into_owned(),
@@ -403,7 +406,7 @@ fn acp_child_env_excludes_user_dirs_and_uses_sandbox_temp() {
     .unwrap();
     assert!(
         acp.wait_timeout(Duration::from_secs(10)).unwrap().is_some(),
-        "cmd /c set 未退出"
+        "cmd /c set did not exit"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut output = String::new();
@@ -414,7 +417,10 @@ fn acp_child_env_excludes_user_dirs_and_uses_sandbox_temp() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(output.contains("TEMP="), "未捕获子进程环境：{output:?}");
+    assert!(
+        output.contains("TEMP="),
+        "The child environment was not captured: {output:?}"
+    );
     let env: HashMap<String, String> = output
         .lines()
         .filter_map(|line| {
@@ -426,7 +432,7 @@ fn acp_child_env_excludes_user_dirs_and_uses_sandbox_temp() {
     for key in ["USERPROFILE", "APPDATA", "HOME", "HOMEDRIVE", "HOMEPATH"] {
         assert!(
             !env.contains_key(key),
-            "子进程不得继承 {key}：{:?}",
+            "The child must not inherit {key}: {:?}",
             env.get(key)
         );
     }
@@ -436,37 +442,37 @@ fn acp_child_env_excludes_user_dirs_and_uses_sandbox_temp() {
     // and never inherits host `%LOCALAPPDATA%`.
     let local_app_data = env
         .get("LOCALAPPDATA")
-        .expect("LOCALAPPDATA 必须指向沙箱单元");
+        .expect("LOCALAPPDATA must be set to the sandbox cell");
     let expected_local_app_data = paths.sandbox.join("home").join("AppData").join("Local");
     assert!(
         PathBuf::from(local_app_data).starts_with(&expected_local_app_data),
-        "LOCALAPPDATA 必须位于 sandbox/home/AppData/Local 下，实际: {local_app_data}"
+        "LOCALAPPDATA must be inside sandbox/home/AppData/Local: {local_app_data}"
     );
     if let Some(host_local) = std::env::var_os("LOCALAPPDATA") {
         assert_ne!(
             PathBuf::from(local_app_data),
             PathBuf::from(host_local),
-            "LOCALAPPDATA 不得继承宿主用户目录"
+            "LOCALAPPDATA must not inherit the host user directory"
         );
     }
-    let temp = env.get("TEMP").expect("TEMP 必须注入");
-    let tmp = env.get("TMP").expect("TMP 必须注入");
+    let temp = env.get("TEMP").expect("TEMP must be set");
+    let short_temp = env.get("TMP").expect("TMP must be set");
     // Windows PSEC may redirect TEMP/TMP to `<LOCALAPPDATA>\Packages\sandbox.<guid>\AC\Temp`
     // beneath the cell root; both remain strictly confined inside `paths.sandbox`.
     assert!(
         PathBuf::from(temp).starts_with(&paths.sandbox),
-        "TEMP 必须位于 sandbox 单元内，实际: {temp}"
+        "TEMP must be inside the sandbox cell: {temp}"
     );
     assert!(
-        PathBuf::from(tmp).starts_with(&paths.sandbox),
-        "TMP 必须位于 sandbox 单元内，实际: {tmp}"
+        PathBuf::from(short_temp).starts_with(&paths.sandbox),
+        "TMP must be inside the sandbox cell: {short_temp}"
     );
     assert_ne!(
         PathBuf::from(temp),
         std::env::temp_dir(),
-        "TEMP 不得继承用户临时目录"
+        "TEMP must not inherit the user temporary directory"
     );
-    assert!(paths.temp.is_dir(), "TEMP 目录必须已创建");
+    assert!(paths.temp.is_dir(), "The TEMP directory must exist");
 
     for key in [
         "PATH",
@@ -478,12 +484,15 @@ fn acp_child_env_excludes_user_dirs_and_uses_sandbox_temp() {
         "PROCESSOR_ARCHITECTURE",
         "NUMBER_OF_PROCESSORS",
     ] {
-        assert!(env.contains_key(key), "缺少系统变量 {key}: {env:?}");
+        assert!(
+            env.contains_key(key),
+            "Missing system environment variable {key}: {env:?}"
+        );
     }
     assert_eq!(
         env.get("DUTHUB_TEST_MARKER").map(String::as_str),
         Some("1"),
-        "调用方注入的 env 必须保留"
+        "Caller-supplied environment variables must be preserved"
     );
 
     acp.close_stdin();
@@ -520,7 +529,7 @@ fn session_listener_authenticates_scoped_token_and_revokes() {
     assert!(auth.is_runtime_listener(&id));
     listener::revoke(listener, &auth);
     assert!(!auth.is_runtime_listener(&id));
-    // 吊销后 token 已不在 overlay：新连接只能 401 或直接连接失败，绝不再成功。
+    // After revocation, a new connection must fail authentication or fail to connect.
     if let Ok(response) = http_discover(port, &token) {
         assert!(
             response.starts_with("HTTP/1.1 401"),
@@ -544,7 +553,7 @@ fn goose_binding_and_env_do_not_expose_key_in_debug() {
     assert!(env.contains(&("GOOSE_MODEL".into(), "fake-model".into())));
     assert!(
         env.contains(&("GOOSE_MODE".into(), "approve".into())),
-        "F1：GOOSE_MODE 必须是 approve"
+        "GOOSE_MODE must be approve"
     );
     assert!(env.contains(&(
         "GOOSE_PATH_ROOT".into(),
@@ -574,7 +583,7 @@ fn acp_client_emits_exited_event_after_process_end() {
         if acp.try_wait().unwrap().is_some() {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "进程未退出");
+        assert!(std::time::Instant::now() < deadline, "Process did not exit");
         std::thread::sleep(Duration::from_millis(20));
     }
     let events = acp.drain();
@@ -582,7 +591,7 @@ fn acp_client_emits_exited_event_after_process_end() {
         events
             .iter()
             .any(|event| matches!(event, AcpEvent::Exited(Some(0)))),
-        "缺少 Exited 事件: {events:?}"
+        "Missing Exited event: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&cwd);
 }
@@ -591,10 +600,10 @@ fn acp_client_emits_exited_event_after_process_end() {
 fn acp_client_rejects_missing_working_directory() {
     // The cwd check must fire before the program is looked at, so the program
     // path only has to exist (the embedded goose binary is gone).
-    let exe = std::env::current_exe().expect("测试自身可执行文件");
-    let error = match AcpClient::spawn(&exe, &[], Path::new("Z:\\duthub-missing-cwd"), &[], 4096) {
-        Ok(_) => panic!("不存在的 cwd 必须拒绝"),
-        Err(error) => error,
+    let exe = std::env::current_exe().expect("locate the current test executable");
+    let Err(error) = AcpClient::spawn(&exe, &[], Path::new("Z:\\duthub-missing-cwd"), &[], 4096)
+    else {
+        panic!("The client must reject a missing working directory");
     };
     assert!(error.to_string().contains("工作目录不存在"));
 }

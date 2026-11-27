@@ -1,13 +1,16 @@
-//! 每 DUT 一个 Agent 进程的会话宿主（W2）。
+//! Each DUT requires a session host for the agent process (W2).
 //!
-//! - [`HostManager::start`] 是默认 goose 的便捷接口；[`HostManager::start_with_agent`]
-//!   接受 `agents.json` 中的任意 ACP 定义（外部 goose 路径在这里真正进入启动链）。
-//! - [`HostManager::start`] **立即**返回；解包/校验/initialize/session-new 都在
-//!   工作线程完成。
-//! - [`HostManager::stop`] 在 UI 线程只做：吊销 token、置停止意图、cancel +
-//!   关 stdin；等待/杀进程树在工作线程。
-//! - 工作线程 watchdog：有未完成 prompt 且 10 分钟无任何 ACP 事件 →
-//!   `Failed` 并停止（不自动重启）。
+//! - [`HostManager::start`] is a convenient interface provided by the default Goose framework.
+//!   [`HostManager::start_with_agent`] accepts any ACP definitions defined in `agents.json` (these
+//!   files are part of the overall startup process).
+//! - [`HostManager::start`] returns results immediately. Operations such as unpacking,
+//!   verification, initialization, and session management are all completed within the worker thread.
+//! - [`HostManager::stop`] is handled solely by the UI thread: it cancels tokens, sets the system
+//!   into a stopped state, cancels processes, and closes stdin. It waits for the worker thread to
+//!   complete tasks related to killing processes.
+//! - For worker threads involving watchdog mechanisms: if there are still unfinished tasks
+//!   remaining, and no ACP events occur within 10 minutes, then the operation is considered "Failed",
+//!   and the thread is stopped (without automatic restarting).
 //! - W2b restart policy: a worker that reached `Ready` and then exited on its
 //!   own is restarted at most three times inside ten minutes (1s/2s/4s
 //!   backoff, see [`duthub_core::restart`]). An explicit stop cancels a pending
@@ -71,7 +74,8 @@ mod recovery {
     }
 }
 
-/// 有未完成 prompt 时允许的最长无事件时间（F24：10 分钟）。
+/// The maximum duration without any events allowed when there are unfinished prompts pending
+/// processing (F24: 10 minutes).
 pub const PROMPT_HANG_TIMEOUT: Duration = Duration::from_mins(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,7 +83,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Resumed sessions must still expose the duthub MCP tools; bound the probe.
 const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-/// UI → 工作线程命令队列容量。UI 只用 `try_send` 投递，永不阻塞渲染线程（F4）。
+/// UI → Capacity of the worker thread command queue. The UI interface uses `try_send` to send
+/// messages, ensuring that the rendering thread remains unblocked at all times (press F4).
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 
 pub trait HostEvents: Send + Sync {
@@ -114,7 +119,7 @@ impl std::error::Error for HostError {}
 /// Where a new session takes its model binding from.
 ///
 /// `FromSettings` resolves the same provider/model/key chain as the
-/// 「Agent 模型」page (an explicit selection wins); it is ignored for Agents
+/// "Agent Model" page (a deliberate choice of option); it is ignored for agents.
 /// that bring their own credentials. `Resolved` is used by tests and callers
 /// that already hold a key. `None` means "this Agent authenticates itself".
 #[derive(Debug)]
@@ -201,12 +206,13 @@ struct WorkerContext {
     last_activity_ms: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
-    /// 测试专用：覆盖每会话 listener URL（负向用例注入不可达 MCP）；
-    /// 产品路径恒为 `None`。
+    /// For testing purposes only: The listener URL is used for each session (negative scenarios
+    /// involve injecting inaccessible MCP);
+    /// The product path remains "`None`".
     mcp_url_override: Option<String>,
 }
 
-/// 每 DUT 一个 goose 进程的宿主。
+/// Each DUT serves as the host for one goose process.
 pub struct HostManager {
     work_dir: PathBuf,
     state: Arc<dyn McpState>,
@@ -246,11 +252,12 @@ impl HostManager {
         }
     }
 
-    /// 启动 DUT 的默认 goose Agent 会话（兼容既有调用方/测试）。
+    /// Launch the default Goose Agent session for the DUT (compatible with existing callers/tests).
     ///
-    /// 若 `<work_dir>/agents.json` 的 goose 条目配置了外部程序，这里同样采用它
-    /// （与 UI 路径一致）；注册表损坏/不可读时回退内嵌 goose（fail closed：
-    /// 不执行任何未经过哈希校验的外部条目）。
+    /// If the "goose" entry in `<work_dir>/agents.json` contains a reference to an external
+    /// program, then this method will also be used (similar to the UI path). In case the registry
+    /// becomes corrupted or unreadable, the internal goose mechanism will be used instead (fail
+    /// closed: no processing of any external entries that haven't been verified using hashing).
     pub fn start(&mut self, dut_id: &str, binding: GooseBinding) -> Result<(), HostError> {
         let agent = duthub_core::agent_config::load_agents(&self.work_dir)
             .ok()
@@ -287,8 +294,14 @@ impl HostManager {
         self.start_with_agent(dut_id, binding, agent)
     }
 
-    /// 按 `agents.json` 的 Agent 定义启动会话；`binding = None` 表示该 Agent 自带
-    /// 模型认证（仅 non-goose 允许；goose 启动前必须解析出模型绑定）。
+    /// Start the session based on the Agent definitions in `agents.json`. Setting `binding = None`
+    /// indicates that this Agent comes with a built-in model authentication mechanism. This feature
+    /// is available only for non-"goose" agents. For "goose" agents, it's necessary to configure
+    /// the model bindings before starting the agent.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Keep the existing public launch API"
+    )]
     pub fn start_with_agent(
         &mut self,
         dut_id: &str,
@@ -299,11 +312,13 @@ impl HostManager {
         if dut_id.is_empty() {
             return Err(HostError::Invalid("DUT id 为空".into()));
         }
-        // CLI 在 UI 线程立即拒绝，避免用户点启动后才在工作线程看到错误。
+        // The CLI is rejected immediately by the UI thread, preventing users from encountering
+        // errors after clicking "Start" and until the work thread processes the request.
         registry::ensure_launchable(&agent)
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        // F19：start 内统一 trim + 校验协议/Base URL/模型/密钥，legacy 调用方
-        // （非目录路径）也不能绕过协议白名单。
+        // F19: During the start process, all elements such as trimming, protocol verification, Base
+        // URL, models, and keys must be standardized. For legacy callers, (non-directory paths)
+        // cannot bypass the protocol allowlist either.
         let binding = binding
             .as_ref()
             .map(model_env::normalize_binding)
@@ -314,8 +329,10 @@ impl HostManager {
                 "goose 会话需要模型绑定：请先在「Agent 模型」中保存 provider/model/Token".into(),
             ));
         }
-        // F8：先回收已结束且工作线程已 join 的旧记录；线程仍在收尾时保留 entry，
-        // 同 DUT 任意时刻只允许一个 Agent（否则快速重启会出现两个进程共享
+        // F8: First, the old records that have been completed and whose worker threads have joined
+        // have been discarded. Entries that are still in process of being finalized will be
+        // retained. At any given moment, only one agent is allowed to operate on the DUT
+        // (otherwise, rapid restarts could result in two processes sharing resources).
         // GOOSE_PATH_ROOT）。
         self.remove_finished(dut_id);
         if self.sessions.contains_key(dut_id) {
@@ -436,8 +453,10 @@ impl HostManager {
         Ok(())
     }
 
-    /// UI 线程停止：吊销 token、置停止意图、投递 Stop；不做任何 stdin 写入、
-    /// 不等线程、不杀树（F4）。cancel + close stdin + 等待/杀进程树都在工作线程。
+    /// UI thread stopped: Token revoked, stop intention set, process terminated. No further actions
+    /// are taken regarding stdin writing, waiting for other threads to complete, or killing the
+    /// process tree (using F4). All operations such as canceling, closing stdin, and
+    /// waiting/terminating the process tree are performed within the working thread.
     pub fn stop(&mut self, dut_id: &str) {
         let Some(session) = self.sessions.get(dut_id) else {
             return;
@@ -450,7 +469,8 @@ impl HostManager {
             return;
         }
         session.stop_flag.store(true, Ordering::Relaxed);
-        // F3：只把非终止态改成 Stopping；工作线程可能刚把它置为 Failed/Stopped。
+        // F3: Only changes the state from non-terminating to "Stopping". It's possible that the
+        // worker thread has been set to "Failed/Stopped" earlier.
         session
             .view
             .try_transition_if(|status| !status.is_terminal(), SessionStatus::Stopping);
@@ -458,7 +478,8 @@ impl HostManager {
         if let Some(listener) = session.listener_slot.lock().unwrap().take() {
             listener::revoke(listener, &self.auth);
         }
-        // 有界队列；即使队列已满，stop_flag 也会让工作线程在下一轮退出。
+        // Contiguous queues: Even when the queue is full, the stop_flag allows the worker threads
+        // to exit during the next round.
         let _ = session.tx.try_send(WorkerCommand::Stop);
         self.dirty.store(true, Ordering::Relaxed);
     }
@@ -495,7 +516,8 @@ impl HostManager {
         StopJoin::Joined
     }
 
-    /// 取消当前轮（不终止进程）；UI 只投递命令，stdin 写入在工作线程（F4）。
+    /// Cancel the current round (do not terminate the process); UI will only send commands, while
+    /// stdin will be written to the worker thread (F4).
     pub fn cancel(&mut self, dut_id: &str) {
         let Some(session) = self.sessions.get(dut_id) else {
             return;
@@ -510,7 +532,8 @@ impl HostManager {
         }
     }
 
-    /// 发送 prompt（仅 Ready）；完成经 [`HostManager::view`] 的 transcript/status 观察。
+    /// Sending prompts (only for Ready states). Completed observation of transcripts and statuses
+    /// via [`HostManager::view`).
     pub fn prompt(&mut self, dut_id: &str, text: &str) -> Result<(), HostError> {
         let Some(session) = self.sessions.get(dut_id) else {
             return Err(HostError::NotRunning(dut_id.to_owned()));
@@ -524,7 +547,8 @@ impl HostManager {
         if session.view.session_id().is_none() && !session.is_cli {
             return Err(HostError::NotReady(dut_id.to_owned()));
         }
-        // F3：Ready → Busy 用 CAS；stop 并发把状态改成 Stopping/终止态时不得覆盖。
+        // F3: Ready → Busy. When using CAS, it is necessary to avoid overwriting the state during
+        // the transition from Ready to Stopping/terminated state.
         let current = session.view.status();
         if !session
             .view
@@ -542,7 +566,8 @@ impl HostManager {
                 self.dirty.store(true, Ordering::Relaxed);
                 Ok(())
             }
-            // 投递失败：把状态还原为 Ready，避免会话卡在 Busy。
+            // Delivery failed: Restore the status to Ready, so as to prevent sessions from getting
+            // stuck in the Busy state.
             Err(TrySendError::Full(_)) => {
                 session
                     .view
@@ -558,7 +583,8 @@ impl HostManager {
         }
     }
 
-    /// Arc 视图（不每帧克隆 transcript Vec；渲染层锁 `view.transcript`）。
+    /// Arc view (does not clone the transcript Vec per frame; rendering layer locks
+    /// `view.transcript`).
     #[must_use]
     pub fn view(&self, dut_id: &str) -> Option<Arc<SessionView>> {
         self.sessions
@@ -566,7 +592,8 @@ impl HostManager {
             .map(|session| session.view.clone())
     }
 
-    /// 本次会话实际解析到的程序/参数/环境（外部 goose 是否被采用）。
+    /// The programs/parameters/environments actually parsed during this session (including whether
+    /// the external "goose" was utilized).
     #[must_use]
     pub fn launch(&self, dut_id: &str) -> Option<AgentLaunchSpec> {
         self.sessions
@@ -574,10 +601,14 @@ impl HostManager {
             .and_then(|session| session.launch.lock().unwrap().clone())
     }
 
-    /// 回收已结束的工作线程；返回自上次 tick 后是否有状态变化。
+    /// Recycling of completed worker threads; indicating whether there has been any changes in
+    /// their status since the last tick.
     ///
-    /// F3/F8 对账：`join` 完成时若会话仍是非终止态（工作线程 panic 或异常返回），
-    /// 兜底置 Failed；终止态的 entry 保留到下一次 `start` 时再回收（UI 需要显示）。
+    /// F3/F8 reconciliation: If the session remains in an non-terminating state after the `join`
+    /// operation is completed (due to work thread panics or other exceptions), it will be marked as
+    /// failed. Entries that are in a terminating state will be retained until the next `start`
+    /// operation, at which time they can be reclaimed (this information needs to be displayed in
+    /// the UI).
     pub fn tick(&mut self) -> bool {
         let mut reconciled: Vec<(String, String)> = Vec::new();
         for (dut_id, session) in &mut self.sessions {
@@ -613,17 +644,20 @@ impl HostManager {
         dirty || !reconciled.is_empty()
     }
 
-    /// 标记视图/工作线程已结束（供 UI 使用）；不改变会话记录。
+    /// Mark the view/work thread as completed (for UI purposes); does not affect session records.
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
-    /// 仅在「会话已终止且工作线程已 join」时回收 entry；线程仍在收尾时保留，
-    /// 避免快速重启出现两个 goose 共享同一 `GOOSE_PATH_ROOT（F8`）。
+    /// Entries are only reclaimed when the session has been terminated and the worker thread has
+    /// completed its tasks. Threads continue to be retained until they are actually finished
+    /// processing tasks. This prevents situations where two processes share the same
+    /// `GOOSE_PATH_ROOT(F8)` during rapid restarts.
     fn remove_finished(&mut self, dut_id: &str) -> bool {
         let finished = self.sessions.get(dut_id).is_some_and(|session| {
             session.view.status().is_terminal()
-                // `join == None` 表示 tick 已 join 过，同样算收尾完成。
+                // `join == None` indicates that the tick has already been joined. In this case, the
+                // process is considered to be completed.
                 && session.join.as_ref().is_none_or(JoinHandle::is_finished)
         });
         if !finished {
@@ -696,7 +730,8 @@ fn run_worker(context: &WorkerContext, rx: &Receiver<WorkerCommand>) {
         }
     }
     cleanup_attempt(context);
-    // F3 兜底：任何异常返回路径都必须留下终止态，否则会话永远无法重启。
+    // F3 fallback: Any abnormal return paths must result in a termination state. Otherwise, the
+    // session will never be able to be restarted.
     if !context.view.status().is_terminal() {
         let message = "Agent 工作线程意外结束".to_owned();
         context
@@ -788,12 +823,14 @@ fn run_attempt(
         // GOOSE_PROVIDER/OPENAI_BASE_URL and redirect the model binding.
         merge_model_env(&launch.env, model)?
     } else {
-        // 调用方显式声明该 Agent 自带认证：只注入它自己的 keyring 环境变量，
-        // 不把 duthub 模型 Token 传给第三方程序。
+        // The caller explicitly declares that this agent uses self-authentication. It only injects
+        // its own keyring environment variables, and does not pass the Duthub model token to
+        // third-party applications.
         launch.env.clone()
     };
-    // 产品路径：每会话 loopback listener + 只读 Token。
-    // 测试路径（mcp_url_override）直接使用注入 URL，不注册 listener。
+    // Product path: Loopback listener for each session + read-only token.
+    // The test path (mcp_url_override) uses the injected URL directly, without registering any
+    // listeners.
     let (port, token, url) = if let Some(url) = &context.mcp_url_override {
         (None, "dth-test-token".to_owned(), url.clone())
     } else {
@@ -913,7 +950,8 @@ fn run_attempt(
     if let Some(port) = port {
         context.view.set_port(port);
     }
-    // 用户可能在启动期间已点停止：不得把 Stopping 覆盖成 Ready。
+    // It is possible that the user has already chosen to stop the process during initialization. Do
+    // not change the state from "Stopping" to "Ready".
     let ready_reached = context
         .view
         .try_transition(&SessionStatus::Starting, SessionStatus::Ready);
@@ -937,8 +975,9 @@ fn run_attempt(
     let mut stop_requested = false;
     let mut terminal_failure = false;
     loop {
-        // UI stop 只置 flag + 投递命令；即使 Stop 命令因队列满被丢弃，
-        // 这里也会在下一轮退出（F4）。
+        // The UI "stop" function simply sets a flag and executes the corresponding command. Even if
+        // the "stop" command is discarded due to a full queue, it will still be executed in the
+        // next iteration (F4).
         if context.stop_flag.load(Ordering::Relaxed) {
             stop_requested = true;
         }
@@ -1054,13 +1093,16 @@ fn run_attempt(
                         TranscriptEntry::error(message.clone()),
                     );
                     context.dirty.store(true, Ordering::Relaxed);
-                    // 关键事件队列溢出属于 fail closed：无论是否在等 prompt 都终止。
+                    // The key event queue overflow situation is treated as a failure condition: The
+                    // process will be terminated, regardless of whether it is waiting for a prompt
+                    // or not.
                     let critical_overflow = message.starts_with(CRITICAL_OVERFLOW_PREFIX);
                     if critical_overflow || context.pending.swap(false, Ordering::Relaxed) {
                         fatal = Some(message);
                     }
                 }
-                // 退出统一由下方 `try_wait` 分支处理（同时负责 on_exited 与收尾）。
+                // The exit process is handled by the `try_wait` branch below. This branch is also
+                // responsible for handling the on_exited and cleanup operations.
                 AcpEvent::Exited(_) => {}
             }
         }
@@ -1072,7 +1114,8 @@ fn run_attempt(
 
         if let Some(code) = acp.try_wait().map_err(|error| error.to_string())? {
             context.view.set_stderr_tail(acp.stderr_tail());
-            // 用户主动停止时，进程退出码（可能是 kill 产生的非 0）不算失败。
+            // When the user actively stops the process, the process exit code (which may not be 0,
+            // as generated by the kill command) is not considered a failure.
             let stopping = context.stop_flag.load(Ordering::Relaxed)
                 || context.view.status() == SessionStatus::Stopping;
             if code != 0 && !stopping {
@@ -1136,8 +1179,9 @@ fn run_attempt(
     let status = acp
         .wait_timeout(STOP_TIMEOUT)
         .map_err(|error| error.to_string())?;
-    // 即使主进程已正常退出，也要 TerminateJobObject 清理同一 Job 内残留的
-    // 孙进程；句柄由 SandboxedProcess 的 Drop 关闭。
+    // Even if the main process has successfully terminated, it is still necessary to use
+    // TerminateJobObject to clean up any remaining child processes within that job. The handles are
+    // closed by the Drop method of the SandboxedProcess object.
     acp.kill();
     let code = status;
     context.view.set_stderr_tail(acp.stderr_tail());
@@ -1156,8 +1200,9 @@ fn run_attempt(
     })
 }
 
-/// 失败并上报一次；只把非终止态改为 Failed（F3），已被 stop 置为 Stopping
-/// 或已终止时不再覆盖/重复上报。
+/// If a failure occurs, report the issue once. Only change the status from "Not Terminated" to
+/// "Failed" (F3). If the process has already been stopped or terminated, no further reporting will
+/// be performed.
 fn fail_session(context: &WorkerContext, message: &str) {
     if context.stop_flag.load(Ordering::Relaxed) {
         return;
@@ -1185,7 +1230,8 @@ fn cleanup_attempt(context: &WorkerContext) {
     if let Some(acp) = context.acp.lock().unwrap().take() {
         acp.close_stdin();
         let _ = acp.wait_timeout(Duration::from_millis(500));
-        // 主进程退出不代表 Job 内没有残留孙进程（F5）；统一收尾。
+        // The exit of the main process does not mean that there are no remaining sub-processes
+        // within the job (F5); all processes are finally terminated together.
         acp.kill();
     }
     // The in-flight prompt died with the attempt. Without this reset the next
@@ -1437,22 +1483,25 @@ pub(crate) fn read_resume_candidate(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResumeOutcome {
-    /// 没有可用 session-id，直接新建会话。
+    /// No available session-id found. Creating a new session instead.
     Fresh,
-    /// `session/load` 成功，沿用已有 session。
+    /// `session/load` succeeded. The existing session will continue to be used.
     Resumed,
-    /// 恢复不可用/失败，已新建会话；消息必须明确显示「已降级为新会话」。
+    /// The unavailable/failed instance has been restored, and a new session has been created. The
+    /// message must clearly indicate that the instance has been downgraded to a new session.
     Degraded(String),
 }
 
-/// 读取上次落盘的 session-id（缺失/空白视为没有）。
+/// Read the session-id from the last write to disk. Missing/blank values are considered as not
+/// present.
 fn read_stored_session_id(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let session_id = text.trim();
     (!session_id.is_empty()).then(|| session_id.to_owned())
 }
 
-/// F11：优先恢复已有会话；不支持或失败时回退新会话。
+/// F11: Prioritize the restoration of existing sessions. If there are any issues, new sessions will
+/// be rejected.
 fn resume_or_new<E, Load, Create>(
     stored_session: Option<&str>,
     load_supported: bool,
@@ -1481,7 +1530,8 @@ where
         Ok(true) => Ok((
             SessionInfo {
                 session_id: session_id.to_owned(),
-                // `AcpClient::load_session` 只暴露 bool（不返回 extensionResults）。
+                // `AcpClient::load_session` only returns a boolean value (no extensionResults is
+                // returned).
                 extension_results: Value::Array(Vec::new()),
                 current_mode: None,
             },
@@ -1500,10 +1550,11 @@ where
     }
 }
 
-/// F1：`session/new` 的 `_meta.extensionResults` 必须恰好是 duthub 成功。
+/// F1: The `_meta.extensionResults` of `session.new` must be exactly equal to "duthub".
 ///
-/// managed config 关闭内置扩展只是前提；运行时仍须校验实际结果，
-/// 否则 `GOOSE_MODE` 配置漂移或 MCP 不可达时工具面会静默扩大。
+/// Closing the built-in extensions in managed config is just a prerequisite; it's still necessary
+/// to verify the actual results during runtime. Otherwise, when the `GOOSE_MODE` configuration
+/// changes or the MCP becomes unreachable, the tool will automatically expand without any warning.
 pub fn validate_extension_results(results: &Value) -> Result<(), String> {
     let Some(entries) = results.as_array() else {
         return Err("session/new 未返回 _meta.extensionResults 数组".into());
@@ -1598,7 +1649,7 @@ mod tests {
         ] {
             assert!(
                 validate_extension_results(&bad).is_err(),
-                "必须拒绝异常工具面: {bad}"
+                "It is necessary to reject the abnormal tool surface: {bad}."
             );
         }
     }
@@ -1642,7 +1693,7 @@ mod tests {
 
     #[test]
     fn resume_falls_back_to_new_session_with_degraded_note() {
-        // 未声明 loadSession 能力。
+        // The ability to use loadSession has not been declared.
         let (session, outcome) = resume_or_new(
             Some("stale-session"),
             false,
@@ -1657,7 +1708,7 @@ mod tests {
                 if reason.contains("已降级为新会话") && reason.contains("未声明")
         ));
 
-        // 声明能力但 session/load 返回 MethodNotFound。
+        // Declared the ability, but the session/load returned MethodNotFound.
         let (session, outcome) = resume_or_new(
             Some("stale-session"),
             true,
@@ -1672,7 +1723,7 @@ mod tests {
                 if reason.contains("已降级为新会话") && reason.contains("不支持")
         ));
 
-        // 声明能力但 session/load 报错。
+        // Claims to have certain capabilities, but reports errors related to sessions/loads.
         let (session, outcome) = resume_or_new(
             Some("stale-session"),
             true,
@@ -1693,14 +1744,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("duthub-session-id-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session-id");
-        assert_eq!(read_stored_session_id(&path), None, "缺失文件视为没有");
+        assert_eq!(
+            read_stored_session_id(&path),
+            None,
+            "Missing files are considered to be absent."
+        );
         std::fs::write(&path, "  \n").unwrap();
-        assert_eq!(read_stored_session_id(&path), None, "空白文件视为没有");
+        assert_eq!(
+            read_stored_session_id(&path),
+            None,
+            "Blank files are considered to be empty."
+        );
         std::fs::write(&path, "  abc-123 \n").unwrap();
         assert_eq!(
             read_stored_session_id(&path).as_deref(),
             Some("abc-123"),
-            "必须 trim 后返回"
+            "It is necessary to perform trimming before returning the result."
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1725,7 +1784,9 @@ mod tests {
             &[("openai_api_key".to_owned(), "sk-env-keys".to_owned())],
             model_env,
         )
-        .expect_err("同名键必须报错而不是静默覆盖");
+        .expect_err(
+            "Keys with the same name must trigger an error instead of being silently overwritten.",
+        );
         assert!(error.contains("冲突"), "{error}");
     }
 
@@ -1771,7 +1832,7 @@ mod tests {
         assert_eq!(
             read_resume_candidate(&paths, &launch, true, &view).as_deref(),
             Some("session-ok"),
-            "agent 与哈希都匹配时必须恢复"
+            "When both the agent and the hash match, it's necessary to restore the state."
         );
 
         // Different agent: never resume another Agent's session.
@@ -1781,7 +1842,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_resume_candidate(&paths, &launch, true, &view), None);
-        assert!(!paths.resume.exists(), "不匹配的 resume.json 必须清理");
+        assert!(
+            !paths.resume.exists(),
+            "Invalid resume.json file must be cleaned up."
+        );
         assert!(!paths.session_id.exists());
 
         // Same agent, different program binary.
@@ -1795,13 +1859,13 @@ mod tests {
         assert!(!paths.resume.exists());
         assert!(
             !paths.session_id.exists(),
-            "被拒绝的 resume.json 不得回退到 legacy session-id"
+            "The rejected resume.json file cannot be restored to the legacy session-id."
         );
         assert!(
             view.transcript_snapshot()
                 .iter()
                 .any(|entry| entry.text.contains("不匹配")),
-            "必须留下不匹配注记"
+            "It is necessary to keep the annotation unmatched"
         );
 
         // Legacy session-id only for goose and only without resume.json.
@@ -1815,13 +1879,13 @@ mod tests {
         );
         assert!(
             !paths.resume.exists() && !paths.session_id.exists(),
-            "损坏的 resume.json 必须清理且不得回退到 legacy session-id"
+            "The damaged resume.json file must be cleaned up, and cannot be reverted to the legacy session-id mode."
         );
         std::fs::write(&paths.session_id, "legacy-session").unwrap();
         assert_eq!(
             read_resume_candidate(&paths, &launch, true, &view).as_deref(),
             Some("legacy-session"),
-            "旧版 session-id 在 goose 且无 resume.json 时仍尝试恢复"
+            "In older versions of Goose, even when there is no resume.json file, attempts are still made to restore the session-id."
         );
         assert!(
             view.transcript_snapshot()
@@ -1831,7 +1895,7 @@ mod tests {
         assert_eq!(
             read_resume_candidate(&paths, &launch, false, &view),
             None,
-            "非 goose 不得使用 legacy session-id"
+            "Legacy session IDs must not be used for purposes other than those specified."
         );
 
         let _ = std::fs::remove_dir_all(&work);
@@ -1862,15 +1926,15 @@ mod tests {
 
     /// goose definition for the worker-path tests: `DUTHUB_TEST_GOOSE` wins,
     /// otherwise the product resolver decides (downloaded install > PATH).
-    /// `None` = goose is not installed: the embedded asset was removed on
-    /// 2026-11-24, so the caller skips with a visible reason.
+    /// `None` = goose is not installed (goose is no longer embedded), so the
+    /// caller skips with a visible reason.
     #[cfg(windows)]
     fn test_goose_agent() -> Option<AgentDefinition> {
         if let Some(raw) = std::env::var_os("DUTHUB_TEST_GOOSE") {
             let program = std::path::PathBuf::from(raw);
             assert!(
                 program.is_absolute() && program.is_file(),
-                "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+                "DUTHUB_TEST_GOOSE must be a valid absolute path to the goose executable file: {}",
                 program.display()
             );
             let sha256 = duthub_core::store::sha256_file(&program).ok()?;
@@ -1890,8 +1954,7 @@ mod tests {
     fn unreachable_mcp_marks_session_failed_and_stops_process() {
         let Some(agent) = test_goose_agent() else {
             eprintln!(
-                "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-                 或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+                "SKIP: Goose is unavailable. Install it from Tool Downloads or set DUTHUB_TEST_GOOSE to the executable."
             );
             return;
         };
@@ -1950,11 +2013,11 @@ mod tests {
                     "unexpected failure: {message}"
                 );
             }
-            other => panic!("MCP 不可达必须让会话 Failed，实际 {other:?}"),
+            other => panic!("An unreachable MCP endpoint must fail the session: {other:?}"),
         }
         assert!(
             acp.lock().unwrap().is_none(),
-            "失败路径必须释放 ACP 进程（含进程树）"
+            "The failed path must release the ACP process (including all related processes)."
         );
         assert!(listener_slot.lock().unwrap().is_none());
         assert!(dirty.load(Ordering::Relaxed));

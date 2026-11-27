@@ -1,7 +1,13 @@
-use super::{Workbench, Palette, Window, Context, IntoElement, Styled, div, px, InteractiveElement, ParentElement, FluentBuilder, StatefulInteractiveElement, SharedString, icon_btn, icon, relay_panel, connection_agent_panel, alerts_panel, Div, panel_head, toggle, In, field, setting_row, Disableable, btn, BtnVariant, WindowExt, subtle, Switch, BAUD_OPTIONS, AppContext, copy_text, detected_lan_ip, A2aStatus, chip, connection_lease_action};
+use super::{
+    A2aStatus, BAUD_OPTIONS, BtnVariant, Context, Disableable, Div, FluentBuilder, In,
+    InteractiveElement, IntoElement, Palette, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Switch, Window, WindowExt, Workbench, alerts_panel, btn,
+    chip, connection_agent_panel, connection_lease_action, copy_text, detected_lan_ip, div, field,
+    icon, icon_btn, panel_head, px, relay_panel, setting_row, subtle, toggle,
+};
 
 // ---------------------------------------------------------------------------
-// 连接管理
+// Connection Management
 // ---------------------------------------------------------------------------
 
 pub fn render_connection(
@@ -203,9 +209,12 @@ pub fn render_connection(
         )
 }
 
-/// 心跳面板（需求⑦）：每 DUT 心跳配置行（启用/间隔/自定义命令）+ 最近一次状态。
-/// 配置写 `dut.heartbeat`（保存落盘）并同步到心跳引擎运行时；
-/// Agent 可经 heartbeat.set 改写命令（引擎是运行时单一归属，保存前回填）。
+/// Heartbeat panel (Requirement ⑦): Heartbeat configuration row for each DUT
+/// (enabled/interval/custom commands) + last status.
+/// Configure `dut.heartbeat` and write it to disk, then synchronize it to the heartbeat engine
+/// during runtime.
+/// The Agent can modify the command through heartbeat.set (the engine is a single entity during
+/// runtime; it is populated before saving).
 pub(super) fn serial_logs_panel(
     w: &mut Workbench,
     p: &'static Palette,
@@ -335,7 +344,8 @@ pub(super) fn heartbeat_panel(
         return collapsible_panel(header, None, p);
     }
     let mut body = div();
-    // 多行命令独占一行表单宽度，便于编辑和检查顺序。
+    // Multiple commands occupy one line of the form, which makes it easier to edit and check the
+    // order of operations.
     let interval_value = w.input_value(In::HeartbeatInterval);
     body = body
         .child(field(
@@ -415,16 +425,20 @@ pub(super) fn heartbeat_panel(
         };
     let mut summary = status_label;
     if let Some(h) = &state.sysinfo.hostname {
-        summary.push_str(&format!(" · {h}"));
+        summary.push_str(" · ");
+        summary.push_str(h);
     }
     if let Some(u) = &state.sysinfo.uptime {
-        summary.push_str(&format!(" · up {u}"));
+        summary.push_str(" · up ");
+        summary.push_str(u);
     }
     if let Some(c) = &state.sysinfo.cpu {
-        summary.push_str(&format!(" · {c}"));
+        summary.push_str(" · ");
+        summary.push_str(c);
     }
     if let Some(m) = &state.sysinfo.mem {
-        summary.push_str(&format!(" · {m}"));
+        summary.push_str(" · ");
+        summary.push_str(m);
     }
     body = body.child(
         div()
@@ -519,7 +533,7 @@ pub(super) fn serial_panel(
         None,
         p,
     ));
-    // 波特率 + 数据格式
+    // Bit rate + Data format
     let baud_options: Vec<(String, String)> = BAUD_OPTIONS
         .iter()
         .map(|b| (b.to_string(), b.to_string()))
@@ -698,7 +712,7 @@ pub(super) fn adb_panel(
     collapsible_panel(header, Some(body), p)
 }
 
-/// 只读地址行 + 复制按钮。
+/// Read-only address line + copy button.
 pub(super) fn endpoint_copy_row(
     label: &str,
     value: &str,
@@ -825,7 +839,6 @@ pub(super) fn mcp_panel(
             window,
             cx,
         );
-        let local_url = format!("http://127.0.0.1:{port}/mcp");
         body = body.child(
             div()
                 .flex()
@@ -840,7 +853,22 @@ pub(super) fn mcp_panel(
                         .items_center()
                         .gap(px(6.))
                         .child(subtle(crate::i18n::label("mcpPort"), p))
-                        .child(div().w(px(61.)).child(port_field))
+                        .child(div().w(px(68.)).child(port_field))
+                        .child(
+                            btn(
+                                "dut-mcp-random-port",
+                                crate::i18n::label("mcpRandomPort"),
+                                &BtnVariant::Tiny,
+                                p,
+                            )
+                            .on_click(cx.listener({
+                                let dut_id = dut.id.clone();
+                                move |this, _ev, _win, cx| {
+                                    this.randomize_dut_mcp_port(&dut_id);
+                                    cx.notify();
+                                }
+                            })),
+                        )
                         .child(
                             btn(
                                 "dut-mcp-save-port",
@@ -857,14 +885,7 @@ pub(super) fn mcp_panel(
                                 }
                             })),
                         ),
-                )
-                .child(div().flex_1().min_w(px(220.)).child(endpoint_copy_row(
-                    crate::i18n::label("mcpLocalAddress"),
-                    &local_url,
-                    "dut-mcp-copy-local",
-                    p,
-                    cx,
-                ))),
+                ),
         );
         // Surface per-port bind failures directly inside the panel.
         if let Some(reason) = w.mcp_runtime.failure_for_port(port) {
@@ -880,7 +901,7 @@ pub(super) fn mcp_panel(
             );
         }
         if let Some(ip) = lan_ip {
-            let lan_url = format!("http://{ip}:{port}/mcp");
+            let lan_url = duthub_desktop::agent_ui::mcp_client_url(port, Some(ip));
             body = body.child(endpoint_copy_row(
                 crate::i18n::label("mcpLanAddress"),
                 &lan_url,
@@ -906,140 +927,6 @@ pub(super) fn mcp_panel(
             let token_for_copy = token.clone();
             let expanded = w.expanded_mcp_config.as_deref() == Some(dut.id.as_str());
             let toggle_id = dut.id.clone();
-            let dut_cred = w
-                .settings
-                .agent_access
-                .listener_for_dut(&dut.id)
-                .and_then(|listener| {
-                    w.settings
-                        .agent_access
-                        .agents
-                        .iter()
-                        .find(|cred| cred.listener_id.as_deref() == Some(&listener.id))
-                        .cloned()
-                });
-            if let Some(cred) = dut_cred {
-                const DUT_MCP_GRANTS: [(duthub_core::agent_access::DutAction, &str); 8] = [
-                    (
-                        duthub_core::agent_access::DutAction::Read,
-                        "agentAccessGrantRead",
-                    ),
-                    (
-                        duthub_core::agent_access::DutAction::Capture,
-                        "agentAccessGrantCapture",
-                    ),
-                    (
-                        duthub_core::agent_access::DutAction::SerialWrite,
-                        "agentAccessGrantSerialWrite",
-                    ),
-                    (
-                        duthub_core::agent_access::DutAction::Reset,
-                        "agentAccessGrantReset",
-                    ),
-                    (
-                        duthub_core::agent_access::DutAction::Power,
-                        "agentAccessGrantPower",
-                    ),
-                    (
-                        duthub_core::agent_access::DutAction::Relay,
-                        "agentAccessGrantRelay",
-                    ),
-                    (
-                        duthub_core::agent_access::DutAction::Adb,
-                        "agentAccessGrantAdb",
-                    ),
-                    (
-                        duthub_core::agent_access::DutAction::Flash,
-                        "agentAccessGrantFlash",
-                    ),
-                ];
-                let mut perms = div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(6.))
-                    .py(px(4.))
-                    .child(subtle(crate::i18n::label("mcpPermissionsLabel"), p));
-                for (action, label_key) in DUT_MCP_GRANTS {
-                    let granted = cred
-                        .grants
-                        .iter()
-                        .find(|g| g.dut_id == dut.id)
-                        .is_some_and(|g| g.actions.contains(&action));
-                    let cid = cred.id.clone();
-                    let did = dut.id.clone();
-                    perms = perms.child(
-                        btn(
-                            format!("dut-mcp-grant-{}-{}", dut.id, action.as_str()),
-                            crate::i18n::label(label_key),
-                            if granted {
-                                &BtnVariant::TinyPrimary
-                            } else {
-                                &BtnVariant::Tiny
-                            },
-                            p,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_agent_grant(&cid, &did, action);
-                            cx.notify();
-                        })),
-                    );
-                }
-                body = body.child(perms);
-            }
-            if let Some(lease_mgr) = w.device.lease_manager() {
-                let st = lease_mgr.status(&dut.id);
-                let status_text = match st.phase {
-                    duthub_core::lease::LeasePhase::Free => {
-                        crate::i18n::label("mcpLeaseFree").to_owned()
-                    }
-                    duthub_core::lease::LeasePhase::Held => {
-                        let holder = st.holder.as_deref().unwrap_or("—");
-                        match st.remaining_secs {
-                            Some(secs) => crate::i18n::message(
-                                "mcpLeaseHeldTimed",
-                                &[
-                                    ("holder", holder),
-                                    ("secs", &secs.to_string()),
-                                    ("queue", &st.queue_len.to_string()),
-                                ],
-                            ),
-                            None => crate::i18n::message(
-                                "mcpLeaseHeld",
-                                &[("holder", holder), ("queue", &st.queue_len.to_string())],
-                            ),
-                        }
-                    }
-                    duthub_core::lease::LeasePhase::Protected => crate::i18n::message(
-                        "mcpLeaseProtected",
-                        &[("op", st.protected_op.as_deref().unwrap_or("—"))],
-                    ),
-                    duthub_core::lease::LeasePhase::NeedsInspection => {
-                        crate::i18n::label("mcpLeaseNeedsInspection").to_owned()
-                    }
-                };
-                let mut lease_row = div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.))
-                    .py(px(4.))
-                    .child(subtle(crate::i18n::label("mcpControlLeaseLabel"), p))
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(match st.phase {
-                                duthub_core::lease::LeasePhase::Free => p.accent,
-                                duthub_core::lease::LeasePhase::NeedsInspection => p.red,
-                                _ => p.text,
-                            })
-                            .child(SharedString::from(status_text)),
-                    );
-                if let Some(action_btn) = super::settings::connection_lease_action(w, p, cx) {
-                    lease_row = lease_row.child(action_btn);
-                }
-                body = body.child(lease_row);
-            }
             body = body
                 .child(
                     div()
@@ -1101,8 +988,9 @@ pub(super) fn mcp_panel(
                 );
             if expanded {
                 let server = duthub_desktop::agent_ui::mcp_server_name(&dut.id);
+                let config_url = duthub_desktop::agent_ui::mcp_client_url(port, lan_ip);
                 let config_text =
-                    duthub_desktop::agent_ui::mcp_client_config(&server, &local_url, &token);
+                    duthub_desktop::agent_ui::mcp_client_config(&server, &config_url, &token);
                 body = body.child(config_block(
                     "dut-mcp-config",
                     None,
@@ -1166,8 +1054,9 @@ pub(super) fn a2a_dut_panel(
         .as_ref()
         .and_then(|state| state.as_ref().ok().and_then(std::clone::Clone::clone));
     let mut body = div();
-    // W4a：运行时状态行（Running/Starting/失败原因），替代旧的
-    // 「运行时尚未接入」静态提示。W4c：self-test 下运行时为 None → Disabled。
+    // W4a: Running/Starting/reason for failure status. This replaces the old "Not yet connected to
+    // the runtime" message. W4c: During self-test, this field will be set to None, indicating that
+    // the function is disabled.
     let a2a_status = w
         .a2a
         .as_ref()
@@ -1396,6 +1285,12 @@ pub(super) fn actions_row(
         } else {
             "create"
         }
+    } else if w
+        .duts
+        .selected()
+        .is_some_and(|dut| w.device_session_index(&dut.id).is_some())
+    {
+        "saveUpdate"
     } else {
         "saveCreation"
     };

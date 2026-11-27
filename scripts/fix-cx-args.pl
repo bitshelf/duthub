@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# 给 w.select_field(...) / w.combobox(...) 的调用尾部插入 ", cx"（若无）。
+# Append ", cx" to w.select_field(...) and w.combobox(...) calls that omit it.
 use strict; use warnings;
 
 for my $file (@ARGV) {
@@ -11,7 +11,7 @@ for my $file (@ARGV) {
     my $changed = 0;
     while ($src =~ /w\.(select_field|combobox)\(/g) {
         my $start = $-[0] + length($&);
-        # 从 start 开始做括号平衡扫描
+        # Scan matching parentheses from the start of the call.
         my $depth = 1;
         my $i = $start;
         my $in_str = 0; my $str_ch = '';
@@ -30,7 +30,7 @@ for my $file (@ARGV) {
         my $close = $i - 1;   # 指向匹配的 ')'
         my $before = substr($src, $close - 1, 1);
         if ($before ne 'x') {   # 尾部不是 ", cx"
-            # 找最后一个非空白
+            # Find the last non-whitespace character.
             my $j = $close - 1;
             $j-- while $j > 0 && substr($src, $j, 1) =~ /\s/;
             $out .= substr($src, $pos, $j + 1 - $pos) . ", cx" . substr($src, $j + 1, $close - $j - 1) . ")";

@@ -1,0 +1,2 @@
+# The desktop source contract checks multiline Rust snippets verbatim.
+apps/desktop/src/workspace/*.rs text eol=lf

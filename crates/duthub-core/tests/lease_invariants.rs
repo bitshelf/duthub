@@ -1,6 +1,6 @@
-//! 控制租约不变量测试（docs/SECURITY.md；SPEC §6.1）：
-//! INV-01 单租约 / INV-04 generation fencing / TTL 过期 / GUI 优先（Agent 排队被拒）
-//! / INV-05 Protected / INV-06 跨 DUT 并行 / INV-07 重启作废。
+//! Control lease invariant tests (`docs/SECURITY.md`; SPEC §6.1):
+//! INV-01 single lease, INV-04 generation fencing, TTL expiry, GUI priority (Agent denied while
+//! GUI holds), INV-05 Protected, INV-06 cross-DUT parallelism, and INV-07 restart invalidation.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use duthub_core::lease::{
 };
 
 fn manager() -> Arc<ControlLeaseManager> {
-    // 审计内存环：测试后可检查事件流（不落盘）
+    // In-memory audit ring so tests can inspect events without disk I/O.
     Arc::new(
         ControlLeaseManager::new(Some(AuditSink::memory()))
             .with_wait_poll(Duration::from_millis(10)),
@@ -25,7 +25,7 @@ fn agent(name: &str) -> LeaseHolder {
     }
 }
 
-/// INV-01：并发 acquire 同一 DUT 只有 1 个成功；其余 Busy 且消息携带持有者。
+/// INV-01: only one concurrent acquire succeeds per DUT; all others receive `Busy` with the holder.
 #[test]
 fn inv01_concurrent_acquire_single_winner() {
     let m = manager();
@@ -47,18 +47,22 @@ fn inv01_concurrent_acquire_single_winner() {
         .collect();
     let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let winners: Vec<_> = outcomes.iter().filter_map(|r| r.as_ref().ok()).collect();
-    assert_eq!(winners.len(), 1, "INV-01：并发 acquire 必须恰好 1 个成功");
-    // 5 个失败者全部 Busy，消息指明持有者
+    assert_eq!(
+        winners.len(),
+        1,
+        "INV-01: concurrent acquire must produce exactly one winner"
+    );
+    // All 5 losers must fail with `Busy` naming the active holder.
     for err in outcomes.into_iter().filter_map(std::result::Result::err) {
         match err {
             LeaseError::Busy { holder, .. } => assert_ne!(holder, ""),
-            other => panic!("并发失败必须是 Busy，得到 {other:?}"),
+            other => panic!("Concurrent acquisition must return Busy, got {other:?}"),
         }
     }
     assert_eq!(m.status("dut-a").phase, LeasePhase::Held);
 }
 
-/// INV-01 另一侧：GUI 持有期间 Agent acquire 被拒（Busy + 持有者标签）。
+/// INV-01 other direction: Agent acquire is rejected with `Busy` + holder label while GUI holds.
 #[test]
 fn inv01_agent_acquire_rejected_while_gui_holds() {
     let m = manager();
@@ -69,17 +73,17 @@ fn inv01_agent_acquire_rejected_while_gui_holds() {
         LeaseError::Busy { holder, .. } => {
             assert!(
                 holder.contains("GUI"),
-                "Busy 消息必须指明 GUI 持有：{holder}"
+                "Busy message must name the GUI holder: {holder}"
             );
         }
-        other => panic!("期望 Busy，得到 {other:?}"),
+        other => panic!("Expected Busy, got {other:?}"),
     }
-    // 释放后 Agent 才能取到
+    // Agent can acquire once the GUI releases.
     m.release("dut-a", &g.lease_id).unwrap();
     m.acquire("dut-a", &agent("claude"), None).unwrap();
 }
 
-/// INV-04：release/re-acquire 后 generation 单调 +1，旧代数 admit 全拒。
+/// INV-04: release/re-acquire increments generation monotonically and rejects stale admissions.
 #[test]
 fn inv04_stale_generation_rejected() {
     let m = manager();
@@ -87,25 +91,28 @@ fn inv04_stale_generation_rejected() {
     assert_eq!(g1.generation, 1);
     m.release("dut-a", &g1.lease_id).unwrap();
     let g2 = m.acquire("dut-a", &LeaseHolder::Gui, None).unwrap();
-    assert_eq!(g2.generation, 2, "每次 acquire generation+1");
-    // 旧代数句柄写入 admit：租约已换人（GUI 在场）→ Busy 指向 GUI
+    assert_eq!(g2.generation, 2, "each acquire must increment generation");
+    // Stale handle admission: lease changed hands to GUI -> Busy naming GUI.
     let stale_write = WriteIdentity::agent(Some(g1.lease_id.clone()), Some(g1.generation));
     assert!(matches!(
         m.admit_write("dut-a", &stale_write),
         Err(LeaseError::Busy { .. })
     ));
-    // 当前句柄 + 旧代数 → Generation fencing
+    // Current handle with stale generation -> generation fencing error.
     let wrong_gen = WriteIdentity::agent(Some(g2.lease_id.clone()), Some(1));
     assert!(matches!(
         m.admit_write("dut-a", &wrong_gen),
         Err(LeaseError::Generation { current: 2 })
     ));
-    // 正确 (lease_id, generation) 放行；renew 不变代数
+    // Matching `(lease_id, generation)` succeeds; renew must not advance generation.
     let ok = WriteIdentity::agent(Some(g2.lease_id.clone()), Some(2));
     assert!(m.admit_write("dut-a", &ok).is_ok());
     let renewed = m.renew("dut-a", &g2.lease_id).unwrap();
-    assert_eq!(renewed.generation, 2, "renew 不得推进代数（SPEC §6.5）");
-    // 强制接管：代数再 +1，旧持有者下一次写入被拒
+    assert_eq!(
+        renewed.generation, 2,
+        "renew must not advance generation (SPEC §6.5)"
+    );
+    // Force takeover advances generation again and blocks subsequent writes from prior holder.
     let g3 = m.force_takeover("dut-a").unwrap();
     assert_eq!(g3.generation, 3);
     assert!(matches!(
@@ -114,7 +121,8 @@ fn inv04_stale_generation_rejected() {
     ));
 }
 
-/// TTL 过期：到期后惰性回收 → Free；renew 报 Expired；Agent 重新可取。
+/// TTL expiry: lazy reclamation transitions to `Free`, renew returns `Expired`, and new acquires
+/// succeed.
 #[test]
 fn ttl_expiry_invalidates_and_frees() {
     let m = Arc::new(
@@ -124,20 +132,21 @@ fn ttl_expiry_invalidates_and_frees() {
     );
     let g = m.acquire("dut-a", &agent("claude"), None).unwrap();
     std::thread::sleep(Duration::from_millis(110));
-    // renew 先于惰性回收触发 → 明确 Expired（区别 UnknownLease）
+    // Renew runs before lazy reclamation -> returns `Expired` (distinct from `UnknownLease`).
     assert_eq!(m.renew("dut-a", &g.lease_id), Err(LeaseError::Expired));
     assert_eq!(m.status("dut-a").phase, LeasePhase::Free);
-    // GUI 持有期间 TTL 过期 → GUI 写入 admit 现场重新获取（新代数）
+    // If a GUI lease expires, the next GUI write admit reacquires immediately with a new generation.
     let g2 = m.acquire("dut-a", &LeaseHolder::Gui, None).unwrap();
     assert!(g2.generation > g.generation);
     std::thread::sleep(Duration::from_millis(110));
-    // GUI 身份写入：admit 自动现场 acquire（人类在场）
+    // GUI write automatically acquires on admit.
     let ctx = m.admit_write("dut-a", &WriteIdentity::gui()).unwrap();
-    let ctx = ctx.expect("GUI 写入必须携带新租约上下文");
+    let ctx = ctx.expect("GUI write must return a new lease context");
     assert!(ctx.generation > g2.generation);
 }
 
-/// INV-05：Protected 期间 acquire/renew/release/写入/接管全拒；exit 走状态机。
+/// INV-05: `Protected` rejects acquire, renew, release, writes, and takeover; exit follows the
+/// state machine.
 #[test]
 fn inv05_protected_blocks_everything_until_exit() {
     let m = manager();
@@ -172,14 +181,14 @@ fn inv05_protected_blocks_everything_until_exit() {
     assert_eq!(
         m.status("dut-a").phase,
         LeasePhase::Protected,
-        "status 必须显示保护态"
+        "status must report Protected phase"
     );
-    // exit(ok) → Free；随后 Agent 可取（代数 +1）
+    // `exit_protected(true)` -> `Free`; Agent can acquire with incremented generation.
     m.exit_protected("dut-a", true).unwrap();
     assert_eq!(m.status("dut-a").phase, LeasePhase::Free);
     let g2 = m.acquire("dut-a", &agent("bot"), None).unwrap();
     assert!(g2.generation > g.generation);
-    // exit(unknown) → NeedsInspection → 人工确认 → Free
+    // `exit_protected(false)` -> `NeedsInspection` -> manual resolution -> `Free`.
     m.enter_protected("dut-a", "烧录中").unwrap();
     m.exit_protected("dut-a", false).unwrap();
     assert_eq!(m.status("dut-a").phase, LeasePhase::NeedsInspection);
@@ -191,7 +200,7 @@ fn inv05_protected_blocks_everything_until_exit() {
     assert_eq!(m.status("dut-a").phase, LeasePhase::Free);
 }
 
-/// INV-06：跨 DUT 并行互不阻塞（互斥只作用于同 DUT）。
+/// INV-06: independent DUTs do not block one another (mutual exclusion is per DUT).
 #[test]
 fn inv06_parallel_duts_independent() {
     let m = manager();
@@ -200,17 +209,17 @@ fn inv06_parallel_duts_independent() {
     let gc = m.acquire("dut-c", &LeaseHolder::Gui, None).unwrap();
     assert_ne!(ga.lease_id, gb.lease_id);
     assert_ne!(gb.lease_id, gc.lease_id);
-    // 三个 DUT 同时 Held
+    // All three DUTs are held concurrently.
     for dut in ["dut-a", "dut-b", "dut-c"] {
         assert_eq!(m.status(dut).phase, LeasePhase::Held, "{dut}");
     }
-    // 一个 DUT 的释放不影响其他
+    // Releasing one DUT does not affect the others.
     m.release("dut-a", &ga.lease_id).unwrap();
     assert_eq!(m.status("dut-a").phase, LeasePhase::Free);
     assert_eq!(m.status("dut-b").phase, LeasePhase::Held);
 }
 
-/// INV-07：进程重启（新管理器）后旧租约全部作废。
+/// INV-07: process restart (fresh manager) invalidates all previous leases.
 #[test]
 fn inv07_restart_invalidates_all_leases() {
     let m1 = manager();
@@ -219,23 +228,23 @@ fn inv07_restart_invalidates_all_leases() {
     assert_eq!(
         m2.renew("dut-a", &g.lease_id),
         Err(LeaseError::UnknownLease),
-        "重启后旧句柄必须 UnknownLease"
+        "old lease handle must return UnknownLease after restart"
     );
     assert_eq!(
         m2.validate("dut-a", &g.lease_id, g.generation),
         Err(LeaseError::UnknownLease)
     );
     assert_eq!(m2.status("dut-a").phase, LeasePhase::Free);
-    // 新管理器可立即授予
+    // Fresh manager can immediately grant a new lease.
     m2.acquire("dut-a", &LeaseHolder::Gui, None).unwrap();
 }
 
-/// FIFO 等待队列：取消队首请求后，下一位获得租约。
+/// FIFO wait queue: cancelling the head request lets the next waiter acquire the lease.
 #[test]
 fn fifo_queue_orders_cancels_and_times_out() {
     let m = manager();
     let g1 = m.acquire("dut-a", &LeaseHolder::Gui, None).unwrap();
-    // 排队两个 Agent（a 先 b 后）
+    // Enqueue two agents (`bot-a` then `bot-b`).
     let ha = {
         let m = m.clone();
         let holder = agent("bot-a");
@@ -248,51 +257,55 @@ fn fifo_queue_orders_cancels_and_times_out() {
         std::thread::spawn(move || m.acquire("dut-a", &holder, Some(Duration::from_millis(2000))))
     };
     std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(m.status("dut-a").queue_len, 2, "两个等待者已入队");
-    // 取消 bot-a 的排队
+    assert_eq!(
+        m.status("dut-a").queue_len,
+        2,
+        "two waiters should be queued"
+    );
+    // Cancel `bot-a`'s queued wait request.
     let req_a = m.pending_wait_requests("dut-a")[0];
     assert!(m.cancel_wait("dut-a", req_a));
     assert_eq!(m.status("dut-a").queue_len, 1);
     m.release("dut-a", &g1.lease_id).unwrap();
-    // bot-a 已取消 → 队首是 bot-b
+    // `bot-a` was cancelled, so `bot-b` is now at the head of the queue.
     let gb = hb.join().unwrap().unwrap();
     assert_eq!(gb.holder, "Agent bot-b");
-    // bot-a 主动取消后应以 Busy 退出；等待超时由独立单测覆盖。
+    // Cancelled `bot-a` exits with `Busy`; wait timeout is covered by a dedicated unit test.
     assert!(matches!(ha.join().unwrap(), Err(LeaseError::Busy { .. })));
 }
 
-/// GUI 优先：GUI 身份写入在 Free 时自动获取租约（admit 现场 acquire）；
-/// Agent 持有时 GUI 写入被拒（Busy 指向 Agent）。
+/// GUI priority: GUI writes auto-acquire when `Free`, and are denied with `Busy` naming the Agent
+/// while an Agent holds the lease.
 #[test]
 fn gui_priority_write_admit_both_directions() {
     let m = manager();
-    // Free：GUI 写入自动获取
+    // Free: GUI write auto-acquires.
     let ctx = m
         .admit_write("dut-a", &WriteIdentity::gui())
         .unwrap()
-        .expect("GUI admit 必须返回租约上下文");
+        .expect("GUI admit must return a lease context");
     assert_eq!(m.status("dut-a").phase, LeasePhase::Held);
-    // GUI 再次写入：同租约上下文（幂等）
+    // Repeated GUI write returns the same lease context (idempotent).
     let ctx2 = m
         .admit_write("dut-a", &WriteIdentity::gui())
         .unwrap()
-        .expect("GUI admit 幂等");
+        .expect("GUI admit must be idempotent");
     assert_eq!(ctx, ctx2);
-    // Agent 在控：GUI 写入被拒
+    // Agent holds the lease: GUI write is denied.
     m.release("dut-a", &ctx.lease_id).unwrap();
     let ga = m.acquire("dut-a", &agent("bot"), None).unwrap();
     let err = m.admit_write("dut-a", &WriteIdentity::gui()).unwrap_err();
     match err {
         LeaseError::Busy { holder, .. } => assert!(holder.contains("bot"), "{holder}"),
-        other => panic!("期望 Busy，得到 {other:?}"),
+        other => panic!("Expected Busy, got {other:?}"),
     }
-    // System（心跳）：GUI 持有期放行；Agent 控制期静默被拒（方案 §5.3 admit 表）
+    // System (heartbeat): allowed while GUI holds; rejected while Agent controls the DUT.
     m.release("dut-a", &ga.lease_id).unwrap();
     let gg = m.acquire("dut-a", &LeaseHolder::Gui, None).unwrap();
     assert_eq!(
         m.admit_write("dut-a", &WriteIdentity::system()),
         Ok(None),
-        "GUI 持有期 System 放行"
+        "system writes are allowed while GUI holds the lease"
     );
     m.release("dut-a", &gg.lease_id).unwrap();
     let _ = m.acquire("dut-a", &agent("bot-2"), None).unwrap();
@@ -301,15 +314,16 @@ fn gui_priority_write_admit_both_directions() {
             m.admit_write("dut-a", &WriteIdentity::system()),
             Err(LeaseError::Busy { .. })
         ),
-        "Agent 控制期心跳静默被拒"
+        "heartbeat must be rejected while an Agent holds the lease"
     );
 }
 
-/// auth 开关联动：auth ON 时无租约 Agent 写拒（LeaseRequired）；GUI 不受影响。
+/// Auth toggle coupling: when auth is ON, leaseless Agent writes fail with `LeaseRequired`; GUI is
+/// unaffected.
 #[test]
 fn auth_switch_gates_leaseless_agent_writes() {
     let m = manager();
-    // 默认 auth 关：无租约 Agent 写放行（偏差 7 过渡）
+    // Default auth OFF: leaseless Agent writes pass via compatibility mode.
     assert_eq!(
         m.admit_write("dut-a", &WriteIdentity::agent(None, None)),
         Ok(None)
@@ -319,8 +333,8 @@ fn auth_switch_gates_leaseless_agent_writes() {
         m.admit_write("dut-a", &WriteIdentity::agent(None, None)),
         Err(LeaseError::LeaseRequired)
     ));
-    // GUI 不受 auth 开关影响（本地人类在场）
+    // GUI is unaffected by the auth toggle (local human operator).
     assert!(m.admit_write("dut-a", &WriteIdentity::gui()).is_ok());
-    // System 心跳也不受影响（但受 Protected 影响，见 INV-05 用例）
+    // System heartbeat is also unaffected by auth (still gated by `Protected`; see INV-05).
     assert_eq!(m.admit_write("dut-a", &WriteIdentity::system()), Ok(None));
 }

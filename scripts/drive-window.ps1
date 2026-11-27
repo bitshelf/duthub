@@ -1,5 +1,5 @@
-# 驱动 duthub 窗口交互：激活 → 可选点击/输入 → 截图
-# 用法: powershell -File scripts/drive-window.ps1 [-ClickX 65 -ClickY 55] [-Type "text"] [-Key "Enter"] [-Double] [-Out target\x.png] [-SleepMs 800]
+# Activate the duthub window, optionally click or type, and capture a screenshot.
+# Usage: powershell -File scripts/drive-window.ps1 [-ClickX 65 -ClickY 55] [-Type "text"] [-Key "{ENTER}"] [-Double] [-Out target\x.png] [-SleepMs 800]
 param(
     [switch]$Topmost,
     [int]$ClickX = -1, [int]$ClickY = -1,
@@ -42,7 +42,7 @@ $cb = {
         $sb = New-Object System.Text.StringBuilder 256
         [WinDrv]::GetWindowText($hWnd, $sb, 256) | Out-Null
         if ($sb.ToString() -eq "duthub" -or $sb.ToString() -eq "") {
-            # 空标题窗口可能是我们的（按进程过滤）
+            # An untitled window can still match the process filter.
             $procId = 0
             [WinDrv]::GetWindowThreadProcessId($hWnd, [ref]$procId) | Out-Null
             $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
@@ -55,7 +55,7 @@ $cb = {
 [WinDrv]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
 if ($target -eq [IntPtr]::Zero) { Write-Output "WINDOW NOT FOUND"; exit 1 }
 [WinDrv]::ShowWindow($target, 9) | Out-Null
-# ALT 按下/释放绕过 Windows 前台锁定（SetForegroundWindow 限制）
+# Press and release Alt so Windows allows the SetForegroundWindow call.
 [WinDrv]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
 [WinDrv]::SetForegroundWindow($target) | Out-Null
 [WinDrv]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
@@ -80,7 +80,7 @@ if ($ClickX -ge 0) {
     }
     Start-Sleep -Milliseconds $SleepMs
     if ($Wheel -ne 0) {
-        # 滚轮：负值向上滑动一行（0x0800=WHEEL）；每次滚动一行直到归零
+        # Send one wheel notch at a time until no movement remains. Negative scroll counts move up.
         $dir = if ($Wheel -gt 0) { [uint32]0 } else { [uint32]0x80000000 }
         $n = [Math]::Abs($Wheel)
         [WinDrv]::SetCursorPos($sx, $sy) | Out-Null
@@ -99,7 +99,7 @@ if ($Key -ne "") {
     Start-Sleep -Milliseconds 300
 }
 
-# 截图
+# Capture the screenshot.
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 $rect2 = New-Object WinDrv+RECT

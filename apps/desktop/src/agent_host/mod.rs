@@ -1,19 +1,21 @@
-//! goose ACP 宿主（W2）+ 通用 ACP Agent 注册表。
+//! Goose ACP Host (W2) + Universal ACP Agent Registry.
 //!
-//! 分层：
-//! - [`bundle`]：goose 许可/发布事实（兼容面）与版本探测；goose 不再内嵌，
-//!   由「工具下载」页下载安装（2026-11-24）；
-//! - [`registry`]：`agents.json` 定义 → 启动规格（外部路径/哈希/版本门槛），
-//!   以及未安装状态 [`registry::goose_install_state`]；
-//! - [`acp`]：按行 JSON-RPC ACP 客户端（stdout 只走协议）；
+//! Layers:
+//! - [`bundle`]: Goose licensing/release details (compatible with various platforms) and version
+//!   detection mechanisms. Goose is no longer embedded in the application; it is downloaded and
+//!   installed via the "Tool Download" page.
+//! - [`registry`]: Definitions for `agents.json` are used to determine startup specifications
+//!   (external paths/hashes/version thresholds). Additionally, there's a status indicator
+//!   [`registry::goose_install_state`].
+//! - [`acp`]: JSON-RPC ACP client implemented per line; stdout follows the protocol only.
 //! - [`job`]: self-containment helper (`contain_current_process`) for test stubs;
 //! - [`model_env`]: model provider -> goose environment and managed config;
 //! - [`sandbox`]: per-DUT sandbox / `GOOSE_PATH_ROOT` / transcript layout and unified MXC policy preparation;
-//! - [`listener`]：每会话 loopback MCP listener 与只读 Token；
-//! - [`session`]：会话状态、内存/文件 transcript 上限；
-//! - [`transcript`]：async transcript writer thread (keeps disk I/O off the ACP loop);
-//! - [`host`]：每 DUT 一个 Agent 进程的 HostManager（默认 goose）；
-//! - [`cli`]：CLI profiles (W2c). The first implemented profile is Claude Code:
+//! - [`listener`]: Loopback MCP listener for each session, along with read-only tokens.
+//! - [`session`]: Session state, maximum number of transcripts stored in memory/files.
+//! - [`transcript`]: async transcript writer thread (keeps disk I/O off the ACP loop);
+//! - [`host`]: Each DUT is assigned a `HostManager` process for the Agent (default: goose);
+//! - [`cli`]: CLI profiles (W2c). The first implemented profile is Claude Code:
 //!   argv/NDJSON parsing/resume, spawned once per turn.
 
 pub mod acp;

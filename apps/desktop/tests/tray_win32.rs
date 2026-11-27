@@ -99,7 +99,7 @@ impl TestWindow {
             Self { hwnd }
         };
         // Let the show take effect before the caller samples `main_visible`.
-        window.pump(Duration::from_millis(50));
+        TestWindow::pump(Duration::from_millis(50));
         window
     }
 
@@ -114,7 +114,7 @@ impl TestWindow {
 
     /// Drains the window message queue; `ShowWindowAsync` from the tray thread
     /// only takes effect once this thread pumps.
-    fn pump(&self, duration: Duration) {
+    fn pump(duration: Duration) {
         let deadline = Instant::now() + duration;
         loop {
             let mut msg = MSG::default();
@@ -132,7 +132,7 @@ impl TestWindow {
         }
     }
 
-    fn wait_until(&self, timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             if predicate() {
@@ -141,7 +141,7 @@ impl TestWindow {
             if Instant::now() >= deadline {
                 return false;
             }
-            self.pump(Duration::from_millis(25));
+            Self::pump(Duration::from_millis(25));
         }
     }
 }
@@ -169,7 +169,8 @@ unsafe extern "system" fn test_wndproc(
 ) -> windows::Win32::Foundation::LRESULT {
     match msg {
         WM_DESTROY => windows::Win32::Foundation::LRESULT(0),
-        // SAFETY: Forwards unhandled messages to Win32's default window procedure.
+        // SAFETY: The window manager supplied the handle and message parameters.
+        // Forward them unchanged to the default procedure on this thread.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
@@ -267,7 +268,10 @@ fn commands_before_the_icon_exists_are_harmless() {
     handle.set_alert(true);
     handle.notify("title", "body", TrayNotifyLevel::Warning);
     assert_eq!(handle.test_probe().balloons_sent, 0);
-    assert_eq!(handle.drain_events(), [] as [duthub_desktop::tray::TrayEvent; 0]);
+    assert_eq!(
+        handle.drain_events(),
+        [] as [duthub_desktop::tray::TrayEvent; 0]
+    );
 
     assert!(
         handle.set_icon_visible(false),
@@ -288,7 +292,7 @@ fn hide_main_never_strands_the_window() {
     if hidden {
         // A real shell accepted the icon: the window must actually go away.
         assert!(
-            window.wait_until(Duration::from_millis(3000), || !handle.main_visible()),
+            TestWindow::wait_until(Duration::from_millis(3000), || !handle.main_visible()),
             "hide_main returned true but the window stayed visible"
         );
         assert!(
@@ -309,7 +313,7 @@ fn hide_main_never_strands_the_window() {
     assert!(handle.show_main());
     if visible_before {
         assert!(
-            window.wait_until(Duration::from_millis(3000), || handle.main_visible()),
+            TestWindow::wait_until(Duration::from_millis(3000), || handle.main_visible()),
             "show_main must bring the window back"
         );
     }
@@ -337,7 +341,7 @@ fn icon_lifecycle_against_a_real_shell() {
 
     assert!(handle.hide_main(), "a desktop session must accept NIM_ADD");
     assert!(
-        window.wait_until(Duration::from_millis(3000), || !handle.main_visible()),
+        TestWindow::wait_until(Duration::from_millis(3000), || !handle.main_visible()),
         "the hidden window must not stay visible"
     );
     let probe = handle.test_probe();
@@ -350,7 +354,7 @@ fn icon_lifecycle_against_a_real_shell() {
     // Tooltip and balloon.
     handle.set_tooltip("duthub tray test");
     handle.notify("duthub test", "body text", TrayNotifyLevel::Warning);
-    window.pump(Duration::from_millis(400));
+    TestWindow::pump(Duration::from_millis(400));
     assert_eq!(
         handle.test_probe().balloons_sent,
         1,
@@ -359,10 +363,10 @@ fn icon_lifecycle_against_a_real_shell() {
 
     // Blink on then off restores the normal icon.
     handle.set_alert(true);
-    window.pump(Duration::from_millis(1200));
+    TestWindow::pump(Duration::from_millis(1200));
     assert!(handle.test_probe().alerting);
     handle.set_alert(false);
-    window.pump(Duration::from_millis(200));
+    TestWindow::pump(Duration::from_millis(200));
     assert!(!handle.test_probe().alerting);
 
     // A TaskbarCreated replay must either keep the icon reachable or report
@@ -378,7 +382,7 @@ fn icon_lifecycle_against_a_real_shell() {
             LPARAM(0),
         );
     }
-    window.pump(Duration::from_millis(500));
+    TestWindow::pump(Duration::from_millis(500));
     let lost = handle.drain_events().contains(&TrayEvent::IconLost);
     assert!(
         handle.test_probe().icon_rect.is_some() || lost,
@@ -388,7 +392,7 @@ fn icon_lifecycle_against_a_real_shell() {
     // Restore.
     assert!(handle.show_main());
     let _ = handle.set_icon_visible(false);
-    window.pump(Duration::from_millis(400));
+    TestWindow::pump(Duration::from_millis(400));
     assert!(handle.test_probe().icon_rect.is_none());
     handle.remove();
     assert!(handle.test_probe().icon_rect.is_none());
@@ -404,7 +408,7 @@ fn flash_stops_itself_after_the_cap() {
     assert!(handle.hide_main(), "a desktop session must accept NIM_ADD");
     handle.set_alert(true);
     assert!(handle.test_probe().alerting);
-    let stopped = window.wait_until(Duration::from_secs(35), || !handle.test_probe().alerting);
+    let stopped = TestWindow::wait_until(Duration::from_secs(35), || !handle.test_probe().alerting);
     assert!(
         stopped,
         "the tray thread must stop blinking after the 30 s cap on its own"
@@ -420,9 +424,13 @@ fn hide_then_show_restores_visibility() {
     let window = TestWindow::create();
     let handle = tray::install_with_hwnd(window.raw(), options()).expect("tray install");
     assert!(handle.hide_main());
-    assert!(window.wait_until(Duration::from_millis(3000), || !window.visible()));
+    assert!(TestWindow::wait_until(Duration::from_millis(3000), || {
+        !window.visible()
+    }));
     assert!(handle.show_main());
-    assert!(window.wait_until(Duration::from_millis(3000), || window.visible()));
+    assert!(TestWindow::wait_until(Duration::from_millis(3000), || {
+        window.visible()
+    }));
     let _ = handle.set_icon_visible(false);
     handle.remove();
 }

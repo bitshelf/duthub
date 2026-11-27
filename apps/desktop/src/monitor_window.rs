@@ -209,7 +209,7 @@ impl FloatMonitor {
         self.frame = Some(frame);
     }
 
-    /// "还原": hand the preview back to the right side panel, focus the main
+    /// Redock the preview in the right side panel and focus the main window.
     /// window and close this one. The Workbench clears its float bookkeeping
     /// first so the close observer treats it as a programmatic close.
     fn redock(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -1,15 +1,15 @@
-//! MCP `ServerHandler` 实现：工具集与 `docs/API_CONTRACT.md` 对齐。
+//! MCP tool registration, dispatch, and authorization.
 //!
-//! MCP 先检查工具白名单，再进行凭据和 DUT 授权。
-//! 内部设备服务保留原有权限、租约与审批校验。
+//! Check the tool allowlist before checking credentials and DUT grants.
+//! The internal device services retain their own lease, approval, and permission checks.
 //!
-//! 授权三层（SPEC §14 / 方案 §3 TOCTOU）：
-//! - [B] 授权（Grant）：auth 开启时写工具按 `DutAction` 校验凭据授权，deny by default；
-//! - [C] 租约：写工具凭 `dut_acquire_control` 取得的 `lease_id（归属当前凭据` +
-//!   generation 复核）构造写身份，device 写入通道再做 [D]/[E] 双点复核；
-//! - `审批令牌保留为高危动作二次确认（Power/Reset/PowerKey/relay_test/无租约写`）。
+//! Layer the checks as follows.
+//! Verify the credential has the requested DUT action grant.
+//! Verify lease ownership and generation before constructing the write identity.
+//! The device checks that identity at both admission and execution.
+//! Approval tokens provide a separate confirmation for designated writes.
 //!
-//! 校验失败返回 isError 工具结果（`LeaseRequired/{code}` / `ApprovalRequired/{code}`）。
+//! Return authorization, lease, and approval failures as coded tool errors.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -50,11 +50,13 @@ pub const NOTIFY_TOOL_NAME: &str = "notify_user";
 pub const DUT_CONTROL_TOOL_NAME: &str = "dut_control";
 pub const SERIAL_EXEC_TOOL_NAME: &str = "serial_exec";
 pub const ADB_EXEC_TOOL_NAME: &str = "adb_exec";
+pub const AGENT_FEEDBACK_TOOL_NAME: &str = "agent_feedback";
 pub const USER_EXTRA_TOOL_NAMES: &[&str] = &[
     NOTIFY_TOOL_NAME,
     DUT_CONTROL_TOOL_NAME,
     SERIAL_EXEC_TOOL_NAME,
     ADB_EXEC_TOOL_NAME,
+    AGENT_FEEDBACK_TOOL_NAME,
 ];
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -118,6 +120,18 @@ pub struct SerialReadArgs {
     /// Return the newest `tail` chunks (1..=400), replacing the legacy `analyze_serial` tool.
     #[serde(default)]
     pub tail: Option<usize>,
+    /// Output mode: `"stream"` (default raw chunks) or `"screen"` (clean rendered VT100 terminal screen).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Optional literal substring to wait for on the live serial stream (bounded by `timeoutMs`).
+    #[serde(default)]
+    pub wait_for: Option<String>,
+    /// Optional bounded regex pattern to wait for on the live serial stream (bounded by `timeoutMs`).
+    #[serde(default)]
+    pub wait_regex: Option<String>,
+    /// Optional wait budget in ms when `waitFor` or `waitRegex` is set (default 5000, clamped 100..=30000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -144,6 +158,9 @@ pub struct DutControlArgs {
     /// Optional explicit multi-step lease handle from `dut_control(action="acquire_lease")` (required for `renew_lease`/`release_lease`).
     #[serde(default)]
     pub lease_id: Option<String>,
+    /// Registered session name occupying the serial port (required for `action="acquire_lease"`, optional for single-step auto-leases).
+    #[serde(default)]
+    pub session_name: Option<String>,
     /// Optional FIFO wait budget in ms when another Agent holds this DUT (default 5000, max 60000; up to 120000 for `acquire_lease`).
     #[serde(default)]
     pub wait_ms: Option<u64>,
@@ -173,6 +190,9 @@ pub struct AdbExecArgs {
     /// Optional explicit multi-step lease handle from `dut_control(action="acquire_lease")`.
     #[serde(default)]
     pub lease_id: Option<String>,
+    /// Optional session name registered when acquiring a temporary serial lease.
+    #[serde(default)]
+    pub session_name: Option<String>,
     /// Optional FIFO wait budget in ms when another Agent holds this DUT (default 5000, max 60000).
     #[serde(default)]
     pub wait_ms: Option<u64>,
@@ -188,6 +208,9 @@ pub struct SerialExecArgs {
     /// Plain text/command to send immediately when `waitFor` is not used.
     #[serde(default)]
     pub text: Option<String>,
+    /// Validated logical terminal keys to send as raw control bytes (e.g. `["ctrl+c"]`, `["esc"]`, `["up", "enter"]`).
+    #[serde(default)]
+    pub keys: Option<Vec<String>>,
     /// Bookmark serial cursor before triggering relay `reset` so boot prompts are never missed.
     #[serde(default)]
     pub trigger_reset: bool,
@@ -203,6 +226,15 @@ pub struct SerialExecArgs {
     /// Optional substring to wait for after sending commands to confirm completion.
     #[serde(default)]
     pub expect: Option<String>,
+    /// Optional bounded regex pattern to wait for after sending commands to confirm completion.
+    #[serde(default)]
+    pub expect_regex: Option<String>,
+    /// Optional quiet-settle window in ms (200..=5000): once output starts arriving, treat the command as done after `settleMs` of silence.
+    #[serde(default)]
+    pub settle_ms: Option<u64>,
+    /// Stall detection threshold in ms (default 3000, clamped 200..=30000): flag `stalled: true` if zero response bytes arrive within this window.
+    #[serde(default)]
+    pub stall_timeout_ms: Option<u64>,
     /// Optional `[mark] {label}` written to the DUT serial log (creates a log segment boundary when split logs are enabled).
     #[serde(default)]
     pub mark_label: Option<String>,
@@ -215,6 +247,9 @@ pub struct SerialExecArgs {
     /// Optional explicit multi-step lease handle from `dut_control(action="acquire_lease")`.
     #[serde(default)]
     pub lease_id: Option<String>,
+    /// Optional session name registered when acquiring a temporary serial lease.
+    #[serde(default)]
+    pub session_name: Option<String>,
     /// Optional FIFO wait budget in ms when another Agent holds this DUT (default 5000, max 60000).
     #[serde(default)]
     pub wait_ms: Option<u64>,
@@ -251,10 +286,37 @@ pub struct LogSegmentReadArgs {
 struct DutFilesArgs {
     /// Omit to discover all DUT folders in the working directory.
     dut_id: Option<String>,
+    /// Optional category filter: `image` | `TEST` | `压力&老化` | `串口日志` | `misc` | `feedback`.
+    #[serde(default)]
+    category: Option<String>,
     #[serde(default)]
     offset: usize,
     #[serde(default = "default_limit")]
     limit: usize,
+}
+
+/// Arguments of `agent_feedback`: record structured Agent usage feedback under `feedback/`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentFeedbackArgs {
+    /// Target DUT ID (auto-bound on a DUT-scoped listener; writes to `<work_dir>/feedback/` when omitted on a generic listener).
+    #[serde(default)]
+    pub dut_id: Option<String>,
+    /// Feedback category: `bug` | `usability` | `missing_feature` | `performance` | `doc` | `other`.
+    pub category: String,
+    /// Severity: `low` | `medium` | `high` (default `medium`).
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// Short feedback summary (1..=120 characters).
+    pub title: String,
+    /// Detailed context, pain point, reproduction steps, or optimization suggestion (1..=8192 characters).
+    pub detail: String,
+    /// Optional related MCP tool name (e.g. `serial_exec`, `dut_control`).
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// Optional Agent session name.
+    #[serde(default)]
+    pub session_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -271,11 +333,11 @@ struct DutFileReadArgs {
 pub struct SerialWriteArgs {
     pub dut_id: String,
     pub text: String,
-    /// 高危二次确认令牌：未携带 `lease_id` 时必填（现状兼容）；
-    /// 携带有效 `lease_id` 时租约即控制凭据（审批豁免，方案 §6.2）
+    /// Supply an approval token for the supported unleased compatibility path.
+    /// A valid control lease is sufficient where the tool permits leased writes.
     #[serde(default)]
     pub approval_token: Option<String>,
-    /// `控制租约句柄（dut_acquire_control` 返回；归属当前凭据 + generation 复核）
+    /// Lease handle issued by the acquire tool and verified against the current credential.
     #[serde(default)]
     pub lease_id: Option<String>,
 }
@@ -285,7 +347,7 @@ pub struct SerialWriteArgs {
 pub struct SerialWriteRequest {
     #[serde(flatten)]
     args: SerialWriteArgs,
-    /// 每次新操作生成唯一值。连接重建或请求超时后，在五分钟内用相同 ID 和 text 重试。
+    /// Use a fresh ID for each operation. Retry within five minutes with the same ID and text.
     request_id: Option<String>,
 }
 
@@ -318,7 +380,7 @@ struct WriteReceipt {
 #[serde(rename_all = "camelCase")]
 pub struct AdbShellArgs {
     pub dut_id: String,
-    /// argv 形式（不含 adb 本体与 -s），例如 `["shell", "getprop", "ro.product.model"]`
+    /// Pass the ADB arguments without the executable or the device-selection flags.
     pub argv: Vec<String>,
     pub approval_token: String,
     #[serde(default)]
@@ -348,7 +410,7 @@ pub struct ControlResetArgs {
 #[serde(rename_all = "camelCase")]
 pub struct ControlPowerKeyArgs {
     pub dut_id: String,
-    /// false=短按（开机）true=长按（强制断电）
+    /// Use false for a short power-key press and true for a long press.
     pub long_press: bool,
     pub approval_token: String,
     #[serde(default)]
@@ -359,7 +421,7 @@ pub struct ControlPowerKeyArgs {
 #[serde(rename_all = "camelCase")]
 pub struct RelayTestArgs {
     pub dut_id: String,
-    /// 继电器通道号（1 起始；仅测试该单通道，其他通道不动）
+    /// One-based relay channel. The test affects only this channel.
     pub channel: u8,
     pub approval_token: String,
     #[serde(default)]
@@ -370,10 +432,12 @@ pub struct RelayTestArgs {
 #[serde(rename_all = "camelCase")]
 pub struct AcquireControlArgs {
     pub dut_id: String,
-    /// 忙时是否排队等待（FIFO）
+    /// Required session name occupying the serial port (1..=128 chars).
+    pub session_name: String,
+    /// Whether to wait in FIFO order when the lease is busy.
     #[serde(default)]
     pub wait: bool,
-    /// 等待上限毫秒（wait=true 时生效；0 = 不等待，忙即拒）
+    /// Maximum wait in milliseconds. Zero returns immediately.
     #[serde(default)]
     pub deadline_ms: u64,
 }
@@ -382,7 +446,7 @@ pub struct AcquireControlArgs {
 #[serde(rename_all = "camelCase")]
 pub struct LeaseIdArgs {
     pub dut_id: String,
-    /// `dut_acquire_control` 返回的租约句柄
+    /// Handle returned by the control lease acquire tool.
     pub lease_id: String,
 }
 
@@ -390,7 +454,7 @@ pub struct LeaseIdArgs {
 #[serde(rename_all = "camelCase")]
 pub struct DutLabelArgs {
     pub dut_id: String,
-    /// 分段标记文本（`[mark] {label}`；示例「烧录前」「重启后第 1 次采样」）
+    /// Text appended to the segment marker.
     pub label: String,
 }
 
@@ -406,7 +470,7 @@ pub struct HeartbeatSetArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FlashTestArgs {
-    /// settings.flashTools[].id（稳定预设 id，非可执行路径）
+    /// Stable ID of the flash preset in settings.
     pub preset_id: String,
 }
 
@@ -436,11 +500,11 @@ pub struct ApprovalRequestArgs {
     pub dut_id: String,
     /// serial.write | adb.shell | control.power | control.reset | control.test
     pub action: String,
-    /// 被授权操作的参数（JSON 对象，用于绑定校验；control.test 绑定 {"channel": N}）
+    /// JSON parameters bound to the approval. Channel tests bind the channel number.
     pub args: serde_json::Value,
 }
 
-/// 审批校验失败 → isError 工具结果（含引导提示）
+/// Return a coded approval failure with recovery instructions.
 fn approval_error(err: &ApprovalErr) -> rmcp::ErrorData {
     rmcp::ErrorData::invalid_params(
         format!("ApprovalRequired/{}: {}", err.code(), err.message()),
@@ -550,16 +614,16 @@ fn media_recording_json(recording: RecordingHandle) -> serde_json::Value {
     serde_json::Value::Object(object)
 }
 
-/// MCP Server 核心。`state` 由宿主注入（进程内 Runtime 或快照文件）；
-/// `access` 为 None 时（stdio 快照）按 `LocalAdmin` 语义、不做授权/租约复核
-/// （写工具由状态源只读限制拒绝）。
+/// Server core with the host-supplied live or snapshot state.
+/// Stdio uses the local administrator context.
+/// Its snapshot implementation rejects writes.
 #[derive(Clone)]
 pub struct McpServerCore {
     state: Arc<dyn McpState>,
     access: Option<Arc<AccessContext>>,
-    /// 监听器对外地址（SKILL.md 生成用；局域网模式为探测到的局域网 IP）。
+    /// Address advertised in the generated skill for this listener.
     listener_endpoint: Option<SocketAddr>,
-    /// DUT 专用监听器绑定的 DUT；`None` = 通用监听器（LLM 全局读取）。
+    /// DUT bound to a dedicated listener. General listeners have no fixed DUT.
     listener_dut: Option<Arc<str>>,
     /// Evidence-only server (A2A): tool calls outside [`EVIDENCE_TOOL_NAMES`]
     /// are rejected even when they are otherwise plan-safe reads.
@@ -612,11 +676,6 @@ impl McpServerCore {
 
     pub(crate) fn with_listener_endpoint(mut self, endpoint: Option<SocketAddr>) -> Self {
         self.listener_endpoint = endpoint;
-        self
-    }
-
-    pub(crate) fn with_listener_dut(mut self, dut_id: Option<&str>) -> Self {
-        self.listener_dut = dut_id.map(Arc::from);
         self
     }
 
@@ -722,15 +781,15 @@ impl McpServerCore {
         )
     }
 
-    /// [B] 授权（SPEC §5.2 deny by default）：LocalAdmin（auth 关/stdio）全通过；
-    /// auth 开启时按 `DutAction` 校验凭据 Grant，拒绝记审计 grant.deny。
+    /// The local administrator context has full grants.
+    /// Authenticated credentials require the requested DUT grant. Record denials in the audit log.
     fn authorize(
         &self,
         principal: &Principal,
         dut_id: &str,
         action: DutAction,
     ) -> Result<(), rmcp::ErrorData> {
-        // DUT 专用监听器：跨 DUT 一律拒绝，且不确认目标 DUT 是否存在。
+        // Reject cross-DUT requests without disclosing target existence.
         if let Some(bound) = self.listener_dut.as_deref()
             && bound != dut_id
         {
@@ -756,7 +815,7 @@ impl McpServerCore {
         Err(unauthorized_error(dut_id, action.as_str()))
     }
 
-    /// 读类工具授权（dut 作用域）。
+    /// Verify the read grant for the selected DUT.
     fn authorize_read(&self, principal: &Principal, dut_id: &str) -> Result<(), rmcp::ErrorData> {
         if dut_id.trim().is_empty() {
             return Err(rmcp::ErrorData::invalid_params(
@@ -822,13 +881,13 @@ impl McpServerCore {
         self.authorize(principal, dut_id, DutAction::Read)
     }
 
-    /// DUT 专用端点省略参数时的默认 DUT。
+    /// Return the default DUT for a dedicated endpoint.
     fn scoped_dut<'a>(&'a self, requested: Option<&'a str>) -> Option<&'a str> {
         requested.or(self.listener_dut.as_deref())
     }
 
-    /// `全局清单类工具授权（dut_list` / `adb_list_devices` / `skill_export`）：
-    /// 凭据需至少对一个 DUT 持有 read 授权。涉及 DUT 记录的结果仍按 DUT 过滤。
+    /// Listing tools require a read grant for at least one DUT.
+    /// Filter individual DUT results against their own grants.
     fn authorize_any_read(&self, principal: &Principal) -> Result<(), rmcp::ErrorData> {
         if let Some(bound) = self.listener_dut.as_deref() {
             return self.authorize(principal, bound, DutAction::Read);
@@ -842,8 +901,8 @@ impl McpServerCore {
         let Principal::Agent { credential_id, .. } = principal else {
             return Ok(());
         };
-        // 合并授权视图（持久表 + 每会话 runtime overlay）：会话凭据的 read
-        // 授权与持久凭据同样可见，停用/未知凭据一律拒绝。
+        // Combine persistent and session-specific grants.
+        // Inactive and unknown credentials cannot use either grant source.
         let any_read = access.auth.grants_for(credential_id).is_some_and(|grants| {
             grants
                 .iter()
@@ -864,7 +923,7 @@ impl McpServerCore {
         }
     }
 
-    /// acquire 前置授权（SPEC §6.4 失败路径 Unauthorized）：该 DUT 任一写类 Grant。
+    /// Acquisition requires at least one write grant for the DUT.
     fn authorize_any_write(
         &self,
         principal: &Principal,
@@ -904,11 +963,11 @@ impl McpServerCore {
         Err(unauthorized_error(dut_id, "任一写类动作"))
     }
 
-    /// [C] 租约复核（归属当前凭据 + generation）：构造携带 (`lease_id`, generation)
-    /// 的写身份，device 写入通道再做 [D]/[E] 双点复核。
-    /// - auth `ON：lease_id` 必填（先 `dut_acquire_control），归属当前凭据`；
-    /// - auth OFF（偏差 7 `过渡）：lease_id` 可省（GUI 租约在场仍被 device 拒）；
-    ///   提供时同样校验归属。
+    /// Check the credential's lease ownership and generation to build the write context.
+    /// The actor rechecks it when queuing and executing the write.
+    /// With authentication enabled, clients must acquire a lease first.
+    /// Unauthenticated compatibility paths may omit the lease.
+    /// A supplied lease is still validated and GUI takeover remains effective.
     fn lease_identity(
         &self,
         principal: &Principal,
@@ -950,7 +1009,7 @@ impl McpServerCore {
         }
     }
 
-    /// renew/release 的持有者归属复核（Agent 凭据必须与租约持有者一致）。
+    /// Verify that an Agent owns the lease before renewal or release.
     fn ensure_holder_owned(
         &self,
         principal: &Principal,
@@ -967,6 +1026,103 @@ impl McpServerCore {
                 .map_err(|err| lease_error(&err))?;
         }
         Ok(())
+    }
+
+    /// Derive a unified machine-readable DUT state and deterministic next-action hint
+    /// for Agent preflight routing (`ready`, `busy_gui`, `busy_agent`, `flashing`,
+    /// `needs_inspection`, `manual_takeover`, `disconnected`).
+    fn derive_dut_state(
+        &self,
+        source: &str,
+        control: Option<&crate::state::ControlStatusDto>,
+    ) -> (&'static str, String) {
+        if self
+            .access
+            .as_ref()
+            .is_some_and(|access| access.lease.manual_control())
+        {
+            return (
+                "manual_takeover",
+                "Manual takeover is active in duthub. Read-only inspection still works; wait for the human operator to disable Manual Takeover before writing or controlling hardware.".into(),
+            );
+        }
+        if let Some(ctrl) = control {
+            match ctrl.state.as_str() {
+                "needs_inspection" => {
+                    return (
+                        "needs_inspection",
+                        "DUT is locked for human safety inspection after a fault. Do not retry writes; call notify_user and wait for operator clearance.".into(),
+                    );
+                }
+                "protected" => {
+                    let op = ctrl
+                        .protected_op
+                        .as_deref()
+                        .unwrap_or("protected operation");
+                    return (
+                        "flashing",
+                        format!(
+                            "DUT is in protected state ({op}). Avoid control writes; monitor via serial_read or dut_status until it returns to ready."
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if source == "idle" {
+            return (
+                "disconnected",
+                "Serial session is not open. Read saved logs via log_segments or call notify_user to ask the operator to open the serial port.".into(),
+            );
+        }
+        if let Some(ctrl) = control
+            && ctrl.state == "held"
+        {
+            let holder = ctrl.holder.as_deref().unwrap_or("unknown");
+            if holder.eq_ignore_ascii_case("gui") || holder.contains("GUI") {
+                return (
+                    "busy_gui",
+                    "Desktop GUI operator holds the serial port. Do not retry-loop writes; call notify_user to ask the operator to release control (or start duthub with --release-gui-lease).".into(),
+                );
+            }
+            let session = ctrl
+                .session_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(holder);
+            let occupied = ctrl.occupied_secs.unwrap_or(0);
+            return (
+                "busy_agent",
+                format!(
+                    "Held by Agent session '{session}' (occupied {occupied}s, queue={}). Use waitMs to queue politely or notify_user if stuck.",
+                    ctrl.queue_len
+                ),
+            );
+        }
+        (
+            "ready",
+            "DUT is ready for serial_read, serial_exec, adb_exec, and dut_control.".into(),
+        )
+    }
+
+    /// Return the clean rendered terminal screen text for a DUT, preferring the live
+    /// VT100 emulator snapshot and falling back to ANSI-stripped recent serial output.
+    fn render_dut_screen(&self, dut_id: &str, max_tail_lines: Option<usize>) -> Option<String> {
+        let raw = if let Some(screen) = self.state.serial_screen(dut_id) {
+            screen
+        } else {
+            let result = self.state.serial_read(dut_id, 0, usize::MAX)?;
+            let start = result.lines.len().saturating_sub(150);
+            let mut joined = String::new();
+            for line in &result.lines[start..] {
+                joined.push_str(&line.text);
+            }
+            crate::keys::strip_ansi_escapes(&joined)
+        };
+        Some(match max_tail_lines {
+            Some(max_lines) => tail_text_lines(&raw, max_lines),
+            None => raw,
+        })
     }
 
     /// Build a human-intervention desktop notice when an Agent fails to obtain
@@ -992,7 +1148,8 @@ impl McpServerCore {
         };
         let dut_label = self
             .state
-            .dut_info(dut_id).map_or_else(|| dut_id.to_owned(), |info| info.name);
+            .dut_info(dut_id)
+            .map_or_else(|| dut_id.to_owned(), |info| info.name);
 
         let code = err
             .data
@@ -1023,22 +1180,16 @@ impl McpServerCore {
                 ),
                 "Wait for the human operator to disable Manual Takeover in duthub.",
             ),
-            (
-                _,
-                false,
-                Some(st),
-            ) if st.phase == duthub_core::lease::LeasePhase::NeedsInspection => (
-                "Human intervention: DUT needs safety check",
-                format!(
-                    "Agent '{requester}' cannot run '{action_label}' on {dut_label}: previous critical operation requires manual inspection and recovery in duthub."
-                ),
-                "Wait for the human operator to inspect the hardware and click 'Mark safe & recover'.",
-            ),
-            (
-                _,
-                false,
-                Some(st),
-            ) if st.phase == duthub_core::lease::LeasePhase::Protected => {
+            (_, false, Some(st)) if st.phase == duthub_core::lease::LeasePhase::NeedsInspection => {
+                (
+                    "Human intervention: DUT needs safety check",
+                    format!(
+                        "Agent '{requester}' cannot run '{action_label}' on {dut_label}: previous critical operation requires manual inspection and recovery in duthub."
+                    ),
+                    "Wait for the human operator to inspect the hardware and click 'Mark safe & recover'.",
+                )
+            }
+            (_, false, Some(st)) if st.phase == duthub_core::lease::LeasePhase::Protected => {
                 let op = st.protected_op.as_deref().unwrap_or("critical operation");
                 (
                     "Human intervention: DUT in protected operation",
@@ -1048,11 +1199,7 @@ impl McpServerCore {
                     "Wait for the protected operation (such as firmware flashing) to finish, then retry.",
                 )
             }
-            (
-                _,
-                false,
-                Some(st),
-            ) if st.phase == duthub_core::lease::LeasePhase::Held => {
+            (_, false, Some(st)) if st.phase == duthub_core::lease::LeasePhase::Held => {
                 let holder = st.holder.as_deref().unwrap_or("another holder");
                 if holder.starts_with("GUI") {
                     (
@@ -1114,6 +1261,15 @@ impl McpServerCore {
             if let Some(holder) = st.holder {
                 data.insert("holder".into(), serde_json::json!(holder));
             }
+            if let Some(session_name) = st.session_name {
+                data.insert("sessionName".into(), serde_json::json!(session_name));
+            }
+            if let Some(acquired_at) = st.acquired_at_unix_ms {
+                data.insert("acquiredAtUnixMs".into(), serde_json::json!(acquired_at));
+            }
+            if let Some(occupied_secs) = st.occupied_secs {
+                data.insert("occupiedSecs".into(), serde_json::json!(occupied_secs));
+            }
             data.insert("queueLen".into(), serde_json::json!(st.queue_len));
             if let Some(op) = st.protected_op {
                 data.insert("protectedOp".into(), serde_json::json!(op));
@@ -1134,12 +1290,17 @@ impl McpServerCore {
     /// Acquire or validate an exclusive DUT control lease for a write/control/ADB
     /// operation, supporting fair FIFO queuing across concurrent Agents and
     /// automatic human-intervention alerts when access is blocked.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal helper aggregating lease options from MCP tool arguments"
+    )]
     async fn acquire_or_use_lease(
         &self,
         principal: &Principal,
         dut_id: &str,
         action_label: &str,
         explicit_lease_id: Option<&str>,
+        session_name: Option<&str>,
         wait_ms: Option<u64>,
         notify_on_blocked: Option<bool>,
     ) -> Result<(WriteIdentity, Option<ScopedLeaseGuard>, u64), rmcp::ErrorData> {
@@ -1163,6 +1324,20 @@ impl McpServerCore {
         }
 
         let holder = holder_for(principal);
+        let registered_session = if let Some(raw) = session_name {
+            duthub_core::lease::validate_session_name(raw).map_err(|msg| {
+                rmcp::ErrorData::invalid_params(
+                    msg,
+                    Some(serde_json::json!({ "code": "INVALID_SESSION_NAME" })),
+                )
+            })?
+        } else {
+            let requester = match principal {
+                Principal::Agent { agent_name, .. } => agent_name.as_str(),
+                Principal::LocalAdmin => "local-admin",
+            };
+            format!("{requester}/{action_label}")
+        };
         let status = access.lease.status(dut_id);
         let blocked_for_human = access.lease.manual_control()
             || matches!(
@@ -1186,7 +1361,8 @@ impl McpServerCore {
 
         let started = Instant::now();
         let grant_result = if effective_wait_ms == 0 {
-            self.state.dut_acquire_control(dut_id, holder, 0)
+            self.state
+                .dut_acquire_control_with_session(dut_id, holder, &registered_session, 0)
         } else {
             let Ok(permit) = self.lease_waits.clone().try_acquire_owned() else {
                 let err = rmcp::ErrorData::new(
@@ -1207,7 +1383,12 @@ impl McpServerCore {
             let dut = dut_id.to_owned();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                state.dut_acquire_control(&dut, holder, effective_wait_ms)
+                state.dut_acquire_control_with_session(
+                    &dut,
+                    holder,
+                    &registered_session,
+                    effective_wait_ms,
+                )
             })
             .await
             .map_err(|_| state_err("Lease wait worker failed"))?
@@ -1337,7 +1518,7 @@ impl McpServerCore {
     }
 
     #[tool(
-        description = "列出当前凭据有权读取的 DUT、串口状态及已配置的继电器控制能力（只读，不含凭据）"
+        description = "列出当前凭据有权读取的 DUT、机读状态（dutState + nextActionHint）、串口摘要、已配置的继电器控制能力及当前串口占用信息（只读，不含凭据）"
     )]
     #[expect(
         clippy::needless_pass_by_value,
@@ -1371,6 +1552,15 @@ impl McpServerCore {
                     value["relayCapabilities"] = serde_json::json!(relay.capabilities);
                     value["relayChannels"] = serde_json::json!(relay.channels);
                 }
+                let control_status = self.state.dut_control_status(&d.dut_id).ok();
+                let (dut_state, next_action_hint) =
+                    self.derive_dut_state(&d.source, control_status.as_ref());
+                value["dutState"] = serde_json::json!(dut_state);
+                value["nextActionHint"] = serde_json::json!(next_action_hint);
+                if let Some(control_status) = control_status {
+                    value["controlStatus"] =
+                        serde_json::to_value(control_status).unwrap_or(serde_json::Value::Null);
+                }
                 value
             })
             .collect();
@@ -1378,7 +1568,7 @@ impl McpServerCore {
     }
 
     #[tool(
-        description = "获取单个 DUT 的完整只读状态（合并原 dut_info/dut_control_status/heartbeat_get/relay_status）：返回串口与会话、已配置继电器板卡与各功能通道（power/reset/recovery/maskrom/powerKey）、继电器通道实时状态、烧录模式能力、控制租约与心跳状态。"
+        description = "获取单个 DUT 的完整只读状态（合并原 dut_info/dut_control_status/heartbeat_get/relay_status）：返回机读 dutState 与 nextActionHint、串口与会话、已配置继电器板卡与各功能通道（power/reset/recovery/maskrom/powerKey）、继电器通道实时状态、烧录模式能力、控制租约与心跳状态。"
     )]
     async fn dut_status(
         &self,
@@ -1417,16 +1607,17 @@ impl McpServerCore {
         let can_enter_maskrom = has_maskrom && can_trigger_reboot;
         let can_enter_loader_hw = has_recovery && can_trigger_reboot;
         let can_enter_loader_serial = session_id.is_some();
-        let recommended_loader_flow = if can_enter_loader_hw {
-            "hardware_recovery_relay"
-        } else if has_adb {
-            "adb_exec_reboot_loader_or_serial_exec"
-        } else if can_enter_loader_serial && has_reset {
-            "serial_exec_with_trigger_reset_or_reboot_loader"
-        } else if can_enter_loader_serial {
-            "serial_exec_reboot_loader"
-        } else {
-            "unavailable"
+        let recommended_loader_flow = match (
+            can_enter_loader_hw,
+            has_adb,
+            can_enter_loader_serial,
+            has_reset,
+        ) {
+            (true, _, _, _) => "hardware_recovery_relay",
+            (false, true, _, _) => "adb_exec_reboot_loader_or_serial_exec",
+            (false, false, true, true) => "serial_exec_with_trigger_reset_or_reboot_loader",
+            (false, false, true, false) => "serial_exec_reboot_loader",
+            (false, false, false, _) => "unavailable",
         };
         let channel_states = if info.relay.is_some() {
             let state = self.state.clone();
@@ -1449,10 +1640,11 @@ impl McpServerCore {
         } else {
             None
         };
-        let control = self
-            .state
-            .dut_control_status(&args.dut_id)
-            .ok()
+        let control_dto = self.state.dut_control_status(&args.dut_id).ok();
+        let (dut_state, next_action_hint) =
+            self.derive_dut_state(&info.source, control_dto.as_ref());
+        let control = control_dto
+            .as_ref()
             .and_then(|status| serde_json::to_value(status).ok());
         let heartbeat = self
             .state
@@ -1460,6 +1652,8 @@ impl McpServerCore {
             .ok()
             .and_then(|hb| serde_json::to_value(hb).ok());
         let mut payload = serde_json::to_value(&info).unwrap_or(serde_json::Value::Null);
+        payload["dutState"] = serde_json::json!(dut_state);
+        payload["nextActionHint"] = serde_json::json!(next_action_hint);
         payload["session_id"] = serde_json::json!(session_id);
         payload["session_open"] = serde_json::json!(session_id.is_some());
         payload["relayChannelStates"] =
@@ -1477,18 +1671,152 @@ impl McpServerCore {
     }
 
     #[tool(
-        description = "读取 DUT 实时串口数据块。支持游标续读（sinceSeq + limit）或直接取尾部最新 N 行（tail=1..=400，替代原 analyze_serial）。关闭会话的历史请使用 log_segments。"
+        description = "读取 DUT 实时串口数据或干净的 VT100 渲染屏快照。支持游标续读（sinceSeq + limit）、尾部取数（tail=1..=400）、渲染屏模式（mode=\"screen\"）以及只读阻塞等待（waitFor / waitRegex + timeoutMs）。关闭会话的历史请使用 log_segments。"
     )]
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "required by rmcp #[tool] extractor signature"
-    )]
-    fn serial_read(
+    async fn serial_read(
         &self,
         Parameters(args): Parameters<SerialReadArgs>,
         principal: CurrentPrincipal,
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
+        const MAX_WAIT_PATTERN_CHARS: usize = 256;
+
         self.authorize_read(&principal.0, &args.dut_id)?;
+        let mode = match args
+            .mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None | Some("stream") => "stream",
+            Some("screen") => "screen",
+            Some(other) => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    format!(
+                        "unsupported serial_read mode '{other}'; expected 'stream' or 'screen'"
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        let wait_for = args
+            .wait_for
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        if let Some(pat) = wait_for.as_deref()
+            && pat.chars().count() > MAX_WAIT_PATTERN_CHARS
+        {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!("waitFor exceeds {MAX_WAIT_PATTERN_CHARS} chars"),
+                None,
+            ));
+        }
+        let wait_regex = match args.wait_regex.as_deref().filter(|s| !s.is_empty()) {
+            Some(pat) => Some(compile_bounded_regex(pat, "waitRegex")?),
+            None => None,
+        };
+
+        // Screen-only snapshot mode (no wait pattern).
+        if mode == "screen" && wait_for.is_none() && wait_regex.is_none() {
+            let Some(probe) = self.state.serial_read(&args.dut_id, 0, 1) else {
+                return Err(rmcp::ErrorData::new(
+                    rmcp::model::ErrorCode(-32000),
+                    "DUT 会话未打开。已保存的历史请查 log_segments。",
+                    Some(serde_json::json!({ "kind": "session", "code": "SESSION_NOT_OPEN" })),
+                ));
+            };
+            let latest_seq = self
+                .state
+                .serial_read(&args.dut_id, 0, usize::MAX)
+                .map_or(probe.last_seq, |r| r.last_seq);
+            let screen = self
+                .render_dut_screen(&args.dut_id, args.tail.map(|t| t.clamp(1, 400)))
+                .unwrap_or_default();
+            return Ok(Json(serde_json::json!({
+                "dut_id": args.dut_id,
+                "session_id": probe.session_id,
+                "last_seq": latest_seq,
+                "mode": "screen",
+                "screen": screen,
+                "resourceUri": format!("duthub://dut/{}/serial/screen", args.dut_id),
+            })));
+        }
+
+        // Read-only wait mode (`waitFor` and/or `waitRegex`), cursor-safe with `sinceSeq`.
+        if wait_for.is_some() || wait_regex.is_some() {
+            let limit = args.limit.clamp(1, 400);
+            let timeout_ms = args.timeout_ms.unwrap_or(5_000).clamp(100, 30_000);
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(timeout_ms);
+            let mut cursor = args.since_seq;
+            let mut session_id;
+            let mut collected: Vec<crate::state::LogLineDto> = Vec::new();
+            let mut raw_buf = String::new();
+            let mut matched_by = "timeout";
+
+            loop {
+                let page_limit = if cursor == 0 { usize::MAX } else { 400 };
+                let Some(page) = self.state.serial_read(&args.dut_id, cursor, page_limit) else {
+                    return Err(rmcp::ErrorData::new(
+                        rmcp::model::ErrorCode(-32000),
+                        "DUT 会话未打开。已保存的历史请查 log_segments。",
+                        Some(serde_json::json!({ "kind": "session", "code": "SESSION_NOT_OPEN" })),
+                    ));
+                };
+                session_id = page.session_id;
+                cursor = page.last_seq;
+                for line in page.lines {
+                    if raw_buf.len() < 128 * 1024 {
+                        raw_buf.push_str(&line.text);
+                    }
+                    collected.push(line);
+                }
+                if collected.len() > limit {
+                    let drop_n = collected.len() - limit;
+                    collected.drain(..drop_n);
+                }
+                let cleaned = crate::keys::strip_ansi_escapes(&raw_buf);
+                if let Some(pat) = wait_for.as_deref()
+                    && (raw_buf.contains(pat) || cleaned.contains(pat))
+                {
+                    matched_by = "waitFor";
+                    break;
+                }
+                if let Some(re) = wait_regex.as_ref()
+                    && (re.is_match(&raw_buf) || re.is_match(&cleaned))
+                {
+                    matched_by = "waitRegex";
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            let matched = matched_by != "timeout";
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let mut payload = serde_json::json!({
+                "dut_id": args.dut_id,
+                "session_id": session_id,
+                "last_seq": cursor,
+                "lines": collected,
+                "cursorReset": cursor < args.since_seq,
+                "mode": mode,
+                "matched": matched,
+                "matchedBy": matched_by,
+                "elapsedMs": elapsed_ms,
+            });
+            if mode == "screen" || !matched {
+                payload["screen"] = serde_json::json!(
+                    self.render_dut_screen(&args.dut_id, Some(40))
+                        .unwrap_or_default()
+                );
+            }
+            return Ok(Json(payload));
+        }
+
         if let Some(tail) = args.tail {
             let tail = tail.clamp(1, 400);
             return match self.state.serial_read(&args.dut_id, 0, usize::MAX) {
@@ -1582,7 +1910,7 @@ impl McpServerCore {
     }
 
     #[tool(
-        description = "读取工作目录内各 DUT 的资料目录。省略 dutId 时列出 DUT（DUT 专用端点默认到绑定 DUT），指定 dutId 时分页列出该目录内的普通文件。"
+        description = "读取工作目录内各 DUT 的资料目录。省略 dutId 时列出 DUT（DUT 专用端点默认到绑定 DUT），指定 dutId 时分页列出该目录内的普通文件，支持按 category（image/TEST/压力&老化/串口日志/misc/feedback）过滤。"
     )]
     #[expect(
         clippy::needless_pass_by_value,
@@ -1594,7 +1922,27 @@ impl McpServerCore {
         principal: CurrentPrincipal,
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
         let limit = args.limit.clamp(1, 200);
-        // DUT 专用端点省略 dutId 时默认到绑定 DUT，避免误读别的 DUT 资料。
+        let category_filter = match args
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(cat) => {
+                if !duthub_core::dut_artifacts::DUT_CATEGORY_DIRS.contains(&cat) {
+                    return Err(rmcp::ErrorData::invalid_params(
+                        format!(
+                            "category must be one of: {}",
+                            duthub_core::dut_artifacts::DUT_CATEGORY_DIRS.join(", ")
+                        ),
+                        Some(serde_json::json!({ "code": "INVALID_CATEGORY" })),
+                    ));
+                }
+                Some(cat.to_owned())
+            }
+            None => None,
+        };
+        // Default to the listener's own DUT when the caller omits the ID.
         if let Some(dut_id) = self.scoped_dut(args.dut_id.as_deref()) {
             self.authorize_scoped_read(&principal.0, dut_id)?;
             let root = self
@@ -1605,12 +1953,16 @@ impl McpServerCore {
                 .state
                 .dut_info(dut_id)
                 .ok_or_else(|| state_err("DUT 不存在"))?;
-            let files = match duthub_core::dut_artifacts::list_files(&root, &dut.dut_id, &dut.name)
-            {
-                Ok(files) => files,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => return Err(state_err(&error.to_string())),
-            };
+            let mut files =
+                match duthub_core::dut_artifacts::list_files(&root, &dut.dut_id, &dut.name) {
+                    Ok(files) => files,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(error) => return Err(state_err(&error.to_string())),
+                };
+            if let Some(ref cat) = category_filter {
+                let prefix = format!("{cat}/");
+                files.retain(|file| file.id.starts_with(&prefix));
+            }
             let next =
                 (files.len() > args.offset.saturating_add(limit)).then(|| args.offset + limit);
             let files: Vec<serde_json::Value> = files
@@ -1618,18 +1970,28 @@ impl McpServerCore {
                 .skip(args.offset)
                 .take(limit)
                 .map(|file| {
+                    let top_category = file.id.split_once('/').and_then(|(top, _)| {
+                        duthub_core::dut_artifacts::DUT_CATEGORY_DIRS
+                            .contains(&top)
+                            .then_some(top)
+                    });
                     let mut val = serde_json::to_value(&file).unwrap_or(serde_json::Value::Null);
                     val["resourceUri"] =
                         serde_json::json!(format!("duthub://dut/{dut_id}/files/{}", file.id));
+                    if let Some(cat) = top_category {
+                        val["category"] = serde_json::json!(cat);
+                    }
                     val
                 })
                 .collect();
-            return Ok(Json(
-                serde_json::json!({ "files": files, "nextOffset": next }),
-            ));
+            return Ok(Json(serde_json::json!({
+                "files": files,
+                "categories": duthub_core::dut_artifacts::DUT_CATEGORY_DIRS,
+                "nextOffset": next,
+            })));
         }
-        // 通用监听器保持既有全局只读语义（API_CONTRACT/SECURITY）：省略 dutId
-        // 时列出全部 DUT，但仍要求凭据至少持有一个 read grant（零 grant 拒绝）。
+        // A general listener lists eligible DUTs when no specific DUT was requested.
+        // The credential still needs a read grant.
         self.authorize_any_read(&principal.0)?;
         let mut duts = self.state.list_duts();
         duts.sort_unstable_by(|left, right| left.dut_id.cmp(&right.dut_id));
@@ -1681,13 +2043,20 @@ impl McpServerCore {
     }
 
     #[tool(
-        description = "获取 DUT 独占控制租约，按 expiresAtUnixMs 处理到期。忙时可设置 wait 和 deadlineMs（最多 120000）；等待超时返回 DUT_BUSY。"
+        description = "获取 DUT 独占控制租约（必须传 sessionName 登记会话名），记录开始占用时间 acquiredAtUnixMs 并按 expiresAtUnixMs 处理到期。忙时可设置 wait 和 deadlineMs（最多 120000）；等待超时返回 DUT_BUSY。"
     )]
     async fn dut_acquire_control(
         &self,
         Parameters(args): Parameters<AcquireControlArgs>,
         principal: CurrentPrincipal,
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
+        let session_name =
+            duthub_core::lease::validate_session_name(&args.session_name).map_err(|msg| {
+                rmcp::ErrorData::invalid_params(
+                    msg,
+                    Some(serde_json::json!({ "code": "SESSION_NAME_REQUIRED" })),
+                )
+            })?;
         self.authorize_any_write(&principal.0, &args.dut_id)?;
         let holder = holder_for(&principal.0);
         let wait_ms = if args.wait { args.deadline_ms } else { 0 };
@@ -1698,7 +2067,8 @@ impl McpServerCore {
             ));
         }
         let grant = if wait_ms == 0 {
-            self.state.dut_acquire_control(&args.dut_id, holder, 0)
+            self.state
+                .dut_acquire_control_with_session(&args.dut_id, holder, &session_name, 0)
         } else {
             let permit = self.lease_waits.clone().try_acquire_owned().map_err(|_| {
                 rmcp::ErrorData::new(
@@ -1708,9 +2078,10 @@ impl McpServerCore {
                 )
             })?;
             let state = self.state.clone();
+            let dut_id = args.dut_id.clone();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                state.dut_acquire_control(&args.dut_id, holder, wait_ms)
+                state.dut_acquire_control_with_session(&dut_id, holder, &session_name, wait_ms)
             })
             .await
             .map_err(|_| state_err("Lease wait worker failed"))?
@@ -1721,6 +2092,8 @@ impl McpServerCore {
             "dutId": grant.dut_id,
             "generation": grant.generation,
             "expiresAtUnixMs": grant.expires_at_unix_ms,
+            "acquiredAtUnixMs": grant.acquired_at_unix_ms,
+            "sessionName": grant.session_name,
             "holder": grant.holder,
             "queued": wait_ms > 0,
         })))
@@ -1900,7 +2273,10 @@ impl McpServerCore {
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
         self.authorize_any_read(&principal.0)?;
         let allowed = self.readable_adb_serials(&principal.0);
-        if allowed.as_ref().is_some_and(std::collections::HashSet::is_empty) {
+        if allowed
+            .as_ref()
+            .is_some_and(std::collections::HashSet::is_empty)
+        {
             return Ok(Json(serde_json::json!({ "devices": [] })));
         }
         let permit = self
@@ -1980,8 +2356,8 @@ impl McpServerCore {
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
         self.authorize(&principal.0, &args.dut_id, DutAction::Power)?;
         let identity = self.lease_identity(&principal.0, &args.dut_id, args.lease_id.as_deref())?;
-        // 授权（审批令牌）在共用设备操作入口（ControlService）统一校验并消费；
-        // 租约复核也在该入口（admit 先于令牌消费，不通过不烧令牌）。
+        // The shared device entry point verifies and consumes approval.
+        // A failed lease check leaves the approval token unconsumed.
         self.state
             .control_power(&args.dut_id, args.on, &args.approval_token, identity)
             .map_err(|e| state_err(&e))?;
@@ -2074,8 +2450,8 @@ impl McpServerCore {
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
         self.authorize(&principal.0, &args.dut_id, DutAction::Relay)?;
         let identity = self.lease_identity(&principal.0, &args.dut_id, args.lease_id.as_deref())?;
-        // 授权（审批令牌）与租约复核在共用设备操作入口
-        // （ControlService::channel_test_as）统一校验并消费。
+        // The relay test entry point validates both the lease and approval.
+        // It consumes the token only after authorization succeeds.
         let report = self
             .state
             .relay_test(&args.dut_id, args.channel, &args.approval_token, identity)
@@ -2187,7 +2563,7 @@ impl McpServerCore {
         Parameters(args): Parameters<FlashTestArgs>,
         principal: CurrentPrincipal,
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
-        // 只读白名单测试：按 read 授权放行（烧录预设 id 全局唯一）
+        // The allowlisted flash probe uses read permission.
         self.authorize_any_read(&principal.0)?;
         let result = self
             .state
@@ -2210,9 +2586,9 @@ impl McpServerCore {
         Parameters(args): Parameters<ApprovalRequestArgs>,
         principal: CurrentPrincipal,
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
-        // 可签发的动作清单必须与共用设备操作入口接受的动作一致
-        //（control.* 在 duthub-device::control::ControlAction 中校验与消费，
-        // control.test 在 ControlService::channel_test 中校验与消费）
+        // Keep issuable approval actions aligned with the shared control entry points.
+        // Control actions validate and consume their own approval parameters.
+        // Channel tests use the dedicated control test action.
         let permission = match args.action.as_str() {
             "serial.write" => DutAction::SerialWrite,
             "adb.shell" => DutAction::Adb,
@@ -2277,7 +2653,7 @@ impl McpServerCore {
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
         use std::fmt::Write as _;
 
-        // 零 grant 的 HTTP 凭据不得读取 SKILL.md（stdio LocalAdmin 仍可用）。
+        // HTTP credentials without grants cannot export the skill. Stdio local access still works.
         self.authorize_any_read(&principal.0)?;
         let mut markdown = crate::skill::skill_for_endpoint(self.listener_endpoint);
         if let Some(bound) = self.listener_dut.as_deref() {
@@ -2363,6 +2739,167 @@ impl McpServerCore {
     }
 
     #[tool(
+        name = "agent_feedback",
+        description = "记录 Agent 使用反馈到 feedback 目录，便于后续优化 duthub 工具与流程（仅用户配置监听器开放，参数 camelCase）。category 取 bug | usability | missing_feature | performance | doc | other；severity 取 low | medium | high（默认 medium）；title 1–120 字符；detail 1–8192 字符。"
+    )]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "required by rmcp #[tool] extractor signature"
+    )]
+    fn agent_feedback(
+        &self,
+        Parameters(args): Parameters<AgentFeedbackArgs>,
+        principal: CurrentPrincipal,
+    ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
+        const CATEGORIES: &[&str] = &[
+            "bug",
+            "usability",
+            "missing_feature",
+            "performance",
+            "doc",
+            "other",
+        ];
+        const SEVERITIES: &[&str] = &["low", "medium", "high"];
+        let category = args.category.trim().to_ascii_lowercase();
+        if !CATEGORIES.contains(&category.as_str()) {
+            return Err(rmcp::ErrorData::invalid_params(
+                "category must be one of: bug, usability, missing_feature, performance, doc, other",
+                Some(serde_json::json!({ "code": "INVALID_FEEDBACK_CATEGORY" })),
+            ));
+        }
+        let severity = match args.severity.as_deref() {
+            None => "medium".to_owned(),
+            Some(raw) => {
+                let s = raw.trim().to_ascii_lowercase();
+                if !SEVERITIES.contains(&s.as_str()) {
+                    return Err(rmcp::ErrorData::invalid_params(
+                        "severity must be one of: low, medium, high",
+                        Some(serde_json::json!({ "code": "INVALID_FEEDBACK_SEVERITY" })),
+                    ));
+                }
+                s
+            }
+        };
+        let title = args.title.trim();
+        if title.is_empty() || title.chars().count() > 120 || title.chars().any(char::is_control) {
+            return Err(rmcp::ErrorData::invalid_params(
+                "title must be 1..=120 non-control characters",
+                Some(serde_json::json!({ "code": "INVALID_FEEDBACK_TITLE" })),
+            ));
+        }
+        let detail = args.detail.trim();
+        if detail.is_empty() || detail.chars().count() > 8192 {
+            return Err(rmcp::ErrorData::invalid_params(
+                "detail must be 1..=8192 characters",
+                Some(serde_json::json!({ "code": "INVALID_FEEDBACK_DETAIL" })),
+            ));
+        }
+        let tool_name = args
+            .tool_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(truncate_audit_field);
+        let session_name = match args.session_name.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => Some(
+                duthub_core::lease::validate_session_name(raw).map_err(|msg| {
+                    rmcp::ErrorData::invalid_params(
+                        msg,
+                        Some(serde_json::json!({ "code": "INVALID_SESSION_NAME" })),
+                    )
+                })?,
+            ),
+            _ => None,
+        };
+
+        let target_dut = self.scoped_dut(args.dut_id.as_deref()).map(str::to_owned);
+        if let Some(dut_id) = target_dut.as_deref() {
+            self.authorize_scoped_read(&principal.0, dut_id)?;
+        } else {
+            self.authorize_any_read(&principal.0)?;
+        }
+
+        let root = self
+            .state
+            .dut_artifact_root()
+            .ok_or_else(|| state_err("DUT 资料目录不可用"))?;
+        let now_ms = duthub_core::audit::unix_ms();
+        let author = match &principal.0 {
+            Principal::Agent { agent_name, .. } => agent_name.as_str(),
+            Principal::LocalAdmin => "local-admin",
+        };
+        let slug: String = title
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+            .take(32)
+            .collect();
+        let seq = FEEDBACK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let filename = if slug.is_empty() {
+            format!("feedback-{now_ms}-{seq:04}.md")
+        } else {
+            format!("feedback-{now_ms}-{slug}-{seq:04}.md")
+        };
+        let mut md = String::new();
+        md.push_str("---\n");
+        let _ = std::fmt::Write::write_fmt(&mut md, format_args!("timestampUnixMs: {now_ms}\n"));
+        let _ = std::fmt::Write::write_fmt(&mut md, format_args!("category: {category}\n"));
+        let _ = std::fmt::Write::write_fmt(&mut md, format_args!("severity: {severity}\n"));
+        let _ = std::fmt::Write::write_fmt(
+            &mut md,
+            format_args!("author: {}\n", truncate_audit_field(author)),
+        );
+        if let Some(dut_id) = &target_dut {
+            let _ = std::fmt::Write::write_fmt(
+                &mut md,
+                format_args!("dutId: {}\n", truncate_audit_field(dut_id)),
+            );
+        }
+        if let Some(tool) = &tool_name {
+            let _ = std::fmt::Write::write_fmt(&mut md, format_args!("toolName: {tool}\n"));
+        }
+        if let Some(session) = &session_name {
+            let _ = std::fmt::Write::write_fmt(&mut md, format_args!("sessionName: {session}\n"));
+        }
+        md.push_str("---\n\n");
+        let _ = std::fmt::Write::write_fmt(&mut md, format_args!("# {title}\n\n{detail}\n"));
+
+        let (file_id, resource_uri) = if let Some(dut_id) = &target_dut {
+            let dut = self
+                .state
+                .dut_info(dut_id)
+                .ok_or_else(|| state_err("DUT 不存在"))?;
+            let (file_id, _) = duthub_core::dut_artifacts::write_feedback_file(
+                &root,
+                &dut.dut_id,
+                &dut.name,
+                &filename,
+                md.as_bytes(),
+            )
+            .map_err(|error| state_err(&error.to_string()))?;
+            let uri = format!("duthub://dut/{dut_id}/files/{file_id}");
+            (file_id, Some(uri))
+        } else {
+            let (file_id, _) = duthub_core::dut_artifacts::write_global_feedback_file(
+                &root,
+                &filename,
+                md.as_bytes(),
+            )
+            .map_err(|error| state_err(&error.to_string()))?;
+            (file_id, None)
+        };
+
+        Ok(Json(serde_json::json!({
+            "ok": true,
+            "dutId": target_dut,
+            "category": category,
+            "severity": severity,
+            "fileId": file_id,
+            "resourceUri": resource_uri,
+            "timestampUnixMs": now_ms,
+        })))
+    }
+
+    #[tool(
         name = "dut_control",
         description = "统一原子硬件控制、多 Agent 租约仲裁与受控烧录（仅用户配置监听器开放，参数 camelCase）：action 支持 power_on | power_off | power_cycle | reset | power_key_short | power_key_long | enter_maskrom | enter_loader | relay_test | flash_list | flash_update | flash_reboot | acquire_lease | renew_lease | release_lease。多 Agent 并发时自动 FIFO 排队（waitMs 默认 5000ms），跨步独占可先 acquire_lease 再传 leaseId；无法获取使用权时默认向桌面发人工干预提醒并附带具体原因（notifyOnBlocked=false 可静默）。"
     )]
@@ -2373,6 +2910,14 @@ impl McpServerCore {
     ) -> Result<Json<serde_json::Value>, rmcp::ErrorData> {
         let action_label = format!("dut_control({})", args.action);
         if args.action == "acquire_lease" {
+            let raw_session = args.session_name.as_deref().unwrap_or_default();
+            let session_name =
+                duthub_core::lease::validate_session_name(raw_session).map_err(|msg| {
+                    rmcp::ErrorData::invalid_params(
+                        format!("{msg} (sessionName is required for action=acquire_lease)"),
+                        Some(serde_json::json!({ "code": "SESSION_NAME_REQUIRED" })),
+                    )
+                })?;
             self.authorize_any_write(&principal.0, &args.dut_id)
                 .map_err(|err| {
                     self.attach_blocked_notice(
@@ -2391,7 +2936,8 @@ impl McpServerCore {
                 .min(MAX_LEASE_WAIT_MS);
             let started = Instant::now();
             let grant_result = if wait_ms == 0 {
-                self.state.dut_acquire_control(&args.dut_id, holder, 0)
+                self.state
+                    .dut_acquire_control_with_session(&args.dut_id, holder, &session_name, 0)
             } else {
                 let Ok(permit) = self.lease_waits.clone().try_acquire_owned() else {
                     let err = rmcp::ErrorData::new(
@@ -2412,7 +2958,7 @@ impl McpServerCore {
                 let dut = args.dut_id.clone();
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    state.dut_acquire_control(&dut, holder, wait_ms)
+                    state.dut_acquire_control_with_session(&dut, holder, &session_name, wait_ms)
                 })
                 .await
                 .map_err(|_| state_err("Lease wait worker failed"))?
@@ -2435,6 +2981,8 @@ impl McpServerCore {
                 "leaseId": grant.lease_id,
                 "generation": grant.generation,
                 "expiresAtUnixMs": grant.expires_at_unix_ms,
+                "acquiredAtUnixMs": grant.acquired_at_unix_ms,
+                "sessionName": grant.session_name,
                 "holder": grant.holder,
                 "waitedMs": waited_ms,
             })));
@@ -2493,6 +3041,8 @@ impl McpServerCore {
                 "leaseId": grant.lease_id,
                 "generation": grant.generation,
                 "expiresAtUnixMs": grant.expires_at_unix_ms,
+                "acquiredAtUnixMs": grant.acquired_at_unix_ms,
+                "sessionName": grant.session_name,
                 "holder": grant.holder,
             })));
         }
@@ -2577,6 +3127,7 @@ impl McpServerCore {
                 &args.dut_id,
                 &action_label,
                 args.lease_id.as_deref(),
+                args.session_name.as_deref(),
                 args.wait_ms,
                 args.notify_on_blocked,
             )
@@ -2756,10 +3307,7 @@ impl McpServerCore {
         }
         if matches!(args.op.as_str(), "push" | "pull") {
             let fid = args.file_id.as_deref().map_or_default(str::trim);
-            let remote = args
-                .remote_path
-                .as_deref()
-                .map_or_default(str::trim);
+            let remote = args.remote_path.as_deref().map_or_default(str::trim);
             if fid.is_empty() || remote.is_empty() {
                 return Err(rmcp::ErrorData::invalid_params(
                     "fileId and remotePath are required for push/pull",
@@ -2785,6 +3333,7 @@ impl McpServerCore {
                 &args.dut_id,
                 &action_label,
                 args.lease_id.as_deref(),
+                args.session_name.as_deref(),
                 args.wait_ms,
                 args.notify_on_blocked,
             )
@@ -2839,7 +3388,7 @@ impl McpServerCore {
 
     #[tool(
         name = "serial_exec",
-        description = "向 DUT 串口发指令、生成日志分段标记（markLabel），或以本地毫秒级触发器拦截启动窗口（triggerReset + waitFor + send + thenSend + expect），用于进入 U-Boot / Loader 或执行 Shell 命令。需 serialWrite 权限（triggerReset 时还需 reset 权限），绝不执行宿主机命令。"
+        description = "向 DUT 串口发指令、发送经白名单校验的逻辑控制键（keys，如 ctrl+c / esc / enter）、生成日志分段标记（markLabel），或以本地毫秒级触发器拦截启动窗口（triggerReset + waitFor + send + thenSend + expect / expectRegex / settleMs）。返回 matchedBy、bytesObserved、stalled 及超时/停滞时的 screenTail。需 serialWrite 权限（triggerReset 时还需 reset 权限），绝不执行宿主机命令。"
     )]
     async fn serial_exec(
         &self,
@@ -2850,7 +3399,21 @@ impl McpServerCore {
         const MAX_PATTERN_CHARS: usize = 256;
         const MAX_CAPTURED_BYTES: usize = 64 * 1024;
 
+        let encoded_keys = match args.keys.as_deref() {
+            Some(keys) if !keys.is_empty() => {
+                Some(crate::keys::encode_logical_keys(keys).map_err(|msg| {
+                    rmcp::ErrorData::invalid_params(
+                        msg,
+                        Some(serde_json::json!({ "code": "INVALID_KEY" })),
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        let keys_sent_count = args.keys.as_ref().map_or(0, Vec::len);
+
         let needs_write = args.text.is_some()
+            || encoded_keys.is_some()
             || args.send.is_some()
             || args.then_send.is_some()
             || args.wait_for.is_some();
@@ -2877,7 +3440,7 @@ impl McpServerCore {
 
         if !needs_write && !args.trigger_reset {
             return Err(rmcp::ErrorData::invalid_params(
-                "provide at least one of text, waitFor, send, triggerReset, or markLabel",
+                "provide at least one of text, keys, waitFor, send, triggerReset, or markLabel",
                 None,
             ));
         }
@@ -2909,6 +3472,10 @@ impl McpServerCore {
                 ));
             }
         }
+        let expect_regex = match args.expect_regex.as_deref().filter(|s| !s.is_empty()) {
+            Some(pat) => Some(compile_bounded_regex(pat, "expectRegex")?),
+            None => None,
+        };
 
         let action_label = if args.trigger_reset {
             "serial_exec(triggerReset)"
@@ -2956,9 +3523,10 @@ impl McpServerCore {
             };
             let key = (credential, args.dut_id.clone(), req_id.to_owned());
             let fingerprint_src = format!(
-                "{}|{}|{:?}|{:?}|{:?}",
+                "{}|{}|{:?}|{:?}|{:?}|{:?}",
                 args.trigger_reset,
                 args.text.as_deref().unwrap_or_default(),
+                args.keys,
                 args.wait_for,
                 args.send,
                 args.then_send
@@ -3014,11 +3582,17 @@ impl McpServerCore {
                 &args.dut_id,
                 action_label,
                 args.lease_id.as_deref(),
+                args.session_name.as_deref(),
                 args.wait_ms,
                 args.notify_on_blocked,
             )
             .await?;
         let timeout_ms = args.timeout_ms.unwrap_or(5_000).clamp(200, 30_000);
+        let settle_window = args
+            .settle_ms
+            .map(|ms| Duration::from_millis(ms.clamp(200, 5_000)));
+        let stall_threshold =
+            Duration::from_millis(args.stall_timeout_ms.unwrap_or(3_000).clamp(200, 30_000));
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
         // Bookmark the current serial sequence BEFORE resetting or writing so
@@ -3028,26 +3602,32 @@ impl McpServerCore {
             .serial_read(&args.dut_id, 0, usize::MAX)
             .map_or(0, |res| res.last_seq);
         let mut captured = String::new();
-        let append_chunks =
-            |state: &Arc<dyn McpState>, dut_id: &str, cursor: &mut u64, captured: &mut String| {
-                if let Some(page) = state.serial_read(dut_id, *cursor, 400) {
-                    *cursor = page.last_seq;
-                    for line in page.lines {
-                        if captured.len() < MAX_CAPTURED_BYTES {
-                            let remaining = MAX_CAPTURED_BYTES - captured.len();
-                            if line.text.len() <= remaining {
-                                captured.push_str(&line.text);
-                            } else {
-                                let mut cut = remaining;
-                                while cut > 0 && !line.text.is_char_boundary(cut) {
-                                    cut -= 1;
-                                }
-                                captured.push_str(&line.text[..cut]);
+        let append_chunks = |state: &Arc<dyn McpState>,
+                             dut_id: &str,
+                             cursor: &mut u64,
+                             captured: &mut String|
+         -> usize {
+            let mut added_bytes = 0usize;
+            if let Some(page) = state.serial_read(dut_id, *cursor, 400) {
+                *cursor = page.last_seq;
+                for line in page.lines {
+                    added_bytes += line.text.len();
+                    if captured.len() < MAX_CAPTURED_BYTES {
+                        let remaining = MAX_CAPTURED_BYTES - captured.len();
+                        if line.text.len() <= remaining {
+                            captured.push_str(&line.text);
+                        } else {
+                            let mut cut = remaining;
+                            while cut > 0 && !line.text.is_char_boundary(cut) {
+                                cut -= 1;
                             }
+                            captured.push_str(&line.text[..cut]);
                         }
                     }
                 }
-            };
+            }
+            added_bytes
+        };
 
         let mut reset_triggered = false;
         if args.trigger_reset {
@@ -3065,9 +3645,10 @@ impl McpServerCore {
         }
 
         let mut wait_matched = false;
+        let mut payload_dispatched = false;
         if let Some(wait_for) = args.wait_for.as_deref().filter(|s| !s.is_empty()) {
             loop {
-                append_chunks(&self.state, &args.dut_id, &mut cursor, &mut captured);
+                let _ = append_chunks(&self.state, &args.dut_id, &mut cursor, &mut captured);
                 if captured.contains(wait_for) {
                     wait_matched = true;
                     break;
@@ -3078,15 +3659,33 @@ impl McpServerCore {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             if wait_matched {
-                let payload = args.send.as_deref().unwrap_or("\r");
+                if let Some(ref raw_keys) = encoded_keys {
+                    self.state
+                        .serial_write_raw(&args.dut_id, raw_keys, identity.clone())
+                        .map_err(|e| state_err(&e))?;
+                    payload_dispatched = true;
+                }
+                if args.send.is_some() || encoded_keys.is_none() {
+                    let payload = args.send.as_deref().unwrap_or("\r");
+                    self.state
+                        .serial_write(&args.dut_id, payload, identity.clone())
+                        .map_err(|e| state_err(&e))?;
+                    payload_dispatched = true;
+                }
+            }
+        } else {
+            if let Some(payload) = args.text.as_deref().or(args.send.as_deref()) {
                 self.state
                     .serial_write(&args.dut_id, payload, identity.clone())
                     .map_err(|e| state_err(&e))?;
+                payload_dispatched = true;
             }
-        } else if let Some(payload) = args.text.as_deref().or(args.send.as_deref()) {
-            self.state
-                .serial_write(&args.dut_id, payload, identity.clone())
-                .map_err(|e| state_err(&e))?;
+            if let Some(ref raw_keys) = encoded_keys {
+                self.state
+                    .serial_write_raw(&args.dut_id, raw_keys, identity.clone())
+                    .map_err(|e| state_err(&e))?;
+                payload_dispatched = true;
+            }
         }
 
         if let Some(then_cmd) = args.then_send.as_deref().filter(|s| !s.is_empty())
@@ -3100,14 +3699,48 @@ impl McpServerCore {
             self.state
                 .serial_write(&args.dut_id, then_cmd, identity.clone())
                 .map_err(|e| state_err(&e))?;
+            payload_dispatched = true;
         }
 
+        let post_send_at = Instant::now();
+        let mut bytes_observed: usize = 0;
+        let mut last_rx_at: Option<Instant> = None;
         let mut expect_matched = false;
-        if let Some(expect) = args.expect.as_deref().filter(|s| !s.is_empty()) {
+        let mut matched_by = "immediate";
+
+        let expect_lit = args.expect.as_deref().filter(|s| !s.is_empty());
+        let has_wait_condition =
+            expect_lit.is_some() || expect_regex.is_some() || settle_window.is_some();
+
+        if has_wait_condition {
+            matched_by = "timeout";
             loop {
-                append_chunks(&self.state, &args.dut_id, &mut cursor, &mut captured);
-                if captured.contains(expect) {
+                let added = append_chunks(&self.state, &args.dut_id, &mut cursor, &mut captured);
+                if added > 0 {
+                    bytes_observed = bytes_observed.saturating_add(added);
+                    last_rx_at = Some(Instant::now());
+                }
+                let cleaned = crate::keys::strip_ansi_escapes(&captured);
+                if let Some(expect) = expect_lit
+                    && (captured.contains(expect) || cleaned.contains(expect))
+                {
                     expect_matched = true;
+                    matched_by = "expect";
+                    break;
+                }
+                if let Some(re) = expect_regex.as_ref()
+                    && (re.is_match(&captured) || re.is_match(&cleaned))
+                {
+                    expect_matched = true;
+                    matched_by = "expectRegex";
+                    break;
+                }
+                if let Some(settle) = settle_window
+                    && bytes_observed > 0
+                    && last_rx_at.is_some_and(|last| last.elapsed() >= settle)
+                {
+                    expect_matched = true;
+                    matched_by = "settled";
                     break;
                 }
                 if Instant::now() >= deadline {
@@ -3121,20 +3754,69 @@ impl McpServerCore {
             if !brief.is_zero() {
                 tokio::time::sleep(brief).await;
             }
-            append_chunks(&self.state, &args.dut_id, &mut cursor, &mut captured);
+            bytes_observed = append_chunks(&self.state, &args.dut_id, &mut cursor, &mut captured);
         }
 
-        Ok(Json(serde_json::json!({
+        let stalled = payload_dispatched
+            && has_wait_condition
+            && bytes_observed == 0
+            && post_send_at.elapsed() >= stall_threshold;
+
+        let mut response = serde_json::json!({
             "ok": true,
             "dutId": args.dut_id,
             "resetTriggered": reset_triggered,
             "waitMatched": wait_matched,
             "expectMatched": expect_matched,
+            "matchedBy": matched_by,
+            "bytesObserved": bytes_observed,
+            "stalled": stalled,
             "waitedMs": waited_ms,
             "output": captured,
             "lastSeq": cursor,
-        })))
+        });
+        if keys_sent_count > 0 {
+            response["keysSent"] = serde_json::json!(keys_sent_count);
+        }
+        if matched_by == "timeout" || stalled {
+            response["screenTail"] = serde_json::json!(
+                self.render_dut_screen(&args.dut_id, Some(30))
+                    .unwrap_or_default()
+            );
+        }
+        Ok(Json(response))
     }
+}
+
+static FEEDBACK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn compile_bounded_regex(pattern: &str, field: &str) -> Result<regex::Regex, rmcp::ErrorData> {
+    const MAX_REGEX_CHARS: usize = 256;
+    if pattern.chars().count() > MAX_REGEX_CHARS {
+        return Err(rmcp::ErrorData::invalid_params(
+            format!("{field} exceeds {MAX_REGEX_CHARS} chars"),
+            Some(serde_json::json!({ "code": "INVALID_REGEX" })),
+        ));
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(256 * 1024)
+        .dfa_size_limit(256 * 1024)
+        .build()
+        .map_err(|err| {
+            rmcp::ErrorData::invalid_params(
+                format!("invalid {field} regex: {err}"),
+                Some(serde_json::json!({ "code": "INVALID_REGEX" })),
+            )
+        })
+}
+
+fn tail_text_lines(text: &str, max_lines: usize) -> String {
+    if max_lines == 0 || text.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 /// Wire shape of the `notify_user` response. `queued` is derived from the
@@ -3218,7 +3900,7 @@ pub fn truncate_audit_field(value: &str) -> String {
     out
 }
 
-/// 从请求上下文取服务端注入的主体（HTTP 经 `AuthSvc` 注入 `Principal`）。
+/// Read the principal injected into the tool request by the server.
 fn principal_in_context(
     context: &rmcp::service::RequestContext<rmcp::RoleServer>,
 ) -> Option<Principal> {
@@ -3229,7 +3911,7 @@ fn principal_in_context(
         .or_else(|| context.extensions.get::<Principal>().cloned())
 }
 
-/// 失败是否属于授权/租约/审批/执行策略拒绝（`tool.call` 审计的 Denied 口径）。
+/// Identify policy denials for the tool audit result.
 fn tool_call_denied(error: &rmcp::ErrorData) -> bool {
     let kind = error
         .data
@@ -3245,7 +3927,7 @@ fn tool_call_denied(error: &rmcp::ErrorData) -> bool {
         || error.message.contains("UNAUTHORIZED")
 }
 
-/// 结果摘要：只记长度/条数（数组项数、字符串字符数、文本字节数），绝不记正文。
+/// Summarize results using counts or lengths without including content.
 fn summarize_tool_result(result: &rmcp::model::CallToolResult) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(serde_json::Value::Object(map)) = &result.structured_content {
@@ -3438,6 +4120,14 @@ impl ServerHandler for McpServerCore {
                 .with_description("Newest 150 lines of live serial output (read-only)")
                 .with_mime_type("text/plain"),
             );
+            resources.push(
+                rmcp::model::Resource::new(
+                    format!("duthub://dut/{}/serial/screen", dut.dut_id),
+                    format!("{} serial screen", dut.name),
+                )
+                .with_description("Rendered VT100 terminal screen text (ANSI-free, read-only)")
+                .with_mime_type("text/plain"),
+            );
             if let Some(root) = self.state.dut_artifact_root()
                 && let Ok(files) =
                     duthub_core::dut_artifacts::list_files(&root, &dut.dut_id, &dut.name)
@@ -3474,6 +4164,12 @@ impl ServerHandler for McpServerCore {
                 "DUT Live Serial Tail",
             )
             .with_description("Read the newest 150 chunks of live serial output for a DUT.")
+            .with_mime_type("text/plain"),
+            rmcp::model::ResourceTemplate::new(
+                "duthub://dut/{dutId}/serial/screen",
+                "DUT Rendered Terminal Screen",
+            )
+            .with_description("Read the rendered VT100 terminal screen as clean ANSI-free text.")
             .with_mime_type("text/plain"),
             rmcp::model::ResourceTemplate::new(
                 "duthub://dut/{dutId}/logs/{segmentId}",
@@ -3515,7 +4211,7 @@ impl ServerHandler for McpServerCore {
         };
         let Some((dut_id, subpath)) = rest.split_once('/') else {
             return Err(rmcp::ErrorData::invalid_params(
-                "Invalid duthub resource URI; expected duthub://dut/{dutId}/(serial/tail|logs/{segmentId}|files/{fileId})",
+                "Invalid duthub resource URI; expected duthub://dut/{dutId}/(serial/tail|serial/screen|logs/{segmentId}|files/{fileId})",
                 None,
             ));
         };
@@ -3523,6 +4219,27 @@ impl ServerHandler for McpServerCore {
             return Err(rmcp::ErrorData::invalid_params(
                 "Invalid dutId in resource URI",
                 None,
+            ));
+        }
+        if subpath == "serial/screen" {
+            self.authorize_read(&principal, dut_id)?;
+            let Some(mut text) = self.render_dut_screen(dut_id, None) else {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "DUT session is not open; read archived logs via duthub://dut/{dutId}/logs/{segmentId}",
+                    None,
+                ));
+            };
+            if text.len() > MAX_TEXT_RESOURCE_BYTES {
+                let mut cut = MAX_TEXT_RESOURCE_BYTES;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+            }
+            return Ok(rmcp::model::ReadResourceResponse::Complete(
+                rmcp::model::ReadResourceResult::new(vec![rmcp::model::ResourceContents::text(
+                    text, uri,
+                )]),
             ));
         }
         if subpath == "serial/tail" {
@@ -3906,8 +4623,8 @@ mod scope_tests {
             Arc::new(ControlLeaseManager::new(None)),
             AuditSink::memory(),
         );
-        let server =
-            McpServerCore::new(state, Some(Arc::new(access))).with_listener_dut(Some("dut-a"));
+        let server = McpServerCore::new(state, Some(Arc::new(access)))
+            .with_listener_dut_arc(Some(Arc::from("dut-a")));
         let principal = Principal::Agent {
             agent_name: "fixture".into(),
             credential_id: "fixture".into(),
@@ -3929,7 +4646,7 @@ mod scope_tests {
             )
             .await
             .err()
-            .expect("跨 DUT 必须拒绝");
+            .expect("cross-DUT status must be rejected");
         assert!(
             other_info.message.contains("UNAUTHORIZED"),
             "{other_info:?}"
@@ -3945,7 +4662,7 @@ mod scope_tests {
                 CurrentPrincipal(principal.clone()),
             )
             .err()
-            .expect("跨 DUT 日志必须拒绝");
+            .expect("cross-DUT logs must be rejected");
         assert!(
             other_logs.message.contains("UNAUTHORIZED"),
             "{other_logs:?}"
@@ -3955,13 +4672,14 @@ mod scope_tests {
             .dut_files(
                 Parameters(DutFilesArgs {
                     dut_id: Some("dut-b".into()),
+                    category: None,
                     offset: 0,
                     limit: 10,
                 }),
                 CurrentPrincipal(principal.clone()),
             )
             .err()
-            .expect("跨 DUT 文件必须拒绝");
+            .expect("cross-DUT files must be rejected");
         assert!(
             other_files.message.contains("UNAUTHORIZED"),
             "{other_files:?}"
@@ -3999,7 +4717,7 @@ mod scope_tests {
         ))
     }
 
-    /// any-read 判定走合并授权：runtime overlay 的 read grant 同样可见。
+    /// A read grant in the runtime overlay satisfies the read check.
     #[test]
     fn any_read_uses_merged_overlay_grants() {
         let server = McpServerCore::new(Arc::new(SnapshotState::empty()), Some(overlay_access()));
@@ -4009,28 +4727,28 @@ mod scope_tests {
         };
         server
             .authorize_any_read(&session)
-            .expect("overlay read grant 必须放行 any-read");
+            .expect("overlay read grant must satisfy any-read");
         let unknown = Principal::Agent {
             agent_name: "unknown".into(),
             credential_id: "cred-unknown".into(),
         };
         let error = server
             .authorize_any_read(&unknown)
-            .expect_err("未知凭据必须拒绝");
+            .expect_err("unknown credential must be rejected");
         assert!(error.message.contains("UNAUTHORIZED"), "{error:?}");
         server
             .authorize_any_read(&Principal::LocalAdmin)
-            .expect("LocalAdmin 不受限");
+            .expect("LocalAdmin must be unrestricted");
     }
 
-    /// `skill_export：stdio` `LocalAdmin` 可用；零 grant 的 HTTP 凭据拒绝；read grant 放行。
+    /// Stdio local access and an authenticated read grant allow skill export. A zero-grant credential is refused.
     #[test]
     fn skill_export_requires_any_read_grant_but_allows_local_admin() {
         let state = Arc::new(SnapshotState::empty());
         let stdio = McpServerCore::new(state.clone(), None);
         let Json(data) = stdio
             .skill_export(CurrentPrincipal(Principal::LocalAdmin))
-            .expect("stdio LocalAdmin 可读 SKILL.md");
+            .expect("stdio LocalAdmin can read SKILL.md");
         assert_eq!(data["ok"], serde_json::json!(true));
 
         let zero_grant_auth = AgentAccessRuntime::from_settings(AgentAccessSettings {
@@ -4057,7 +4775,7 @@ mod scope_tests {
             agent_name: "no-grant".into(),
             credential_id: "cred-none".into(),
         })) else {
-            panic!("零 grant 必须拒绝 skill_export");
+            panic!("Reject skill_export when no grants are present");
         };
         assert!(denied.message.contains("UNAUTHORIZED"), "{denied:?}");
 
@@ -4067,10 +4785,10 @@ mod scope_tests {
                 agent_name: "session-agent".into(),
                 credential_id: "cred-session".into(),
             }))
-            .expect("overlay read grant 可读 SKILL.md");
+            .expect("overlay read grant can read SKILL.md");
     }
 
-    /// tool.call 摘要只含长度/条数，不落正文。
+    /// The audit summary contains sizes and counts without result content.
     #[test]
     fn tool_call_summary_counts_but_does_not_leak_content() {
         use rmcp::model::{CallToolResult, ContentBlock, TextContent};

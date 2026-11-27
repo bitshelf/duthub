@@ -1,7 +1,7 @@
-//! `agents.json` / `agent-bindings.json` 持久化回归。
+//! Persistence regression tests for `agents.json` and `agent-bindings.json`.
 //!
-//! 覆盖：缺失生成默认 goose、往返、损坏备份 + fail closed、只存 env 键名、
-//! 每 DUT 绑定默认 goose 与损坏 fail closed。
+//! Covers: generating default `goose` when missing, round-trip, corrupt backup + fail-closed,
+//! storing env key names only, per-DUT default `goose` binding, and corrupt bindings fail-closed.
 
 use std::path::PathBuf;
 
@@ -26,13 +26,13 @@ fn missing_file_generates_versioned_default_goose() {
     let file = load_agents(&dir).unwrap();
     assert_eq!(file, default_agents());
     assert_eq!(file.version, 1);
-    let goose = file.goose().expect("默认必须有 goose");
+    let goose = file.goose().expect("default registry must contain goose");
     assert_eq!(goose.kind, AgentKind::Acp);
-    assert_eq!(goose.program, None, "program=null 表示内嵌");
+    assert_eq!(goose.program, None, "program=null indicates embedded goose");
     assert!(goose.enabled);
     assert!(
         agents_path(&dir).is_file(),
-        "缺失时必须生成 {AGENTS_FILE_NAME}"
+        "{AGENTS_FILE_NAME} must be created when missing"
     );
 
     let raw: serde_json::Value =
@@ -41,7 +41,7 @@ fn missing_file_generates_versioned_default_goose() {
     assert_eq!(raw["agents"][0]["id"], DEFAULT_AGENT_ID);
     assert!(
         raw["agents"][0]["program"].is_null(),
-        "内嵌 goose 必须写 null"
+        "embedded goose must serialize program as null"
     );
     assert!(raw["agents"][0]["expectedSha256"].is_null());
     assert_eq!(raw["agents"][0]["kind"], "acp");
@@ -109,9 +109,9 @@ fn env_values_are_read_from_keyring_entries_not_the_file() {
         [("ACME_API_KEY".to_owned(), "value-from-keyring".into())]
     );
 
-    // 缺失值 fail closed，不把空串当已配置。
+    // Missing values fail closed rather than treating empty strings as configured.
     assert!(load_agent_env_with(&agent, |_| Ok(None)).is_err());
-    // 非法键名在持久化层就拒绝。
+    // Invalid key names are rejected at the persistence layer.
     let mut bad = AgentDefinition::goose();
     bad.env_keys = vec!["NOT-VALID".into()];
     let bad_dir = temp_dir("bad-key");
@@ -134,7 +134,10 @@ fn corrupt_file_is_backed_up_and_load_fails_closed() {
     std::fs::write(agents_path(&dir), "{ definitely not json").unwrap();
     let error = load_agents(&dir).unwrap_err();
     assert!(matches!(error, AgentConfigError::Parse(_)), "{error}");
-    assert!(!agents_path(&dir).exists(), "损坏文件必须被移走");
+    assert!(
+        !agents_path(&dir).exists(),
+        "corrupt file must be moved aside"
+    );
     let backups = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(std::result::Result::ok)
@@ -145,7 +148,7 @@ fn corrupt_file_is_backed_up_and_load_fails_closed() {
                 .contains("agents.corrupt-")
         })
         .count();
-    assert_eq!(backups, 1, "必须保留唯一损坏备份");
+    assert_eq!(backups, 1, "exactly one corrupt backup must be kept");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -161,7 +164,7 @@ fn invalid_schema_fails_closed_without_silent_default() {
     assert!(matches!(error, AgentConfigError::Invalid(_)), "{error}");
     assert!(
         agents_path(&dir).exists(),
-        "语义无效的文件不删除，便于用户修复"
+        "semantically invalid files must stay on disk so the user can fix them"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -185,7 +188,7 @@ fn per_dut_bindings_default_to_goose_and_roundtrip() {
     assert_eq!(loaded.agent_id_for("dut-b"), DEFAULT_AGENT_ID);
     assert_eq!(loaded, bindings);
 
-    // 删除 DUT 只移除自己的绑定。
+    // Removing a DUT removes only its own binding.
     let mut pruned = loaded;
     pruned.remove_dut("dut-a");
     assert_eq!(pruned, AgentBindingsFile::default());

@@ -15,12 +15,11 @@ mod imp {
     use std::ffi::c_void;
     use std::io;
     use std::mem::size_of;
-    #[cfg(test)]
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     #[cfg(test)]
     use std::process::Child;
 
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -36,15 +35,8 @@ mod imp {
     /// `KILL_ON_JOB_CLOSE`.
     #[derive(Debug)]
     pub struct Job {
-        handle: HANDLE,
+        handle: OwnedHandle,
     }
-
-    // SAFETY: `Job` owns an opaque kernel handle (`HANDLE`) exclusively;
-    // transferring or sharing it across threads aliases no process memory.
-    unsafe impl Send for Job {}
-    // SAFETY: Kernel job operations on the handle are thread-safe and the
-    // handle is only closed in `Drop`.
-    unsafe impl Sync for Job {}
 
     /// Limits queried back from the kernel (tests/diagnostics).
     #[cfg(test)]
@@ -56,6 +48,10 @@ mod imp {
     }
 
     impl Job {
+        fn raw_handle(&self) -> HANDLE {
+            HANDLE(self.handle.as_raw_handle())
+        }
+
         /// Create a Job whose only limit is `KILL_ON_JOB_CLOSE`.
         ///
         /// Deliberately omits process/memory caps so desktop child processes
@@ -73,6 +69,9 @@ mod imp {
             };
             // SAFETY: Anonymous non-inheritable Job Object; owned by `Job`.
             let handle = unsafe { CreateJobObjectW(None, None) }.map_err(io::Error::other)?;
+            // SAFETY: CreateJobObjectW succeeded and transferred a valid handle
+            // to this caller. OwnedHandle takes sole responsibility for closing it.
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
             let job = Self { handle };
 
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -84,7 +83,7 @@ mod imp {
             // only reads `info` for the duration of the synchronous call.
             unsafe {
                 SetInformationJobObject(
-                    job.handle,
+                    job.raw_handle(),
                     JobObjectExtendedLimitInformation,
                     std::ptr::from_ref(&info).cast::<c_void>(),
                     INFO_SIZE,
@@ -98,13 +97,19 @@ mod imp {
         pub fn assign_child(&self, child: &Child) -> io::Result<()> {
             let process = HANDLE(child.as_raw_handle());
             // SAFETY: Both handles stay valid for the duration of the call.
-            unsafe { AssignProcessToJobObject(self.handle, process) }.map_err(|error| {
+            unsafe { AssignProcessToJobObject(self.raw_handle(), process) }.map_err(|error| {
                 io::Error::other(format!("AssignProcessToJobObject failed: {error}"))
             })?;
             let mut in_job = BOOL(0);
             // SAFETY: `in_job` is a valid out-parameter; handles remain valid.
-            unsafe { IsProcessInJob(process, Some(self.handle), std::ptr::from_mut(&mut in_job)) }
-                .map_err(|error| io::Error::other(format!("IsProcessInJob failed: {error}")))?;
+            unsafe {
+                IsProcessInJob(
+                    process,
+                    Some(self.raw_handle()),
+                    std::ptr::from_mut(&mut in_job),
+                )
+            }
+            .map_err(|error| io::Error::other(format!("IsProcessInJob failed: {error}")))?;
             if !in_job.as_bool() {
                 return Err(io::Error::other("child process did not join job"));
             }
@@ -129,7 +134,7 @@ mod imp {
             // handle owned by `&self` for the duration of the call.
             unsafe {
                 QueryInformationJobObject(
-                    Some(self.handle),
+                    Some(self.raw_handle()),
                     JobObjectExtendedLimitInformation,
                     std::ptr::from_mut(&mut info).cast::<c_void>(),
                     INFO_SIZE,
@@ -145,15 +150,6 @@ mod imp {
         }
     }
 
-    impl Drop for Job {
-        fn drop(&mut self) {
-            // SAFETY: `self` exclusively owns the handle and never uses it again.
-            unsafe {
-                let _ = CloseHandle(self.handle);
-            }
-        }
-    }
-
     /// Put the current process into an application-wide `KILL_ON_JOB_CLOSE` job
     /// and intentionally leak the handle until process exit.
     ///
@@ -163,9 +159,9 @@ mod imp {
         let job = Job::create_containment()?;
         // SAFETY: `GetCurrentProcess` returns a pseudo-handle valid for the
         // calling process; `job.handle` is owned and live.
-        unsafe { AssignProcessToJobObject(job.handle, GetCurrentProcess()) }.map_err(|error| {
-            io::Error::other(format!("AssignProcessToJobObject failed: {error}"))
-        })?;
+        unsafe { AssignProcessToJobObject(job.raw_handle(), GetCurrentProcess()) }.map_err(
+            |error| io::Error::other(format!("AssignProcessToJobObject failed: {error}")),
+        )?;
         // Leak intentionally so the kernel closes the handle on process death.
         std::mem::forget(job);
         Ok(())

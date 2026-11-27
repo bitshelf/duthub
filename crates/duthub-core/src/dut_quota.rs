@@ -65,7 +65,8 @@ impl DutQuota {
         name: &str,
     ) -> io::Result<QuotaFile> {
         let name = crate::dut_artifacts::name_component(name)?;
-        self.open(dut_id, owner, &format!("logs/{name}"), |owner| {
+        let rel = format!("{}/{name}", crate::dut_artifacts::SERIAL_LOGS_DIR);
+        self.open(dut_id, owner, &rel, |owner| {
             let dir = open_logs_for_write(owner)?;
             match dir.symlink_metadata(name) {
                 Ok(meta) if meta.is_file() && plain(&meta) => {}

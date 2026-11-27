@@ -1,9 +1,10 @@
-//! F7/F11/F19：模型绑定选择 + 会话恢复回退回归。
+//! F7/F11/F19: model binding selection and session resume fallback regressions.
 //!
-//! - 双 provider：显式选中 B 必须使用 B 的 `base_url/model/key（不按启用顺序`）；
-//! - Host 启动前 trim/校验绑定（空字段在 spawn 前拒绝）；
-//! - 有 session-id 且 Agent 支持 loadSession 时恢复；stale/失败回退新会话并提示
-//!   「已降级为新会话」。
+//! - Dual providers: explicitly selecting B must use B's `base_url`/model/key (not enablement
+//!   order);
+//! - Host trims and validates bindings before launch (blank fields are rejected before spawning);
+//! - When `session-id` exists and the agent supports `loadSession`, resume it; stale/failed resumes
+//!   fall back to a new session with a degraded-session note.
 
 #![cfg(windows)]
 
@@ -47,10 +48,7 @@ fn provider(id: &str, name: &str, base_url: &str, model: &str) -> ModelProvider 
         base_url: base_url.into(),
         protocol: Provider::Openai,
         enabled: true,
-        models: vec![ProviderModel {
-            id: model.into(),
-            enabled: true,
-        }],
+        models: vec![ProviderModel::new(model, true)],
     }
 }
 
@@ -64,7 +62,7 @@ fn binding() -> GooseBinding {
 }
 
 // ---------------------------------------------------------------------------
-// Test goose fixture (2026-11-24: goose is downloaded, no longer embedded)
+// Test goose fixture (goose is downloaded, not embedded)
 // ---------------------------------------------------------------------------
 
 /// `DUTHUB_TEST_GOOSE` (absolute path to a goose executable) wins, otherwise the
@@ -74,7 +72,7 @@ fn test_goose_program() -> Option<PathBuf> {
         let path = PathBuf::from(raw);
         assert!(
             path.is_absolute() && path.is_file(),
-            "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+            "DUTHUB_TEST_GOOSE must be an absolute path to an existing goose executable: {}",
             path.display()
         );
         return Some(path);
@@ -98,8 +96,8 @@ fn test_goose_agent() -> Option<AgentDefinition> {
 /// Loud skip: goose is no longer embedded, so ACP tests need an installed one.
 fn skip_without_goose() {
     eprintln!(
-        "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-         或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+        "SKIP: goose is not installed (goose is no longer embedded) — \
+         download goose from Tool Downloads or set DUTHUB_TEST_GOOSE to the goose executable"
     );
 }
 
@@ -152,7 +150,7 @@ fn active_ids_serialize_as_camel_case_and_default_to_none() {
     assert_eq!(value["agent"]["activeProviderId"], "b");
     assert_eq!(value["agent"]["activeModelId"], "model-b");
 
-    // None 必须跳过序列化（坑 #19/#24：examples 往返语义相等）。
+    // None must be omitted from serialization (preserves round-trip equivalence with examples).
     let defaults = duthub_core::store::default_settings();
     let value = serde_json::to_value(&defaults).unwrap();
     assert!(value["agent"].get("activeProviderId").is_none());
@@ -162,7 +160,7 @@ fn active_ids_serialize_as_camel_case_and_default_to_none() {
 #[test]
 fn selected_provider_b_wins_with_its_own_endpoint_model_and_key() {
     let mut settings = duthub_core::store::default_settings();
-    // A 先出现且更早启用；只有显式选择才能保证 B 生效。
+    // A appears first and is enabled; only explicit selection ensures B wins.
     settings.agent.providers = vec![
         provider("a", "Provider A", PROVIDER_A, "model-a"),
         provider("b", "Provider B", PROVIDER_B, "model-b"),
@@ -188,7 +186,7 @@ fn selected_provider_b_wins_with_its_own_endpoint_model_and_key() {
     assert_eq!(binding.model, "model-b");
     assert_eq!(binding.api_key, "sk-b");
 
-    // 环境变量同样来自 B，而不是 A。
+    // Environment variables must also come from B, not A.
     let root = temp_dir("env").join("goose");
     std::fs::create_dir_all(&root).unwrap();
     let env = model_env::goose_env(&binding, &root).unwrap();
@@ -232,7 +230,7 @@ fn host_start_normalizes_binding_and_rejects_blank_fields() {
     assert!(matches!(error, HostError::Invalid(_)), "{error}");
     assert!(
         host.view("dut-blank").is_none(),
-        "校验失败不得创建会话记录（更不得 spawn goose）"
+        "validation failure must not create a session entry or spawn goose"
     );
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -257,7 +255,7 @@ fn stale_session_id_falls_back_to_new_session_with_degraded_note() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-stale"),
-        "回退新会话后未就绪：{:?} stderr={}",
+        "fallback new session did not become ready: {:?} stderr={}",
         host.view("dut-stale").map(|view| view.status()),
         host.view("dut-stale")
             .map_or_default(|view| view.stderr_tail())
@@ -267,17 +265,21 @@ fn stale_session_id_falls_back_to_new_session_with_degraded_note() {
     let session_id = view.session_id().unwrap();
     assert_ne!(
         session_id, "stale-session-id",
-        "stale id 不得被当作有效会话"
+        "stale session id must not be treated as valid"
     );
     let entries = view.transcript_snapshot();
     assert!(
         entries
             .iter()
             .any(|entry| entry.text.contains("已降级为新会话")),
-        "必须显示降级提示：{entries:?}"
+        "degraded note must appear in transcript: {entries:?}"
     );
     let stored = std::fs::read_to_string(&paths.session_id).unwrap();
-    assert_eq!(stored.trim(), session_id, "新会话 id 必须重新落盘");
+    assert_eq!(
+        stored.trim(),
+        session_id,
+        "new session id must be persisted to disk"
+    );
 
     host.stop("dut-stale");
     assert!(wait_terminal(&mut host, "dut-stale"));
@@ -294,7 +296,7 @@ fn stored_session_id_is_resumed_when_agent_supports_load() {
     let work = temp_dir("resume");
     let paths = sandbox::prepare(&work, "dut-resume").unwrap();
 
-    // 第一次启动创建会话，然后明确停止（停止会清掉 resume 标记）。
+    // First launch creates a session, then explicitly stops (which clears resume markers).
     let mut first = HostManager::new(
         work.clone(),
         Arc::new(SnapshotState::empty()),
@@ -306,7 +308,7 @@ fn stored_session_id_is_resumed_when_agent_supports_load() {
         .unwrap();
     assert!(
         wait_ready(&mut first, "dut-resume"),
-        "首次会话未就绪：{:?}",
+        "initial session did not become ready: {:?}",
         first.view("dut-resume").map(|view| view.status())
     );
     let original = first.view("dut-resume").unwrap().session_id().unwrap();
@@ -314,7 +316,7 @@ fn stored_session_id_is_resumed_when_agent_supports_load() {
     assert!(wait_terminal(&mut first, "dut-resume"));
     drop(first);
 
-    // 模拟异常残留：把有效 session-id 写回，下一次启动应恢复同一会话。
+    // Simulate an unclean exit: restore the valid session-id so the next launch resumes it.
     std::fs::write(&paths.session_id, &original).unwrap();
     let mut second = HostManager::new(
         work.clone(),
@@ -327,7 +329,7 @@ fn stored_session_id_is_resumed_when_agent_supports_load() {
         .unwrap();
     assert!(
         wait_ready(&mut second, "dut-resume"),
-        "恢复后未就绪：{:?} stderr={}",
+        "resumed session did not become ready: {:?} stderr={}",
         second.view("dut-resume").map(|view| view.status()),
         second
             .view("dut-resume")
@@ -337,14 +339,14 @@ fn stored_session_id_is_resumed_when_agent_supports_load() {
     assert_eq!(
         view.session_id().as_deref(),
         Some(original.as_str()),
-        "应恢复同一 session；transcript={:?}",
+        "should resume the same session; transcript={:?}",
         view.transcript_snapshot()
     );
     assert!(
         view.transcript_snapshot()
             .iter()
             .any(|entry| entry.text.contains("已恢复上次会话")),
-        "必须显示恢复提示：{:?}",
+        "resumed note must appear in transcript: {:?}",
         view.transcript_snapshot()
     );
 

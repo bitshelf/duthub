@@ -1,7 +1,7 @@
-//! duthub-flash：烧录工具的只读测试执行（`--help` / `--version` 白名单）。
+//! Read-only test execution for flashing tools (`--help` / `--version` allowlist).
 //!
-//! 规则沿用原 `local_runner.py` 的 `SAFE_ARGS` 白名单；真实刷写不在此 crate 暴露
-//! （M3.4 后续实现带审批 token 的 Job 状态机，H4 永不自动）。
+//! Follows the `SAFE_ARGS` allowlist from `local_runner.py`; unapproved raw flashing
+//! arguments are never exposed here.
 
 #![forbid(unsafe_code)]
 
@@ -19,7 +19,7 @@ const FLASH_UPDATE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Allowed image file extensions for workdir-fenced firmware flashing.
 const ALLOWED_IMAGE_EXTENSIONS: [&str; 2] = ["img", "bin"];
 
-/// 只读检查参数白名单（docs/SECURITY.md #4：`--help` 也不可尽信，参数必须显式白名单）。
+/// Allowlist of read-only probe flags (`docs/SECURITY.md` #4: all arguments must be explicitly allowlisted).
 pub const SAFE_ARGS: [&str; 5] = ["--help", "-h", "--version", "-V", "-?"];
 
 #[must_use]
@@ -62,7 +62,7 @@ impl FlashTester {
         self.run_test(executable, &args)
     }
 
-    /// 运行只读测试（仅白名单参数）。返回真实 `ProcessResult` 供 UI 展示。
+    /// Run a read-only test using allowlisted flags and return the real `ProcessResult` for UI display.
     pub fn run_test(&self, executable_spec: &str, args: &[String]) -> DeviceResult<ProcessResult> {
         if !is_safe_args(args) {
             return Err(DeviceError::Invalid(format!(
@@ -155,7 +155,7 @@ mod tests {
             vec!["-?".into()],
         ];
         for args in &ok {
-            assert!(is_safe_args(args), "{args:?} 应放行");
+            assert!(is_safe_args(args), "{args:?} should be allowed");
         }
         let bad: Vec<Vec<String>> = vec![
             vec![],
@@ -164,7 +164,7 @@ mod tests {
             vec!["-w".into(), "image.img".into()],
         ];
         for args in &bad {
-            assert!(!is_safe_args(args), "{args:?} 必须拒绝");
+            assert!(!is_safe_args(args), "{args:?} must be rejected");
         }
     }
 
@@ -178,7 +178,10 @@ mod tests {
             .run_test("upgrade_tool", &["--list".to_string()])
             .unwrap_err();
         assert!(matches!(err, DeviceError::Invalid(_)));
-        assert!(mock.calls.lock().unwrap().is_empty(), "拒绝时不得启动进程");
+        assert!(
+            mock.calls.lock().unwrap().is_empty(),
+            "rejected arguments must not spawn a process"
+        );
     }
 
     #[test]

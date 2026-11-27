@@ -1,4 +1,4 @@
-# 诊断：指定屏幕点上的窗口归属 + 光标往返 + DPI
+# Inspect the window at a screen point, cursor movement, and display DPI.
 param([int]$Sx = 425, [int]$Sy = 150)
 Add-Type @"
 using System;
@@ -30,14 +30,14 @@ $r = New-Object DG+RECT
 [DG]::GetWindowRect($hw, [ref]$r) | Out-Null
 Write-Output ("POINT($Sx,$Sy) -> hwnd=$hw pid=$pid2 proc={0} vis={1} title=[{2}] rect=({3},{4})-({5},{6}) dpi={7}" -f $proc.ProcessName, [DG]::IsWindowVisible($hw), $sb.ToString(), $r.L, $r.T, $r.R, $r.B, [DG]::GetDpiForWindow($hw))
 
-# 光标往返
+# Move the cursor to the target and back.
 [DG]::SetCursorPos($Sx, $Sy) | Out-Null
 Start-Sleep -Milliseconds 200
 $cp = New-Object DG+POINT
 [DG]::GetCursorPos([ref]$cp) | Out-Null
 Write-Output ("cursor after SetCursorPos($Sx,$Sy): ($($cp.X),$($cp.Y))")
 
-# Duthub 窗口的 DPI
+# Read the duthub window's DPI.
 $dw = Get-Process -Name Duthub -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($dw) {
     Add-Type @"

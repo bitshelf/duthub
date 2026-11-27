@@ -80,8 +80,8 @@ impl GarbleMeter {
             bytes
         };
         let sample_len = u32::try_from(sample.len()).unwrap_or(u32::MAX);
-        let control =
-            u32::try_from(sample.iter().filter(|b| is_control_byte(**b)).count()).unwrap_or(u32::MAX);
+        let control = u32::try_from(sample.iter().filter(|b| is_control_byte(**b)).count())
+            .unwrap_or(u32::MAX);
         self.chunks.push_back((sample_len, control));
         self.bytes += sample_len;
         self.control += control;
@@ -170,13 +170,16 @@ mod tests {
     #[test]
     fn control_byte_classifier_excludes_text_controls() {
         for b in [0x07u8, 0x08, 0x09, 0x0a, 0x0d, 0x1b] {
-            assert!(!is_control_byte(b), "0x{b:02x} 是正常的文本/终端控制符");
+            assert!(
+                !is_control_byte(b),
+                "0x{b:02x} is a normal text/terminal control byte"
+            );
         }
         for b in [0x00u8, 0x01, 0x06, 0x0b, 0x0c, 0x0e, 0x1f, 0x7f] {
-            assert!(is_control_byte(b), "0x{b:02x} 必须计入乱码");
+            assert!(is_control_byte(b), "0x{b:02x} must count as garbled");
         }
         for b in [b' ', b'0', b'A', b'~', 0x80, 0xff] {
-            assert!(!is_control_byte(b), "0x{b:02x} 不是控制字节");
+            assert!(!is_control_byte(b), "0x{b:02x} is not a control byte");
         }
     }
 
@@ -257,7 +260,10 @@ mod tests {
         // Window turnover to a clean 4 KiB block: one step down to Watch even
         // though the share is already 0‰.
         meter.observe(&chunk(WINDOW_BYTES, 0));
-        assert_eq!(meter.stats().window_bytes, u32::try_from(WINDOW_BYTES).unwrap());
+        assert_eq!(
+            meter.stats().window_bytes,
+            u32::try_from(WINDOW_BYTES).unwrap()
+        );
         assert_eq!(meter.stats().control_permille, 0);
         assert_eq!(meter.stats().level, GarbleLevel::Watch);
 
@@ -331,7 +337,10 @@ mod tests {
         meter.observe(&chunk(2048, 0));
         let stats = meter.stats();
         assert_eq!(stats.window_bytes, u32::try_from(WINDOW_BYTES).unwrap());
-        assert_eq!(stats.control_permille, 0, "旧的高占比块必须被淘汰");
+        assert_eq!(
+            stats.control_permille, 0,
+            "old high-control chunk must be evicted"
+        );
         assert_eq!(stats.level, GarbleLevel::Watch);
     }
 
@@ -342,7 +351,11 @@ mod tests {
         let stats = meter.stats();
         assert_eq!(stats.window_bytes, 511);
         assert_eq!(stats.control_permille, 1000);
-        assert_eq!(stats.level, GarbleLevel::Clean, "min window 前不判定");
+        assert_eq!(
+            stats.level,
+            GarbleLevel::Clean,
+            "must not judge before min window"
+        );
 
         meter.observe(&[0x00; 1]);
         assert_eq!(meter.stats().window_bytes, MIN_WINDOW_BYTES);
@@ -399,6 +412,6 @@ mod tests {
         assert_eq!(stats.level, GarbleLevel::Clean);
         assert_eq!(stats.control_permille, 0);
         assert_eq!(stats.window_bytes, 0);
-        assert!(meter.enabled(), "reset 不得改变开关状态");
+        assert!(meter.enabled(), "reset must not change enabled state");
     }
 }

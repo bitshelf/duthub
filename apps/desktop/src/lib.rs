@@ -1,11 +1,10 @@
-//! duthub 桌面库目标（W2 起）。
+//! Duthub desktop library target (available since W2).
 //!
-//! - [`agent_host`]：goose ACP 客户端与每 DUT 会话宿主。goose 不再内嵌：
-//!   由「工具下载」页下载安装（`duthub-tooldown`），运行时按「外部路径 >
-//!   已下载安装 > PATH」解析，未安装经 [`agent_host::goose_install_state`] 上报。
-//! - [`agent_ui`]：Agent 相关 UI 的纯逻辑支撑（W4a）：A2A 导出秘密扫描、
-//!   DUT 删除清理序、pending-cleanup 落盘、A2A 端口校验、OS 隔离徽标文案。
-//!   不依赖 gpui/workspace/alerts，集成测试可独立导入。
+//! - [`agent_host`] provides the goose ACP client and per-DUT session host. Use the tool downloader
+//!   to install goose. At runtime prefer the configured external path, then the downloaded
+//!   executable, then PATH. [`agent_host::goose_install_state`] reports when none is available.
+//! - [`agent_ui`] provides testable Agent logic for A2A credential checks and port validation, DUT
+//!   deletion and cleanup persistence, and isolation badge labels.
 //! - [`capture_backend`]: capture-demand ledger, idle clamping, ffmpeg
 //!   resolution, artifact parsing and the `MEDIA_*` error codes
 //!   (`docs/design/CAPTURE_STREAM_BACKENDS.md` §3.4/§4.2/§5.4/§5.7). No GPUI types.
@@ -21,9 +20,10 @@
 //!   `windows` crate (`docs/design/TRAY_ALERT_DESIGN.md` §4/§8/§12). It exposes the
 //!   `TrayBackend` port; non-Windows targets get an inert implementation.
 //!
-//! MCP HTTP 启动栈留在 bin target 的 `mcp_runtime.rs`（`plan_badges.rs` 的
-//! 源码契约把 `spawn_mcp_runtime`/`McpRuntimeHandles` 钉在该文件）；UI 仍在
-//! `src/main.rs` 的 bin target。
+//! The MCP HTTP startup stack remains in the `bin_target` directory, within the file
+//! `mcp_runtime.rs`. The source code contract for `plan_badges.rs` defines `spawn_mcp_runtime` and
+//! `McpRuntimeHandles`, which are located in this file. The UI-related components, on the other
+//! hand, are still located in the `src/main.rs` file within the `bin_target` directory.
 
 pub mod agent_host;
 pub mod agent_ui;

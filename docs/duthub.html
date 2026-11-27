@@ -6,7 +6,7 @@
 <meta name="description" content="Duthub 桌面应用 UI 一比一离线复刻（2026-11 构建对齐）">
 <title>Duthub · Offline</title>
 <style>
-/* ============ 主题 token —— 与 apps/desktop/src/theme.rs 一致 ============ */
+/* Theme tokens shared with apps/desktop/src/theme.rs */
 :root{--bg:#0a1019;--rail:#0c131d;--surface:#101926;--panel:#121d2b;--raised:#182638;--hover:#1e2c3d;--border:#263445;--line:#1e2b3b;--text:#e8f0f7;--muted:#8ca0b5;--faint:#5f758b;--accent:#56cbb9;--accent-weak:#113d3c;--accent-contrast:#071b1b;--blue:#88b7ed;--warn:#e9ba78;--red:#ec8291;--term:#090f18;--term-fg:#cfdbe8;--prompt:#71ddbf;--match:#edbe7a;--backdrop:#030911ad;--accent-ring:#48cbb91a;--sidebar:#0e1520;--shadow:0 16px 60px #0004;--radius:6px;--radius-lg:10px;font-synthesis:none}
 :root[data-theme=light]{--bg:#f4f7fb;--rail:#eaf0f6;--surface:#ffffff;--panel:#f8fbff;--raised:#edf3fa;--hover:#e2ebf4;--border:#d3dee9;--line:#e2eaf2;--text:#182c40;--muted:#63798c;--faint:#8495a6;--accent:#167e75;--accent-weak:#d8f2ed;--accent-contrast:#071b1b;--blue:#1766ac;--warn:#a66e1d;--red:#a93e55;--term:#fbfdff;--term-fg:#244058;--prompt:#13826b;--match:#a16b11;--backdrop:#030911ad;--accent-ring:#48cbb91a;--sidebar:#dfe5ec;--shadow:0 14px 48px #465b721c}
 *{box-sizing:border-box}[hidden]{display:none!important}html,body{height:100%;margin:0}
@@ -16,7 +16,7 @@ svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke
 button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--faint);border-radius:5px}::-webkit-scrollbar-track{background:transparent}
 
-/* ============ 外壳：标题栏 / 工作区 / 底栏 ============ */
+/* Workbench shell, title bar, and footer */
 .app{display:flex;flex-direction:column;width:100%;height:100dvh;min-width:760px}
 .titlebar{height:38px;flex:none;display:flex;align-items:center;background:var(--rail);border-bottom:1px solid var(--line);padding:0 0 0 6px;gap:0}
 .tb-btn{width:30px;height:26px;display:grid;place-items:center;border:0;background:transparent;color:var(--muted);border-radius:6px}
@@ -53,7 +53,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .side-dock{width:clamp(260px,42vw,440px);flex:none;background:var(--surface);border-left:1px solid var(--border);display:none;flex-direction:column;min-width:0;position:relative}
 .side-dock.open{display:flex}
 
-/* ============ 底栏 ============ */
+/* Footer */
 .bottombar{height:40px;flex:none;display:flex;align-items:center;gap:8px;padding:0 8px;background:var(--rail);border-top:1px solid var(--line)}
 .icon-btn{width:32px;height:32px;display:inline-grid;place-items:center;background:transparent;color:var(--muted);border:0;border-radius:7px;flex:none}
 .icon-btn:hover{background:var(--hover);color:var(--text)}
@@ -69,7 +69,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .cmd-add:hover{background:var(--hover);color:var(--text)}
 .cmd-add svg{width:15px;height:15px}
 
-/* ============ 首页 ============ */
+/* Home view */
 .view{display:none;min-height:0;flex:1}
 .view.active{display:flex}
 .view-home{flex-direction:column;align-items:center;overflow:auto;background:var(--bg);padding:56px 24px 24px}
@@ -103,7 +103,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .badge.offline i{width:5px;height:5px;border-radius:99px;background:var(--faint)}
 .badge.usb{color:var(--blue)}
 
-/* ============ 会话视图（终端） ============ */
+/* Terminal session */
 .view-serial{flex-direction:column;background:var(--term)}
 .terminal-viewport{flex:1;min-height:0;overflow-y:auto;padding:16px 19px 40px;cursor:text;outline:none;font:12.5px/1.65 Consolas,"Cascadia Code",monospace;color:var(--term-fg)}
 .terminal-line{min-height:20.6px;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -114,7 +114,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .empty-terminal-inner svg{height:34px;width:34px;color:var(--faint)}
 .empty-terminal-inner p{margin:0;font-size:12.5px}
 
-/* ============ 左侧连接表单 dock ============ */
+/* Left connection form dock */
 .dock-head{height:44px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 14px;border-bottom:1px solid var(--line)}
 .dock-title{font-size:13px;font-weight:670}
 .dock-x{width:28px;height:28px;border:0;background:transparent;color:var(--faint);border-radius:6px;display:grid;place-items:center;font-size:15px}
@@ -196,7 +196,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
 .color-dot{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--match)}
 .subtle{font-size:11px;color:var(--muted)}
 
-/* ============ 右侧 Agent 面板 ============ */
+/* Right Agent panel */
 .agent-head{height:44px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 13px 0 10px;border-bottom:1px solid var(--line)}
 .agent-head-l{display:flex;align-items:center;gap:8px;color:var(--text);font-size:12px;font-weight:650}
 .agent-head-l svg{width:15px;height:15px;color:var(--accent)}
@@ -271,7 +271,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
 .tool-policy+.tool-policy{margin-top:7px;font-family:"Segoe UI",sans-serif;font-size:10px;color:var(--muted)}
 .insp-foot{margin-top:auto;padding:12px 15px;display:flex;justify-content:space-between;font-size:10px;color:var(--faint)}
 
-/* ============ 右侧设备监控面板 ============ */
+/* Right device monitor panel */
 .monitor-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:0 0 12px}
 .dut-line{padding:0 14px 6px;color:var(--muted);font-size:12.5px}
 .src-tabs{padding:12px 12px 0;display:flex;flex-direction:column;gap:10px}
@@ -280,7 +280,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
 .preview img,.preview video{max-width:100%;max-height:100%;object-fit:contain}
 .preview .waiting{color:var(--faint);font-size:12px}
 
-/* ============ 汉堡菜单 / 右键菜单 / 弹层 ============ */
+/* Main menu, context menus, and overlays */
 .ws-menu{position:fixed;left:6px;top:48px;width:206px;background:var(--surface);border:1px solid var(--border);border-radius:9px;box-shadow:var(--shadow);padding:6px;display:none;flex-direction:column;gap:3px;z-index:60}
 .ws-menu.open{display:flex}
 .ws-menu-item{width:100%;height:35px;display:flex;align-items:center;gap:10px;padding:0 10px;border:0;border-radius:6px;background:none;color:var(--text);font-size:13px;text-align:left}
@@ -294,7 +294,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
 .ctx-sep{height:1px;background:var(--line);margin:5px 7px}
 .ctx-head{color:var(--faint);font:10px Consolas,monospace;padding:7px 10px 8px}
 
-/* ============ 设置大弹窗（Zed 风格） ============ */
+/* Settings dialog */
 .config-overlay{position:fixed;inset:0;background:var(--backdrop);display:none;align-items:center;justify-content:center;z-index:88;padding:26px}
 .config-overlay.show{display:flex}
 .config-shell{width:min(1120px,96vw);height:min(760px,92vh);background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);display:flex;overflow:hidden}
@@ -372,7 +372,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
 .icon-sm:hover{background:var(--hover);color:var(--text)}
 .icon-sm svg{width:15px;height:15px}
 
-/* ============ 对话框 / Toast ============ */
+/* Dialogs and toasts */
 .modal-overlay{position:fixed;inset:0;background:var(--backdrop);display:none;align-items:center;justify-content:center;z-index:90;padding:20px}
 .modal-overlay.show{display:flex}
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:14px;width:min(515px,95vw);box-shadow:var(--shadow)}
@@ -422,7 +422,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
 </defs></svg>
 
 <div class="app" id="app">
-  <!-- 标题栏 -->
+  <!-- Title bar -->
   <header class="titlebar">
     <button type="button" class="tb-btn" id="wsMenuToggle" title="菜单" aria-label="菜单"><svg><use href="#i-menu"/></svg></button>
     <span class="tb-divider" aria-hidden="true"></span>
@@ -438,13 +438,13 @@ button.chip:hover{color:var(--text);background:var(--hover)}
   </header>
 
   <div class="workspace">
-    <!-- 左侧连接表单 dock -->
+    <!-- Left connection form dock -->
     <aside class="conn-dock" id="connDock">
       <div class="dock-head"><span class="dock-title" id="connDockTitle">连接管理</span><button type="button" class="dock-x" id="connDockClose" title="关闭"><svg style="width:15px;height:15px"><use href="#i-x"/></svg></button></div>
       <div class="dut-tabbar" id="dutTabbar"></div>
       <div class="dock-body" id="connDockBody">
         <div class="dock-sections">
-          <!-- 串口 -->
+          <!-- Serial -->
           <div class="panel"><div class="panel-head"><div class="panel-title"><svg><use href="#i-terminal"/></svg><span>串口</span></div></div><div class="panel-body">
             <div class="field"><label>DUT 名称</label><input id="fDutName" value="RK3576_ohos" spellcheck="false"></div>
             <div class="field"><label>串口节点</label><div class="combo"><input id="fPort" value="COM8" spellcheck="false"></div><div class="help">点击输入框展开节点列表，也可手动输入串口路径。</div></div>
@@ -453,12 +453,12 @@ button.chip:hover{color:var(--text);background:var(--hover)}
               <div class="field"><label>数据格式</label><div class="select"><select id="fFormat"><option>8N1</option><option>8E1</option><option>8O1</option><option>7E1</option></select></div></div>
             </div>
           </div></div>
-          <!-- USB 调试 -->
+          <!-- USB debugging -->
           <div class="panel"><div class="panel-head"><div class="panel-title"><svg><use href="#i-usb"/></svg><span>USB 调试</span></div></div><div class="panel-body">
             <div class="field"><label>调试工具</label><div class="select"><select id="fUsbTool"><option>None</option><option>ADB</option><option>HDC</option></select></div></div>
             <div class="field" id="usbSerialField" hidden><label>绑定的 ADB 序列号</label><div class="combo"><input placeholder="选择或输入设备标识" spellcheck="false"></div><div class="help">当前未检测到 ADB 设备</div></div>
           </div></div>
-          <!-- 控制 -->
+          <!-- Control -->
           <div class="panel"><div class="panel-head"><div class="panel-title"><svg><use href="#i-bolt"/></svg><span>控制</span></div></div>
           <div class="panel-body">
             <div class="field"><label>控制设备</label><div class="select"><select id="fRelay"><option>None</option><option selected>CH340 · COM25</option></select></div></div>
@@ -469,16 +469,16 @@ button.chip:hover{color:var(--text);background:var(--hover)}
               <div class="relay-row"><label><input type="checkbox" class="check" checked>Maskrom</label><div class="select"><select><option>CH 1</option><option selected>CH 2</option><option>CH 3</option><option>CH 4</option></select></div><button type="button" class="test-btn" disabled>测试</button></div>
             </div>
           </div></div>
-          <!-- 烧录工具 -->
+          <!-- Flash tools -->
           <div class="panel"><div class="panel-head"><div class="panel-title"><svg><use href="#i-hard-drive"/></svg><span>烧录工具</span></div></div><div class="panel-body">
             <div class="field"><label>选择烧录工具</label><div class="select"><select id="fFlash"><option>未绑定</option><option selected>upgrade_tool</option></select></div></div>
           </div></div>
-          <!-- MCP · DUT 映射 -->
+          <!-- MCP per-DUT mapping -->
           <div class="panel"><div class="panel-head"><div class="panel-title"><svg><use href="#i-link"/></svg><span>MCP · DUT 映射</span></div></div><div class="panel-body">
             <div class="field"><label>MCP 传输方式</label><div class="select"><select id="fMcpTransport"><option selected>http</option><option>stdio</option></select></div></div>
             <div class="field"><label>MCP 端点 URL</label><input id="fMcpUrl" value="http://127.0.0.1:8787/mcp" spellcheck="false" style="font-family:Consolas,monospace"><div class="help">Streamable HTTP：输入完整 URL，支持 http:// 或 https://，无需额外选择协议。</div></div>
           </div></div>
-          <!-- 会话心跳 -->
+          <!-- Session heartbeat -->
           <div class="panel"><div class="panel-head"><div class="panel-title"><svg><use href="#i-activity"/></svg><span>会话心跳</span></div></div><div class="panel-body">
             <div class="field"><label class="hb-row"><input type="checkbox" class="check" id="hbEnabled">启用心跳</label></div>
             <div class="field"><label>心跳命令</label><textarea rows="2" placeholder="uname -a&#10;uptime" spellcheck="false"></textarea><div class="help">每行一条，按顺序执行。多条命令会在同一轮探测中一起检查。</div></div>
@@ -489,12 +489,12 @@ button.chip:hover{color:var(--text);background:var(--hover)}
             <div class="panel-footnote" style="padding:0">保存绑定后应用。连续 3 次未收到预期响应时提醒。</div>
             <div class="status-line" id="hbStatus">已停用</div>
           </div></div>
-          <!-- 弹窗提醒 -->
+          <!-- Alert dialogs -->
           <div class="panel"><div class="panel-head"><div class="panel-title"><svg><use href="#i-alert"/></svg><span>弹窗提醒</span></div></div><div class="panel-body">
             <div class="switch-row" style="padding-bottom:12px"><div><div class="st">启用弹窗提醒</div><div class="sd">心跳丢联、串口会话失败、控制动作或烧录失败、Agent 分析时弹出警告。</div></div><button type="button" class="switch on" data-switch aria-label="启用弹窗提醒"></button></div>
             <div class="switch-row" style="padding-top:4px"><div><div class="st">被抑制的提醒来源</div><div class="sd">「忽略此类」仅静默当前 DUT 的同类提醒。</div></div><span class="subtle">暂无被抑制的提醒来源</span></div>
           </div></div>
-          <!-- HDMI 采集卡 -->
+          <!-- HDMI capture -->
           <div class="panel" data-capture><div class="panel-head"><div class="panel-title"><svg><use href="#i-eye"/></svg><span>HDMI 采集卡</span></div><label class="switch-row" style="gap:8px;cursor:pointer"><span class="subtle">启用采集</span><button type="button" class="switch" data-switch data-capture-toggle aria-label="启用采集"></button></label></div>
             <div class="panel-body" hidden>
               <div class="field"><label>视频设备</label><div class="inline-row"><input value="UGREEN 35866" spellcheck="false"><button type="button" class="btn tiny">选择设备</button></div></div>
@@ -506,7 +506,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
               <div class="btn-row"><button type="button" class="btn tiny primary">启动采集</button></div>
             </div>
           </div>
-          <!-- USB 摄像头 -->
+          <!-- USB camera -->
           <div class="panel" data-capture><div class="panel-head"><div class="panel-title"><svg><use href="#i-eye"/></svg><span>USB 摄像头</span></div><label class="switch-row" style="gap:8px;cursor:pointer"><span class="subtle">启用采集</span><button type="button" class="switch" data-switch data-capture-toggle aria-label="启用采集"></button></label></div>
             <div class="panel-body" hidden>
               <div class="field"><label>视频设备</label><div class="inline-row"><input placeholder="留空或填写设备名称 / 路径" spellcheck="false"><button type="button" class="btn tiny">选择设备</button></div></div>
@@ -526,9 +526,9 @@ button.chip:hover{color:var(--text);background:var(--hover)}
       </div>
     </aside>
 
-    <!-- 中央区 -->
+    <!-- Main area -->
     <main class="center" id="centerArea">
-      <!-- 首页 -->
+      <!-- Home view -->
       <section class="view view-home active" id="viewHome">
         <div class="home-inner">
           <img class="home-logo" src="data:image/png;base64,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" alt="Duthub" draggable="false">
@@ -539,7 +539,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
           <div class="tile-grid" id="tileGrid"></div>
         </div>
       </section>
-      <!-- 串口会话 -->
+      <!-- Serial session -->
       <section class="view view-serial" id="viewSerial">
         <div class="terminal-viewport" id="terminalViewport" tabindex="0">
           <div class="terminal-log" id="terminalLog"><div class="terminal-line"><span class="term-cursor"></span></div></div>
@@ -547,7 +547,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
       </section>
     </main>
 
-    <!-- 右侧 Agent 面板 -->
+    <!-- Right Agent panel -->
     <aside class="side-dock" id="sideAgent">
       <div class="agent-head">
         <div class="agent-head-l"><svg><use href="#i-spark"/></svg>Agent</div>
@@ -632,7 +632,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
       </div>
     </aside>
 
-    <!-- 右侧设备监控面板 -->
+    <!-- Right device monitor panel -->
     <aside class="side-dock" id="sideMonitor">
       <div class="panel-head" style="border-radius:0"><div class="panel-title"><svg><use href="#i-eye"/></svg><span>设备监控</span></div><button type="button" class="icon-sm" id="monitorClose" title="关闭"><svg><use href="#i-x"/></svg></button></div>
       <div class="monitor-body">
@@ -647,7 +647,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
     </aside>
   </div>
 
-  <!-- 底栏 -->
+  <!-- Footer -->
   <footer class="bottombar">
     <button type="button" class="icon-btn" id="connToggle" title="连接管理"><svg><use href="#i-link"/></svg></button>
     <div class="cmd-dock idle" id="cmdDock">
@@ -662,14 +662,14 @@ button.chip:hover{color:var(--text);background:var(--hover)}
   </footer>
 </div>
 
-<!-- 汉堡菜单 -->
+<!-- Main menu -->
 <div class="ws-menu" id="wsMenu">
   <button type="button" class="ws-menu-item" data-open-cfg="agent"><svg><use href="#i-spark"/></svg>Agent</button>
   <button type="button" class="ws-menu-item" data-open-cfg="flash"><svg><use href="#i-cpu"/></svg>设备工具</button>
   <button type="button" class="ws-menu-item" data-open-cfg="settings"><svg><use href="#i-settings"/></svg>设置</button>
 </div>
 
-<!-- 终端右键菜单 -->
+<!-- Terminal context menu -->
 <div class="ctx-menu" id="termMenu">
   <button type="button" class="ctx-item" data-act="reconnect"><svg><use href="#i-refresh"/></svg>立即重连</button>
   <button type="button" class="ctx-item" data-act="reset"><svg><use href="#i-check"/></svg>重置终端</button>
@@ -681,7 +681,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
   <button type="button" class="ctx-item" data-act="clear"><svg><use href="#i-trash"/></svg>清屏</button>
 </div>
 
-<!-- 设置大弹窗 -->
+<!-- Settings dialog -->
 <div class="config-overlay" id="configOverlay">
   <div class="config-shell">
     <aside class="config-sidebar">
@@ -700,7 +700,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
       <div class="config-head"><span class="config-head-title" id="cfgTitle">烧录工具</span><div class="config-head-spacer"></div><button type="button" class="config-close" id="configClose" title="关闭">×</button></div>
       <div class="config-pages">
 
-        <!-- Agent 页 -->
+        <!-- Agent page -->
         <div class="cfg-page" data-page="agent" style="max-width:820px;margin:0 auto">
           <div class="chip-row" style="margin:6px 0 14px"><button type="button" class="btn tiny" style="background:var(--accent-weak);border-color:#3d7e7650;color:var(--accent)">添加供应商</button></div>
           <div class="field"><label>模型提供商</label><input value="OpenAI" readonly></div>
@@ -709,7 +709,7 @@ button.chip:hover{color:var(--text);background:var(--hover)}
           <div class="btn-row"><button type="button" class="btn tiny primary">保存模型配置</button><button type="button" class="btn tiny">测试连接</button></div>
         </div>
 
-        <!-- 烧录工具页 -->
+        <!-- Flash tools page -->
         <div class="cfg-page" data-page="flash">
           <h1 class="cfg-title">烧录工具</h1>
           <div class="settings-panel">
@@ -724,7 +724,7 @@ Usage: upgrade_tool [options]</div></div>
           </div>
         </div>
 
-        <!-- USB 调试页 -->
+        <!-- USB debugging page -->
         <div class="cfg-page" data-page="adb" style="max-width:980px;margin:0 auto">
           <p class="subtle" style="margin:4px 0 10px">配置 ADB 和 HDC 的可执行文件，供设备发现和 Shell 使用。</p>
           <div class="settings-panel">
@@ -738,7 +738,7 @@ Usage: upgrade_tool [options]</div></div>
           </div>
         </div>
 
-        <!-- 控制设备页 -->
+        <!-- Device control page -->
         <div class="cfg-page" data-page="relay" style="max-width:980px;margin:0 auto">
           <div class="field" style="margin-top:6px"><label>已配置的设备</label><div class="select"><select id="relayBoardSel"><option selected>CH340 · COM25</option></select></div></div>
           <div class="field"><label>名称</label><input value="CH340" spellcheck="false"></div>
@@ -748,7 +748,7 @@ Usage: upgrade_tool [options]</div></div>
           <div class="btn-row"><button type="button" class="btn">添加设备</button><button type="button" class="btn primary">保存设备</button><button type="button" class="btn">删除</button></div>
         </div>
 
-        <!-- 设备监控页 -->
+        <!-- Device monitor page -->
         <div class="cfg-page" data-page="media" style="max-width:980px;margin:0 auto">
           <div class="panel" style="margin-top:6px;border-radius:8px"><div class="panel-head"><div class="panel-title"><svg><use href="#i-eye"/></svg><span>采集工具</span></div></div>
             <div class="panel-body">
@@ -761,7 +761,7 @@ Usage: upgrade_tool [options]</div></div>
           <p class="subtle" style="margin-top:14px;font-size:12.5px">在 DUT 的连接管理中选择采集设备。</p>
         </div>
 
-        <!-- 设置页 -->
+        <!-- Settings page -->
         <div class="cfg-page" data-page="settings">
           <h1 class="cfg-title">设置</h1>
           <p class="cfg-sub">显示、终端行为、正则高亮与自定义命令。</p>
@@ -856,7 +856,7 @@ Usage: upgrade_tool [options]</div></div>
   </div>
 </div>
 
-<!-- 删除连接确认 -->
+<!-- Confirm connection removal -->
 <div class="modal-overlay" id="deleteOverlay">
   <div class="modal"><div class="panel-body">
     <div class="modal-title">删除连接</div>
@@ -877,14 +877,14 @@ const tileGrid=$('tileGrid'),sessionTabs=$('sessionTabs');
 function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}
 function notify(text){const n=$('notif');$('notifText').textContent=text;n.classList.add('show');clearTimeout(window.__tt);window.__tt=setTimeout(()=>n.classList.remove('show'),2400)}
 
-/* ---- 会话标签 ---- */
+/* Session tabs */
 function renderTabs(){
   if(!sessionOpen){sessionTabs.innerHTML='';return}
   sessionTabs.innerHTML=`<div class="session-tab active" id="tabMain"><span class="tab-dot ${DUT.online?'':'off'}"><i></i></span><span class="tab-label">${esc(DUT.name)} · ${esc(DUT.port)}</span><button type="button" class="tab-close" title="关闭" aria-label="关闭">×</button></div>`;
   sessionTabs.querySelector('.tab-close').addEventListener('click',e=>{e.stopPropagation();closeSession()});
 }
 
-/* ---- 首页磁贴 ---- */
+/* Home tiles */
 function renderTiles(){
   tileGrid.innerHTML=`<button type="button" class="dut-tile" id="tileMain">
     <span class="tile-row1"><span class="tile-ico"><svg><use href="#i-terminal"/></svg></span><span class="tile-name">${esc(DUT.name)}</span><span class="tile-more" id="tileMore" role="button" title="连接管理">⋯</span><span class="tile-del" id="tileDel" role="button" title="删除连接"><svg><use href="#i-trash"/></svg></span></span>
@@ -897,12 +897,12 @@ function renderTiles(){
 }
 renderTiles();
 
-/* ---- 视图切换 ---- */
+/* View switching */
 function openSession(){sessionOpen=true;renderTabs();$('viewHome').classList.remove('active');$('viewSerial').classList.add('active');$('sideMonitorBtn').hidden=false;$('cmdDock').classList.remove('idle');$('terminalViewport').focus()}
 function closeSession(){sessionOpen=false;renderTabs();$('viewSerial').classList.remove('active');$('viewHome').classList.add('active');$('sideMonitorBtn').hidden=true;$('cmdDock').classList.add('idle');$('sideMonitor').classList.remove('open');$('sideMonitorBtn').classList.remove('selected')}
 renderTabs();
 
-/* ---- 连接 dock ---- */
+/* Connection dock */
 let dockMode='edit';
 function renderDutTabs(){
   const bar=$('dutTabbar');
@@ -940,13 +940,13 @@ $('newSessionBtn').addEventListener('click',()=>openConnDock('create'));
 $('homeCreate').addEventListener('click',()=>openConnDock('create'));
 $('homeDevtools').addEventListener('click',()=>openConfig('flash'));
 
-/* ---- 汉堡菜单 ---- */
+/* Main menu */
 const wsMenu=$('wsMenu');
 $('wsMenuToggle').addEventListener('click',e=>{e.stopPropagation();wsMenu.classList.toggle('open')});
 document.addEventListener('click',e=>{if(!wsMenu.contains(e.target))wsMenu.classList.remove('open')});
 wsMenu.querySelectorAll('.ws-menu-item').forEach(btn=>btn.addEventListener('click',()=>{wsMenu.classList.remove('open');openConfig(btn.dataset.openCfg)}));
 
-/* ---- 设置弹窗 ---- */
+/* Settings dialog */
 const CFG_TITLES={agent:'Agent',flash:'烧录工具',adb:'USB 调试',relay:'控制设备',media:'设备监控',settings:'设置'};
 let cfgPage='flash';
 function openConfig(page){cfgPage=page||cfgPage;selectCfg(cfgPage);$('configOverlay').classList.add('show')}
@@ -957,20 +957,20 @@ $('configOverlay').addEventListener('click',e=>{if(e.target===$('configOverlay')
 $('cfgSearch').addEventListener('input',e=>{const q=e.target.value.trim().toLowerCase();document.querySelectorAll('.config-nav-btn').forEach(b=>b.hidden=q&&!b.textContent.toLowerCase().includes(q))});
 $('agentModelBtn').addEventListener('click',()=>openConfig('agent'));
 
-/* ---- 底栏 ---- */
+/* Footer */
 $('sideAgentBtn').addEventListener('click',()=>{$('sideAgent').classList.toggle('open');$('sideAgentBtn').classList.toggle('selected');$('sideMonitor').classList.remove('open');$('sideMonitorBtn').classList.remove('selected')});
 $('agentCloseBtn').addEventListener('click',()=>{$('sideAgent').classList.remove('open');$('sideAgentBtn').classList.remove('selected')});
 $('sideMonitorBtn').addEventListener('click',()=>{$('sideMonitor').classList.toggle('open');$('sideMonitorBtn').classList.toggle('selected');$('sideAgent').classList.remove('open');$('sideAgentBtn').classList.remove('selected')});
 $('monitorClose').addEventListener('click',()=>{$('sideMonitor').classList.remove('open');$('sideMonitorBtn').classList.remove('selected')});
 $('manualBtn').addEventListener('click',function(){manual=!manual;this.classList.toggle('selected',manual);this.title=manual?'解除人工接管':'人工接管所有 DUT，禁止 Agent 写串口和控制继电器';notify(manual?'人工接管已启用，Agent 写入已锁定':'已解除人工接管')});
 
-/* ---- 开关 / 勾选 ---- */
+/* Toggles and checkboxes */
 document.querySelectorAll('[data-switch]').forEach(sw=>sw.addEventListener('click',()=>sw.classList.toggle('on')));
 document.querySelectorAll('[data-capture-toggle]').forEach(sw=>sw.addEventListener('click',()=>{const body=sw.closest('[data-capture]').querySelector('.panel-body');body.hidden=!sw.classList.contains('on')}));
 const hb=$('hbEnabled');if(hb)hb.addEventListener('change',()=>{$('hbStatus').textContent=hb.checked?'尚未探测':'已停用'});
 $('fUsbTool').addEventListener('change',e=>{$('usbSerialField').hidden=e.target.value==='None'});
 
-/* ---- 终端 ---- */
+/* Terminal */
 const tv=$('terminalViewport'),tlog=$('terminalLog');
 tv.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();const line=document.createElement('div');line.className='terminal-line';line.textContent='#';tlog.appendChild(line);tv.scrollTop=tv.scrollHeight}});
 const termMenu=$('termMenu');
@@ -978,7 +978,7 @@ tv.addEventListener('contextmenu',e=>{e.preventDefault();termMenu.style.left=Mat
 document.addEventListener('click',e=>{if(!termMenu.contains(e.target))termMenu.classList.remove('open')});
 termMenu.querySelectorAll('.ctx-item').forEach(btn=>btn.addEventListener('click',()=>{termMenu.classList.remove('open');const a=btn.dataset.act;if(a==='clear')tlog.innerHTML='<div class="terminal-line"><span class="term-cursor"></span></div>';if(a==='reconnect')notify('正在重连 '+DUT.name+' · '+DUT.port+'...')}));
 
-/* ---- Agent 面板 ---- */
+/* Agent panel */
 $('agentInspectorBtn').addEventListener('click',()=>$('agentInspector').classList.toggle('open'));
 $('inspClose').addEventListener('click',()=>$('agentInspector').classList.remove('open'));
 $('agentSend').addEventListener('click',()=>{
@@ -993,12 +993,12 @@ $('agentSend').addEventListener('click',()=>{
 $('agentStop').addEventListener('click',()=>{$('agentStatus').textContent='已停止';document.querySelectorAll('#progressTrack i.done').forEach(s=>s.style.background='var(--red)')});
 $('agentPause').addEventListener('click',function(){$('agentStatus').textContent=$('agentStatus').textContent==='已暂停'?'运行中':'已暂停';});
 
-/* ---- 删除对话框 ---- */
+/* Remove connection dialog */
 $('deleteCancel').addEventListener('click',()=>$('deleteOverlay').classList.remove('show'));
 $('deleteConfirm').addEventListener('click',()=>{$('deleteOverlay').classList.remove('show');if(sessionOpen)closeSession();tileGrid.innerHTML='';notify('连接已删除')});
 $('deleteOverlay').addEventListener('click',e=>{if(e.target===$('deleteOverlay'))$('deleteOverlay').classList.remove('show')});
 
-/* ---- 设置页交互 ---- */
+/* Settings page interactions */
 $('optTheme').addEventListener('change',e=>{document.documentElement.dataset.theme=e.target.value==='浅色'?'light':'dark'});
 let fontSize=14.5;
 function setFontSize(v){fontSize=Math.min(48,Math.max(7.5,v));$('fontSizeVal').textContent=fontSize.toFixed(fontSize%1?1:0)+' px';$('fontPreview').style.fontSize=fontSize+'px'}
@@ -1007,10 +1007,10 @@ $('fontPlus').addEventListener('click',()=>setFontSize(fontSize+0.5));
 $('fontReset').addEventListener('click',()=>setFontSize(14.5));
 document.querySelectorAll('.chip[data-color]').forEach(c=>c.addEventListener('click',()=>{document.documentElement.style.setProperty('--match',c.dataset.color);document.querySelector('.color-dot').style.background=c.dataset.color}));
 
-/* ---- 烧录工具测试 ---- */
+/* Flash tool test */
 $('flashProbeBtn')?.addEventListener('click',function(){const card=$('flashCard');card.classList.add('testing');this.textContent='测试中…';this.disabled=true;setTimeout(()=>{this.textContent='运行测试';this.disabled=false},900)});
 
-/* ---- 快捷命令 ---- */
+/* Command shortcuts */
 document.querySelectorAll('.cmd-pill').forEach(p=>p.addEventListener('click',()=>{if(sessionOpen){const line=document.createElement('div');line.className='terminal-line';line.textContent=p.dataset.cmd;tlog.appendChild(line);tv.scrollTop=tv.scrollHeight}}));
 $('cmdAdd').addEventListener('click',()=>notify('名称与命令均不能为空'));
 </script>

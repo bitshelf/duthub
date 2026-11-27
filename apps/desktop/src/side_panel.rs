@@ -707,9 +707,11 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // W4c：demo Agent 面板已卸载——`render_agent_pane` 不再挂载。无打开
-        // 面板时右栏宽度为 0（`pane_widths` 只在 `visible.is_some()` 时预留），
-        // 空占位即可；Panel::Agent 渲染接真实 SessionView 的 Inspector。
+        // W4c: The demo Agent panel has been uninstalled. The `render_agent_pane` component is no
+        // longer mounted. The width of the right column when the panel is opened is 0 (the
+        // `pane_widths` property is only set when `visible.is_some()` is true). It serves merely as
+        // a placeholder; the Panel::Agent rendering processes are connected to the Inspector of the
+        // real SessionView.
         let Some(panel) = self.side_panel.visible else {
             return div().into_any_element();
         };
@@ -753,7 +755,9 @@ impl Workbench {
                     icon_btn("monitor-float", "copy", p)
                         .tooltip(crate::i18n::t(lang, "monitorFloat"))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if this.frame_pump.placement() == duthub_desktop::capture_ui::MonitorPlacement::Floating {
+                            if this.frame_pump.placement()
+                                == duthub_desktop::capture_ui::MonitorPlacement::Floating
+                            {
                                 this.focus_float_window(cx);
                             } else {
                                 this.handle_monitor_event(
@@ -878,7 +882,7 @@ impl Workbench {
         }
         let offset = self.side_panel.shell_scroll.offset();
         let (font_family, font_size, _) = self.terminal_font(window);
-        let row_height = font_size * 1.5;
+        let row_height = window.pixel_snap(font_size * 1.5);
         let padding = px(12.);
         let rel_y = f32::from(position.y - bounds.origin.y - padding) - f32::from(offset.y);
         match hit_test_row(rel_y, f32::from(row_height), rows.len())? {
@@ -1024,13 +1028,16 @@ impl Workbench {
         let Some(bytes) = crate::workspace::prepare_paste_bytes(&text, bracketed_paste) else {
             return;
         };
-        if let Some(tx) = &shell.tx
-            && tx.try_send(bytes).is_err()
-        {
-            self.notify_toast(crate::i18n::t(
-                self.lang,
-                "shellInputIsTemporarilyUnavailable",
-            ));
+        if let Some(tx) = &shell.tx {
+            if self.settings.terminal.jump_to_latest {
+                self.side_panel.shell_scroll.scroll_to_bottom();
+            }
+            if tx.try_send(bytes).is_err() {
+                self.notify_toast(crate::i18n::t(
+                    self.lang,
+                    "shellInputIsTemporarilyUnavailable",
+                ));
+            }
         }
     }
 
@@ -1050,7 +1057,7 @@ impl Workbench {
             .is_none_or(|shell| shell.exited);
         let mut body = div().flex().flex_col().flex_1().min_h_0();
         let (font_family, font_size, cell_width) = self.terminal_font(window);
-        let row_height = font_size * 1.5;
+        let row_height = window.pixel_snap(font_size * 1.5);
         let selection_bg = crate::workspace::terminal_selection_bg(p, self.theme_mode);
         let selection = self.side_panel.shell_selection;
         if let Some(shell) = &mut self.side_panel.shell {
@@ -1173,6 +1180,9 @@ impl Workbench {
                         }),
                     ) {
                         this.side_panel.shell_selection = None;
+                        if this.settings.terminal.jump_to_latest {
+                            this.side_panel.shell_scroll.scroll_to_bottom();
+                        }
                         if tx.try_send(bytes).is_err() {
                             this.notify_toast(crate::i18n::t(
                                 this.lang,
@@ -1211,7 +1221,24 @@ impl Workbench {
                     }
                 }
             }
-            body = body.child(viewport);
+            body = body.child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(viewport)
+                    .child(
+                        div().absolute().inset_0().child(
+                            gpui_kit::component::scroll::Scrollbar::vertical(
+                                &self.side_panel.shell_scroll,
+                            )
+                            .id("side-shell-scrollbar")
+                            .mode(gpui_kit::component::scroll::ScrollbarMode::Always),
+                        ),
+                    ),
+            );
         }
         if self.side_panel.shell_connecting {
             body = body.child(
@@ -1430,32 +1457,38 @@ impl Workbench {
             .overflow_hidden()
             .rounded(px(8.))
             .bg(p.term);
-        if floating {
-            // Floating: the docked pane is a placeholder; the float window has
-            // the only picture (§6.2/§6.3, no double upload).
-            viewport = viewport.child(subtle(crate::i18n::label("monitorFloating"), p));
-        } else if let Some(frame) = frame {
-            viewport = viewport.child(
-                img(frame)
-                    .absolute()
-                    .inset(px(0.))
-                    .size_full()
-                    .object_fit(ObjectFit::Contain),
-            );
-        } else if has_preview {
-            viewport = viewport.child(subtle(crate::i18n::t(lang, "waitingForVideo"), p));
-        } else if let Some(error) = error {
-            viewport = viewport.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .p(px(12.))
-                    .text_sm()
-                    .text_color(p.red)
-                    .whitespace_normal()
-                    .overflow_hidden()
-                    .child(error),
-            );
+        match (floating, frame, has_preview, error) {
+            (true, _, _, _) => {
+                // Floating: the docked pane is a placeholder; the float window has
+                // the only picture (§6.2/§6.3, no double upload).
+                viewport = viewport.child(subtle(crate::i18n::label("monitorFloating"), p));
+            }
+            (false, Some(frame), _, _) => {
+                viewport = viewport.child(
+                    img(frame)
+                        .absolute()
+                        .inset(px(0.))
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                );
+            }
+            (false, None, true, _) => {
+                viewport = viewport.child(subtle(crate::i18n::t(lang, "waitingForVideo"), p));
+            }
+            (false, None, false, Some(error)) => {
+                viewport = viewport.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .p(px(12.))
+                        .text_sm()
+                        .text_color(p.red)
+                        .whitespace_normal()
+                        .overflow_hidden()
+                        .child(error),
+                );
+            }
+            (false, None, false, None) => {}
         }
         body.child(viewport).into_any_element()
     }
@@ -1464,7 +1497,8 @@ impl Workbench {
     // HDMI float window (§6.4)
     // ------------------------------------------------------------------
 
-    /// Toolbar "还原": close the float window, hand the preview back to the
+    /// The redock action closes the floating window and returns the preview to the right side
+    /// panel.
     /// monitor pane and activate the main window. Called from the float view
     /// before it removes its own window, so the close observer treats it as
     /// programmatic.

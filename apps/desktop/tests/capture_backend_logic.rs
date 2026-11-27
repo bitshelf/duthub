@@ -460,7 +460,12 @@ fn copy_url_hold_expires_without_release() {
     entry.acquire_hold(7, DemandKind::CopyUrl, t0, HOLD_SECS);
     assert!(!entry.is_empty());
     assert_eq!(
-        entry.decide((t0 + HOLD_SECS).checked_sub(Duration::from_millis(1)).unwrap(), IDLE),
+        entry.decide(
+            (t0 + HOLD_SECS)
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+            IDLE
+        ),
         ReclaimDecision::Keep
     );
     // Expiry is visible to `decide` even before the sweep runs.

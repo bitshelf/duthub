@@ -1,5 +1,5 @@
-# 从用户提供的 icon.png 生成应用图标（多尺寸 ICO + 预览）
-# 用法: powershell -File scripts/convert-icon.ps1 -SourcePath <icon.png 路径> [-OutDir <输出目录>]
+# Build a multi-resolution ICO and previews from a supplied icon.png.
+# Usage: powershell -File scripts/convert-icon.ps1 -SourcePath <icon.png path> [-OutDir <output directory>]
 param(
     [Parameter(Mandatory=$true)][string]$SourcePath,
     [string]$OutDir = ""
@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 $src = [System.Drawing.Image]::FromFile($SourcePath)
 
-# 1) 中心裁切为正方形
+# Crop a square from the center.
 $side = [Math]::Min($src.Width, $src.Height)
 $sq = New-Object System.Drawing.Bitmap $side, $side
 $g = [System.Drawing.Graphics]::FromImage($sq)
@@ -28,7 +28,7 @@ $g.DrawImage($src, (New-Object System.Drawing.Rectangle 0, 0, $side, $side),
     (New-Object System.Drawing.Rectangle $offX, $offY, $side, $side), 'Pixel') | Out-Null
 $g.Dispose() | Out-Null
 
-# 2) 缩放到各尺寸
+# Resize for each icon size.
 $sizes = @(256, 128, 64, 48, 32, 16)
 $pngs = @{}
 foreach ($s in $sizes) {
@@ -51,7 +51,7 @@ foreach ($s in $sizes) {
 $sq.Dispose() | Out-Null
 $src.Dispose() | Out-Null
 
-# 3) ICO 打包
+# Pack the images into the ICO container.
 $msIco = New-Object System.IO.MemoryStream
 $bw = New-Object System.IO.BinaryWriter $msIco
 $bw.Write([uint16]0) | Out-Null

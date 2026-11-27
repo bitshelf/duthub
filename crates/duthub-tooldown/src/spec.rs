@@ -1,6 +1,6 @@
 //! Declarative tool table: what to download, which files to extract, which digest is pinned.
 //!
-//! Adding a new tool ("等工具") = one `pub const ToolSpec` here plus a `builtin_specs()` row.
+//! Adding a new tool = one `pub const ToolSpec` here plus a `builtin_specs()` row.
 //! Pins are md-verified probe artifacts: each pin comment records where and when the digest
 //! was obtained. Pinning an alias URL (both built-ins are "latest"-style aliases) means an
 //! upstream content change fails the install loudly with [`crate::ToolInstallError::
@@ -73,7 +73,7 @@ impl ToolSpec {
 
 /// Android platform-tools (adb + fastboot) from Google's official "latest" alias.
 ///
-/// Pinned on 2026-11-23: the archive was downloaded from the URL below (8,188,601 bytes)
+/// Pinned archive downloaded from the URL below (8,188,601 bytes)
 /// and hashed with sha256sum (`89d108360a3bf2924d3bea837239edaccc22fd6ff5befd3787c4348a9fe4f09d`).
 /// The URL is Google's rolling alias, so the pin must be refreshed whenever Google ships a
 /// new platform-tools build — a stale pin fails installs loudly instead of installing
@@ -95,7 +95,7 @@ pub const TOOL_ADB: ToolSpec = ToolSpec {
 
 /// ffmpeg (with ffprobe and ffplay) from gyan.dev's release-essentials alias.
 ///
-/// Pinned on 2026-11-23 from the gyan.dev sidecar
+/// Pinned from the gyan.dev sidecar
 /// `ffmpeg-release-essentials.zip.sha256`. The alias currently resolves to
 /// `packages/ffmpeg-9.1-essentials_build.zip`; refresh the pin whenever gyan.dev re-points
 /// the release alias.
@@ -119,8 +119,8 @@ pub const TOOL_FFMPEG: ToolSpec = ToolSpec {
 /// sha256 in the manifest with `checksumVerified = false` — unverified by design, stated
 /// honestly rather than pretending integrity that is not checked.
 ///
-/// Probed 2026-11-23: `https://github.com/block/goose/...` 301-redirects to the moved repo
-/// `aaif-goose/goose` (GitHub org rename), whose latest release at probe time was v1.60.2.
+/// `https://github.com/block/goose/...` 301-redirects to the moved repo
+/// `aaif-goose/goose` (GitHub org rename); the canonical moved-repo URL is used directly.
 /// The Windows `x86_64` asset is `goose-x86_64-pc-windows-msvc.zip` (200, 54,449,330 bytes);
 /// the `-gnu` variant returned 404. The canonical moved-repo URL is used directly to save
 /// a redirect hop; GitHub org redirects keep old URLs working if it moves again.

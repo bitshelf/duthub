@@ -1,7 +1,7 @@
-//! duthub-device：串口运行时（会话管理 + 事件总线 + 日志管道）。
+//! Serial runtime for session management, event delivery, and logging.
 //!
-//! 门面 `DeviceService` 提供同步 API（GPUI/TUI 线程直接调用）；
-//! 内部持有独立 tokio runtime，每个会话一个独占 task（读写同 task）。
+//! `DeviceService` exposes synchronous methods for direct calls from the GUI and TUI.
+//! Each session owns one task for both reads and writes on the Tokio runtime.
 
 #![forbid(unsafe_code)]
 
@@ -154,14 +154,14 @@ impl DeviceService {
         self
     }
 
-    /// 会话日志开关（串口设置页 `serial.sessionLogDisabled` 反值）。
+    /// Whether to persist session logs, the inverse of serial.sessionLogDisabled.
     #[must_use]
     pub fn with_session_logging(self, enabled: bool) -> Self {
         self.session_log_enabled.store(enabled, Ordering::Release);
         self
     }
 
-    /// 终端回滚缓冲行数（串口设置页 `serial.scrollbackRows`；下限 100）。
+    /// Number of terminal scrollback rows, with a minimum of 100.
     /// Retain the requested history and limit the size of each live frame.
     #[must_use]
     pub fn with_scrollback(self, rows: usize) -> Self {
@@ -180,8 +180,8 @@ impl DeviceService {
         self.set_terminal_buffer(history, snapshot);
     }
 
-    /// 更新终端缓冲（串口设置页保存后调用）：history = Term 回滚容量，
-    /// snapshot = 快照最大行数。影响后续新建的会话。
+    /// Update the scrollback capacity and snapshot row limit after settings are saved.
+    /// These settings apply to newly opened sessions.
     pub fn set_terminal_buffer(&self, history: usize, snapshot: usize) {
         self.scrollback_rows.store(
             history.clamp(
@@ -199,8 +199,8 @@ impl DeviceService {
         );
     }
 
-    /// 当前终端缓冲设置 `(history, snapshot)`（已应用 100 下限）——串口设置页
-    /// 回显与测试断言用。
+    /// Current history and snapshot limits, after applying the 100-row minimum.
+    /// Used by the serial settings view and tests.
     pub fn terminal_buffer(&self) -> (usize, usize) {
         (
             self.scrollback_rows.load(Ordering::Acquire),
@@ -208,8 +208,8 @@ impl DeviceService {
         )
     }
 
-    /// 会话日志开关即时生效：活动会话的写线程同步开关；新会话按构造值。
-    /// 总线事件（MCP `serial_read` / UI 注记）不受影响——只关文件落盘。
+    /// Update both active log writers and the default for new sessions.
+    /// MCP serial reads and UI notices continue to receive bus events.
     pub fn set_session_logging(&self, enabled: bool) {
         let writers: Vec<Arc<Mutex<SessionLogWriter>>> = {
             let registry = duthub_core::util::lock_unpoisoned(&self.registry);
@@ -228,9 +228,9 @@ impl DeviceService {
         self.session_log_enabled.store(enabled, Ordering::Release);
     }
 
-    /// 每 DUT 乱码检测开关（连接管理表单；`true` 才入 map，`false` 移除条目）。
-    /// 活动会话的 `SessionCtx` 持有同一 `Arc`，在下一个 RX 块/快照即生效；
-    /// 新会话在 `open_named_session` 时注入同一 map。
+    /// Per-DUT garble detection. The map holds entries only for enabled DUTs.
+    /// Active sessions share the map and apply changes on the next RX block or snapshot.
+    /// `open_named_session` gives new sessions a reference to the same map.
     pub fn set_garbled_detection_for(&self, dut_id: &str, enabled: bool) {
         let mut switches = match self.garble_enabled.lock() {
             Ok(guard) => guard,
@@ -243,7 +243,7 @@ impl DeviceService {
         }
     }
 
-    /// 当前每 DUT 开关状态（缺省关闭）。
+    /// Whether garble detection is enabled for this DUT. The default is off.
     pub fn garbled_detection_enabled(&self, dut_id: &str) -> bool {
         match self.garble_enabled.lock() {
             Ok(switches) => switches.get(dut_id).copied().unwrap_or(false),
@@ -330,9 +330,8 @@ impl DeviceService {
                     })
                     .is_ok()
                 {
-                    rx.recv().map_err(|_| {
-                        DeviceError::Invalid("日志写线程已退出，分段未确认".into())
-                    })?
+                    rx.recv()
+                        .map_err(|_| DeviceError::Invalid("日志写线程已退出，分段未确认".into()))?
                 } else {
                     // Writer thread gone: inline mark + companion rec record.
                     let mut writer = duthub_core::util::lock_unpoisoned(&logs);
@@ -350,21 +349,21 @@ impl DeviceService {
         }
     }
 
-    /// 接线控制租约管理器（builder）。接管写入通道 admit 与 GUI 会话自动租约。
+    /// Set the lease manager for serial write admission and automatic GUI leases.
     #[must_use]
     pub fn with_lease_authority(mut self, lease: Arc<ControlLeaseManager>) -> Self {
         self.lease = Some(lease);
         self
     }
 
-    /// 接线审计接收端（写入通道 deny 审计；租约事件审计由管理器自带）。
+    /// Set the sink for write-denial audit records. The lease manager audits its own events.
     #[must_use]
     pub fn with_audit_sink(mut self, audit: Arc<AuditSink>) -> Self {
         self.audit = Some(audit);
         self
     }
 
-    /// 共享的租约管理器（MCP 控制权四件套 / GUI 控制权面板必须复用此实例）。
+    /// The lease manager shared by MCP control tools and the GUI control panel.
     pub fn lease_manager(&self) -> Option<Arc<ControlLeaseManager>> {
         self.lease.clone()
     }
@@ -394,9 +393,15 @@ impl DeviceService {
         self.bus.read_serial_page(session_id, since_seq, limit)
     }
 
-    /// 会话缓冲中的最新 seq（无会话/缓冲为空时 0）——心跳响应窗口的读取游标。
+    /// Latest buffered sequence number, or zero if the session or its buffer is absent.
     pub fn session_last_seq(&self, dut_id: &str) -> u64 {
         self.bus.last_seq(&format!("sess-{dut_id}"))
+    }
+
+    /// Return the latest rendered VT100 screen as plain text for an active session.
+    pub fn serial_screen_text(&self, dut_id: &str) -> Option<String> {
+        let screen = self.bus.latest_screen(&format!("sess-{dut_id}"))?;
+        Some(crate::term::render_screen_text(&screen))
     }
 
     /// Write a storage-only boundary. An unopened session returns `NotFound`.
@@ -417,8 +422,8 @@ impl DeviceService {
             })
     }
 
-    /// 排空指定 DUT 会话的异步日志队列：阻塞到写线程把已入队消息全部落盘
-    /// （日志读方 / 测试在会话未关闭时需要确定性的落盘点用）。
+    /// Wait for the session log writer to persist all currently queued messages.
+    /// Readers and tests can use this barrier while the session is still open.
     pub fn flush_session_logs(&self, dut_id: &str) {
         let tx = {
             let registry = duthub_core::util::lock_unpoisoned(&self.registry);
@@ -432,7 +437,7 @@ impl DeviceService {
         }
     }
 
-    /// 枚举串口。真实硬件构建只报告系统发现的端口。
+    /// Enumerate serial ports. Hardware builds return only ports discovered by the OS.
     pub fn list_ports(&self) -> Vec<SerialPortInfo> {
         #[cfg(feature = "real-hardware")]
         {
@@ -447,7 +452,7 @@ impl DeviceService {
         }
     }
 
-    /// 打开会话；同端口互斥（Busy）。返回 `session_id`（`sess-<dut>`）。
+    /// Open a session and return its sess-<dut> ID. A port already in use returns Busy.
     pub fn open_session(
         &self,
         dut_id: &str,
@@ -526,7 +531,7 @@ impl DeviceService {
             return Err(error);
         }
         let logs = Arc::new(Mutex::new(writer));
-        // 会话日志开关（串口设置页）：按构造值初始化写线程开关
+        // Initialize the writer from the session logging setting.
         if !self.session_log_enabled.load(Ordering::Acquire) {
             duthub_core::util::lock_unpoisoned(&logs).set_enabled(false);
         }
@@ -567,6 +572,7 @@ impl DeviceService {
                 let observed_session = session_id.clone();
                 registry.insert(handle);
                 if let Some(lease) = &self.lease {
+                    lease.set_gui_session_name(dut_id, format!("GUI/{port}"));
                     let _ = lease.acquire(dut_id, &LeaseHolder::Gui, None);
                 }
                 drop(registry);
@@ -622,19 +628,23 @@ impl DeviceService {
         Ok(())
     }
 
-    /// 向会话写一行（自动补行尾）。返回错误类别直达 UI。
+    /// Queue a line for the session, applying its configured line ending.
     ///
-    /// 多行文本先归一为 CR 分隔（P2-034）：CRLF 折叠为 CR、单个 LF 替换为 CR，
-    /// 裸 LF 直传会让设备 shell 行编辑回显错乱、.log `[TX]` 注记跨行续行无前缀。
-    /// 行尾追加策略（[`LineEnding`]）`只作用于末尾，不受影响。write_bytes` 与
-    /// GUI 键盘/粘贴路径不做此归一（粘贴路径在 UI 层自带归一）。
+    /// Normalize CRLF and standalone LF to CR before sending multiline text (P2-034).
+    /// Bare LF disrupts shell editing echoes and can create unprefixed TX log lines.
+    /// The `LineEnding` policy still applies to the end of the normalized payload.
+    /// Raw keyboard bytes bypass this step. The UI normalizes pasted text separately.
     ///
-    /// `writer` 声明写入者身份，写入通道内租约复核（[D] 入口点，registry 锁内、
-    /// `try_send` 前）：GUI 自动持有租约（人类在场）、Agent 凭 lease 通过、
-    /// System（心跳）放行——例外见 [`duthub_core::lease::WriteIdentity`]。
+    /// Check the writer identity while holding the registry lock, before `try_send`.
+    /// The GUI has a human lease, and an Agent must authenticate its lease.
+    /// See `WriteIdentity` for the system heartbeat exception.
     #[tracing::instrument(name = "serial.write", skip(self, text), fields(dut_id, len = text.len(), ok))]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Keep the existing public write API"
+    )]
     pub fn write_line(&self, dut_id: &str, writer: WriteIdentity, text: &str) -> DeviceResult<()> {
-        // P2-034：CRLF → CR，再清掉残留的单个 LF（顺序保证不产生 \r\r\n 混排）
+        // Collapse CRLF first so the standalone LF pass cannot leave duplicated CRs.
         let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
         self.enqueue_line(dut_id, &writer, |lease| SessionCommand::Write {
             text: normalized,
@@ -645,10 +655,10 @@ impl DeviceService {
     pub(crate) fn write_heartbeat_batch(
         &self,
         dut_id: &str,
-        writer: WriteIdentity,
+        writer: &WriteIdentity,
         batch: Arc<heartbeat::HeartbeatBatch>,
     ) -> DeviceResult<()> {
-        self.enqueue_line(dut_id, &writer, |lease| {
+        self.enqueue_line(dut_id, writer, |lease| {
             SessionCommand::WriteHeartbeatBatch {
                 text: batch.wire_text(),
                 batch,
@@ -667,7 +677,7 @@ impl DeviceService {
         let Some(handle) = registry.get(dut_id) else {
             return Err(DeviceError::NotFound);
         };
-        // [D] 入口复核（授权→租约→generation 的租约+代数部分；授权在 MCP 层）
+        // Check the lease and generation at admission. MCP has already authorized the request.
         let lease = self.admit(dut_id, writer)?;
         handle.cmd_tx.try_send(command(lease)).map_err(|e| match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => DeviceError::Busy,
@@ -687,7 +697,7 @@ impl DeviceService {
             .map_err(|_| DeviceError::Disconnected)
     }
 
-    /// 会话级行尾策略（H1.2）：无 / \n / \r\n，随后的写入按该策略生效。
+    /// Set the line ending for subsequent writes (none, LF, or CRLF).
     pub fn set_line_ending(&self, dut_id: &str, ending: LineEnding) -> DeviceResult<()> {
         let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
@@ -699,9 +709,9 @@ impl DeviceService {
             .map_err(|_| DeviceError::Disconnected)
     }
 
-    /// 原始字节直写（PuTTY 键盘路径）：不做行尾追加、不发 [TX] 回显。
-    /// UI 键盘输入（字符 / Enter \r / Backspace 0x7f）走这条路径。
-    /// 租约复核与 [`Self::write_line`] 同规则（[D] 入口 + [E] actor 双点）。
+    /// Queue raw keyboard bytes without appending a line ending or emitting a TX echo.
+    /// The UI uses this path for characters, CR for Enter, and DEL for Backspace.
+    /// Admission and the serial actor enforce the same lease rules as `Self::write_line`.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "public API used by desktop callers"
@@ -729,17 +739,17 @@ impl DeviceService {
             })
     }
 
-    /// [D] `入口租约复核（写入唯一通道，try_send` 前、registry 锁内）。
-    /// 未接线租约时返回 Ok(None)（既有路径零改动）。
-    /// 拒绝 → 审计 write.deny + `DeviceError::Lease`（GUI 优先无条件生效）。
+    /// Check the lease before enqueuing a write and while holding the registry lock.
+    /// Return Ok(None) when no lease manager was configured.
+    /// Audit denials as `write.deny` and return `DeviceError::Lease`. GUI priority still applies.
     fn admit(&self, dut_id: &str, writer: &WriteIdentity) -> Result<Option<WriteCtx>, DeviceError> {
         let Some(lease) = &self.lease else {
             return Ok(None);
         };
         match lease.admit_queued_write(dut_id, writer) {
             Ok(ctx) => {
-                // GUI 逐键写入不进审计（刷屏）；Agent / 审批（P1-014 器件层前置，
-                // 同型）写入审计 write.admit
+                // Skip per-keystroke GUI audit entries to avoid flooding the audit log.
+                // Record admitted Agent or preapproved writes as write.admit.
                 if matches!(
                     writer,
                     WriteIdentity::Agent { .. } | WriteIdentity::Approval
@@ -785,8 +795,8 @@ impl DeviceService {
         }
     }
 
-    /// 终端网格重设尺寸（窗口 resize → real 会话 term.resize(cols, rows)）。
-    /// 会话不存在时静默忽略（会话打开后的下一帧会重发）。
+    /// Resize the terminal grid for a real session after the window is resized.
+    /// Ignore a missing session. The UI resends the dimensions after the session opens.
     pub fn resize_terminal(&self, dut_id: &str, cols: usize, rows: usize) -> DeviceResult<()> {
         let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let Some(handle) = registry.get(dut_id) else {
@@ -798,7 +808,7 @@ impl DeviceService {
             .map_err(|_| DeviceError::Disconnected)
     }
 
-    /// 恢复当前会话的本地终端仿真状态。
+    /// Reset the current session's local terminal emulation.
     pub fn reset_terminal(&self, dut_id: &str) -> DeviceResult<()> {
         let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let handle = registry.get(dut_id).ok_or(DeviceError::NotFound)?;
@@ -829,8 +839,8 @@ impl DeviceService {
         Ok(receiver)
     }
 
-    /// 手动重连（H1.4）：唤醒退避等待立即重试。连接正常时为无害唤醒
-    /// （`notify_one` 存许可，下一次断线退避立即返回一次）。
+    /// Wake a reconnect backoff so it retries immediately.
+    /// On a healthy connection, `notify_one` leaves one permit for the next backoff.
     pub fn manual_reconnect(&self, dut_id: &str) -> DeviceResult<()> {
         let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         let handle = registry.get(dut_id).ok_or(DeviceError::NotFound)?;
@@ -838,7 +848,7 @@ impl DeviceService {
         Ok(())
     }
 
-    /// 全部活跃会话摘要（UI tab 渲染用）。
+    /// Summaries of all active sessions for rendering the UI tabs.
     pub fn sessions(&self) -> Vec<SessionSummary> {
         let registry = duthub_core::util::lock_unpoisoned(&self.registry);
         registry
@@ -856,7 +866,10 @@ impl DeviceService {
     }
 
     pub fn session_source(&self, dut_id: &str) -> Option<&'static str> {
-        match duthub_core::util::lock_unpoisoned(&self.registry).get(dut_id).map(|h| h.kind) {
+        match duthub_core::util::lock_unpoisoned(&self.registry)
+            .get(dut_id)
+            .map(|h| h.kind)
+        {
             Some(SessionKind::Demo) => Some("demo"),
             Some(SessionKind::Real) => Some("device"),
             None => None,
@@ -907,7 +920,11 @@ impl DeviceService {
             return Vec::new();
         };
         let mut found = Vec::new();
-        for dir in [folder.join("logs"), folder] {
+        for dir in [
+            folder.join(duthub_core::dut_artifacts::SERIAL_LOGS_DIR),
+            folder.join(duthub_core::dut_artifacts::LEGACY_LOGS_DIR),
+            folder,
+        ] {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
@@ -917,7 +934,9 @@ impl DeviceService {
                 let owned = std::path::Path::new(&file_name)
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("rec"))
-                    && (dir.ends_with("logs") || file_name.starts_with(&prefix));
+                    && (dir.ends_with(duthub_core::dut_artifacts::SERIAL_LOGS_DIR)
+                        || dir.ends_with(duthub_core::dut_artifacts::LEGACY_LOGS_DIR)
+                        || file_name.starts_with(&prefix));
                 if owned {
                     found.push(entry.path());
                 }
@@ -1015,7 +1034,7 @@ mod tests {
             .open_session("dut-b", "COM3", 115_200, SessionKind::Demo)
             .unwrap_err();
         assert!(matches!(err, DeviceError::Busy));
-        // 不同端口可开
+        // A different port can open independently.
         service
             .open_session("dut-b", "COM5", 115_200, SessionKind::Demo)
             .unwrap();
@@ -1053,7 +1072,7 @@ mod tests {
                 result => panic!("expected eventual port release: {result:?}"),
             }
         }
-        // task 结束后发 Disconnected
+        // The task publishes Disconnected when it exits.
         let mut disconnected = false;
         for _ in 0..100 {
             disconnected = !service
@@ -1067,7 +1086,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(disconnected, "关闭后必须产生 Disconnected 事件");
+        assert!(disconnected, "closing must emit a Disconnected event");
     }
 
     #[test]
@@ -1077,7 +1096,7 @@ mod tests {
         service
             .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
-        std::thread::sleep(Duration::from_millis(120)); // 启动日志
+        std::thread::sleep(Duration::from_millis(120)); // Boot logs.
         let _ = absorb_texts(&mut rx);
         service
             .write_line("dut-a", WriteIdentity::gui(), "uname -a")
@@ -1093,7 +1112,7 @@ mod tests {
                 break;
             }
         }
-        assert!(found, "写入应得到模拟 uname 响应");
+        assert!(found, "write should receive simulated uname response");
         service.close_session("dut-a").ok();
     }
 
@@ -1111,14 +1130,14 @@ mod tests {
         service.close_session("dut-a").ok();
         let text_file = service.logs_dir().join("sess-dut-a.log");
         let raw_file = service.logs_dir().join("sess-dut-a.bin");
-        let text = std::fs::read_to_string(&text_file).expect("文本日志存在");
+        let text = std::fs::read_to_string(&text_file).expect("text log should exist");
         assert!(text.contains("Started Serial Getty"));
         assert!(text.contains("uptime"));
-        let raw = std::fs::read(&raw_file).expect("原始日志存在");
+        let raw = std::fs::read(&raw_file).expect("raw log should exist");
         assert!(std::str::from_utf8(&raw).unwrap().contains("Serial Getty"));
     }
 
-    /// H1.1/H1.2：写入产生 TX 回显；行尾策略经会话级设置后在下一条写入生效。
+    /// Writes emit TX echoes and a new line ending policy applies to the next write.
     #[test]
     fn set_line_ending_and_tx_echo_flow_through_service() {
         let service = test_service("tx-echo");
@@ -1153,25 +1172,31 @@ mod tests {
         }
         assert!(
             texts.iter().any(|t| t == "[TX] probe-1"),
-            "写入必须有 TX 回显行"
+            "write must produce a TX echo line"
         );
         assert!(
             texts.iter().any(|t| t == "[TX] probe-2"),
-            "SetEnding 后写入仍须有 TX 回显"
+            "write after SetEnding must still produce a TX echo"
         );
-        // .bin 原始日志：第二条带 CRLF 行尾（发送路径生效的直接证据）
+        // The raw log confirms the second write used CRLF.
         service.flush_session_logs("dut-a");
         let raw = std::fs::read(service.logs_dir().join("sess-dut-a.bin")).unwrap();
         let raw = String::from_utf8_lossy(&raw).to_string();
-        assert!(raw.contains("probe-2\r\n"), "CRLF 策略应写进原始日志");
-        // 未设置策略的第一条保持默认 Lf
+        assert!(
+            raw.contains("probe-2\r\n"),
+            "CRLF policy must be written to raw log"
+        );
+        // The first write used the default LF.
         assert!(raw.contains("probe-1\n"));
-        assert!(!raw.contains("probe-1\r\n"), "默认策略不得写出 CRLF");
+        assert!(
+            !raw.contains("probe-1\r\n"),
+            "default policy must not write CRLF"
+        );
         service.close_session("dut-a").ok();
     }
 
-    /// P2-034：多行 `write_line` 归一为 CR 分隔——线上 payload 的行分隔符为 CR
-    /// （末尾行尾仍按行尾策略追加），.log 的 [TX] 注记单行化、无裸续行。
+    /// Multiline `write_line` sends CR between lines and appends the configured ending.
+    /// The TX log entry stays on a single line.
     #[test]
     fn write_line_normalizes_newlines_to_cr() {
         let service = test_service("multiline");
@@ -1195,27 +1220,33 @@ mod tests {
                 break;
             }
         }
-        assert!(done, "写入必须到达 demo shell");
+        assert!(done, "write must reach the demo shell");
         service.close_session("dut-a").ok();
-        // .bin 线上 payload：行分隔符为 CR，末尾按默认 Lf 策略补 \n
+        // The raw log contains CR separators and the default LF ending.
         let raw = std::fs::read(service.logs_dir().join("sess-dut-a.bin")).unwrap();
         let raw = String::from_utf8_lossy(&raw).to_string();
         assert!(raw.contains("echo C1\recho C2\n"), "payload: {raw:?}");
-        assert!(!raw.contains("echo C1\necho C2"), "不得裸 LF 直传：{raw:?}");
-        assert!(!raw.contains("echo C1\r\n"), "CRLF 不得原样透传：{raw:?}");
-        // .log：[TX] 注记单行（换行转义为字面 \r），无无前缀续行
+        assert!(
+            !raw.contains("echo C1\necho C2"),
+            "bare LF must not pass through: {raw:?}"
+        );
+        assert!(
+            !raw.contains("echo C1\r\n"),
+            "CRLF must not pass through verbatim: {raw:?}"
+        );
+        // The TX note escapes CR as text and has no unprefixed continuation lines.
         let text = std::fs::read_to_string(service.logs_dir().join("sess-dut-a.log")).unwrap();
         assert!(
             text.lines().any(|line| line == "[TX] echo C1\\recho C2"),
-            ".log 必须有单行 [TX] 注记：{text:?}"
+            ".log must contain single-line [TX] annotation: {text:?}"
         );
         assert!(
             !text.lines().any(|line| line == "echo C2"),
-            ".log 不得出现无前缀续行：{text:?}"
+            ".log must not contain unprefixed continuation lines: {text:?}"
         );
     }
 
-    /// H1.4：手动重连——存在会话时无害唤醒（demo 驱动无等待者），不存在时 `NotFound`。
+    /// Manual reconnect is harmless in an open demo session and returns `NotFound` if absent.
     #[test]
     fn manual_reconnect_is_wakeup_not_error() {
         let service = test_service("reconnect");
@@ -1224,7 +1255,7 @@ mod tests {
             .unwrap();
         service.manual_reconnect("dut-a").unwrap();
         std::thread::sleep(Duration::from_millis(60));
-        // 会话仍在（demo 驱动不因唤醒退出），且能继续写入
+        // The demo session stays active after the wake-up and accepts writes.
         service
             .write_line("dut-a", WriteIdentity::gui(), "still-alive")
             .unwrap();
@@ -1270,7 +1301,7 @@ mod tests {
         service.close_session("dut-a").unwrap();
     }
 
-    /// 指定会话日志构造值的测试服务（其余与 [`test_service`] 相同）。
+    /// Construct the same test service with an explicit session logging setting.
     fn test_service_with(tag: &str, session_logging: bool) -> DeviceService {
         let dir = std::env::current_dir()
             .unwrap()
@@ -1280,8 +1311,8 @@ mod tests {
         DeviceService::custom(64, dir, 0).with_session_logging(session_logging)
     }
 
-    /// 写入一行并轮询等待 demo `响应（RX，emit_raw）落盘——flush` 屏障保证
-    /// 确定性的落盘点：响应入盘意味着此前入队的日志消息全部写完。
+    /// Write a line and wait for the demo response to reach the log.
+    /// The flush barrier guarantees that earlier queued records have reached disk.
     fn write_until_on_disk(service: &DeviceService, dut: &str, line: &str, expect: &str) {
         service.write_line(dut, WriteIdentity::gui(), line).unwrap();
         for _ in 0..100 {
@@ -1295,33 +1326,38 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("写入内容未在 2s 内落盘: {expect}");
+        panic!("The write did not reach disk within two seconds: {expect}");
     }
 
-    /// LOG-5 `MarkSync` 同步路径（排空语义）：RX 先入队 → `log_control_boundary`
-    /// (split=true) 同步返回 → mark 行必须落在已入队 RX 之后，并切段开启新段。
-    /// 同步返回由「unwrap 后立刻读盘、无 sleep」锁定。
+    /// Enqueue RX before submitting a synchronous segment marker.
+    /// The marker must follow the queued RX and open the next segment.
+    /// Read the files immediately after the call returns to verify the synchronous boundary.
     #[test]
     fn log_control_boundary_drains_pending_rx_before_mark() {
         let service = test_service("boundary-drain");
         service
             .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
-        // RX 先入队：demo shell 响应（emit_raw → 总线 + 写线程队列）
+        // The demo response is published to the bus and queued for logging first.
         write_until_on_disk(&service, "dut-a", "probe-before-mark", "Executed (demo)");
-        // 分段边界：MarkSync ack 同步返回，此前入队内容必须已全部落盘
+        // The synchronous marker acknowledges after all earlier records are persisted.
         service
             .log_control_boundary("dut-a", "POWER ON BOUNDARY", true)
             .unwrap();
         let text = std::fs::read_to_string(service.logs_dir().join("sess-dut-a.log")).unwrap();
-        let rx_pos = text.find("Executed (demo)").expect("RX 响应必须在盘上");
+        let rx_pos = text
+            .find("Executed (demo)")
+            .expect("RX response must be on disk");
         let mark_pos = text
             .find("[mark] POWER ON BOUNDARY")
-            .expect("mark 行必须落当前段");
-        assert!(mark_pos > rx_pos, "分段必须落在已入队 RX 之后：{text:?}");
+            .expect("mark line must land in the current segment");
+        assert!(
+            mark_pos > rx_pos,
+            "mark must follow previously queued RX: {text:?}"
+        );
         assert!(
             service.logs_dir().join("sess-dut-a.log.1").exists(),
-            "split=true 必须切段（新段 .log.1）"
+            "split=true must rotate to a new segment (.log.1)"
         );
         service.close_session("dut-a").ok();
     }
@@ -1335,7 +1371,10 @@ mod tests {
         let mut attempts = 0usize;
         let err = loop {
             attempts += 1;
-            assert!(attempts <= 64, "分段必须在上限处失败而不是无限成功");
+            assert!(
+                attempts <= 64,
+                "rotation must fail at cap instead of succeeding indefinitely"
+            );
             match service.log_control_boundary("dut-a", &format!("seg-{attempts}"), true) {
                 Ok(()) => {}
                 Err(err) => break err,
@@ -1343,9 +1382,12 @@ mod tests {
         };
         assert_eq!(
             attempts, 21,
-            "每 mark 必须真实切段：第 21 次（MAX_ROTATIONS=20）才失败"
+            "each mark must rotate: failure should occur on attempt 21 (MAX_ROTATIONS=20)"
         );
-        assert!(err.to_string().contains("分段"), "应报分段上限错误：{err}");
+        assert!(
+            err.to_string().contains("分段"),
+            "expected rotation cap error: {err}"
+        );
         assert!(
             service
                 .read_log("sess-dut-a", 0, usize::MAX)
@@ -1361,9 +1403,9 @@ mod tests {
         service.close_session("dut-a").ok();
     }
 
-    /// LOG-4 `DeviceService` 扇出接线（漏改时门禁不会变红的那半段）：开关同步
-    /// 生效到全部活动会话写线程——关闭期间两会话 .log/.bin 逐字节不变而总线
-    /// `SerialChunk` 照常；重开后同文件续写。
+    /// The logging switch reaches all active session writers.
+    /// While disabled, both files stay byte-for-byte unchanged and bus events continue.
+    /// Re-enabling logging appends to the same files.
     #[test]
     fn session_logging_toggle_fans_out_to_active_sessions() {
         let service = test_service("log-fanout");
@@ -1380,7 +1422,7 @@ mod tests {
         let second_log_before = std::fs::read(service.logs_dir().join("sess-dut-b.log")).unwrap();
         let second_bin_before = std::fs::read(service.logs_dir().join("sess-dut-b.bin")).unwrap();
 
-        // 关闭：扇出到两个活动会话——文件逐字节不变，总线事件照常
+        // Disable both active writers without suppressing bus events.
         service.set_session_logging(false);
         service
             .write_line("dut-a", WriteIdentity::gui(), "probe-off-a")
@@ -1402,45 +1444,48 @@ mod tests {
                 break;
             }
         }
-        assert!(bus_seen, "关闭落盘后总线事件必须照常（只关文件写入）");
+        assert!(
+            bus_seen,
+            "bus events must continue when file logging is disabled"
+        );
         service.flush_session_logs("dut-a");
         service.flush_session_logs("dut-b");
         assert_eq!(
             std::fs::read(service.logs_dir().join("sess-dut-a.log")).unwrap(),
             first_log_before,
-            "关闭后 dut-a .log 不得新增内容"
+            "dut-a .log must stay unchanged while logging is disabled"
         );
         assert_eq!(
             std::fs::read(service.logs_dir().join("sess-dut-a.bin")).unwrap(),
             first_bin_before,
-            "关闭后 dut-a .bin 不得新增内容"
+            "dut-a .bin must stay unchanged while logging is disabled"
         );
         assert_eq!(
             std::fs::read(service.logs_dir().join("sess-dut-b.log")).unwrap(),
             second_log_before,
-            "关闭后 dut-b .log 不得新增内容"
+            "dut-b .log must stay unchanged while logging is disabled"
         );
         assert_eq!(
             std::fs::read(service.logs_dir().join("sess-dut-b.bin")).unwrap(),
             second_bin_before,
-            "关闭后 dut-b .bin 不得新增内容"
+            "dut-b .bin must stay unchanged while logging is disabled"
         );
 
-        // 重开：活动会话同文件续写（不换段、不重建文件）
+        // Resume writing to the existing files without rotating or recreating them.
         service.set_session_logging(true);
         write_until_on_disk(&service, "dut-a", "probe-resume-a", "Executed (demo)");
         let text = std::fs::read_to_string(service.logs_dir().join("sess-dut-a.log")).unwrap();
         assert!(
             text.contains("[TX] probe-on-a") && text.contains("[TX] probe-resume-a"),
-            "重开后必须同文件续写：{text:?}"
+            "re-enabling must append to the same file: {text:?}"
         );
         service.close_session("dut-a").ok();
         service.close_session("dut-b").ok();
     }
 
-    /// LOG-4 新会话按构造值初始化：`with_session_logging(false)` 构造 → 会话
-    /// 打开即关闭写线程（文件存在但零写入）；`set_session_logging(true)` 扇出
-    /// 重开活动会话，之后新建的会话按 true 初始化并正常落盘。
+    /// A service created with logging disabled opens sessions with inactive writers.
+    /// Enabling logging updates the active writer and the default for subsequent sessions.
+    /// Both existing and newly opened sessions then persist records.
     #[test]
     fn new_sessions_initialize_from_session_logging_flag() {
         let service = test_service_with("log-init", false);
@@ -1463,13 +1508,22 @@ mod tests {
                 break;
             }
         }
-        assert!(seen, "关闭落盘不影响总线回显");
+        assert!(
+            seen,
+            "disabling file logging must not affect bus echo delivery"
+        );
         service.flush_session_logs("dut-a");
         let log = std::fs::read(service.logs_dir().join("sess-dut-a.log")).unwrap();
         let bin = std::fs::read(service.logs_dir().join("sess-dut-a.bin")).unwrap();
-        assert!(log.is_empty(), "关闭构造值的会话 .log 必须零写入：{log:?}");
-        assert!(bin.is_empty(), "关闭构造值的会话 .bin 必须零写入：{bin:?}");
-        // 全局重开：活动会话（dut-a）与后续新建会话（dut-b）都按 true 生效
+        assert!(
+            log.is_empty(),
+            "session opened with logging disabled must write nothing to .log: {log:?}"
+        );
+        assert!(
+            bin.is_empty(),
+            "session opened with logging disabled must write nothing to .bin: {bin:?}"
+        );
+        // Re-enabling logging applies to the existing DUT and to newly opened sessions.
         service.set_session_logging(true);
         service
             .open_session("dut-b", "COM5", 115_200, SessionKind::Demo)
@@ -1478,7 +1532,7 @@ mod tests {
         let text = std::fs::read_to_string(service.logs_dir().join("sess-dut-b.log")).unwrap();
         assert!(
             text.contains("[TX] probe-after-enable"),
-            "新会话必须按重开的构造值落盘：{text:?}"
+            "new session must persist according to re-enabled flag: {text:?}"
         );
         service.close_session("dut-a").ok();
         service.close_session("dut-b").ok();
@@ -1494,16 +1548,20 @@ mod tests {
                 crate::term::SCROLLBACK_HISTORY,
                 crate::term::SNAPSHOT_MAX_ROWS
             ),
-            "默认保留 1,000,000 行历史，实时快照保持 400 行"
+            "default preserves 1,000,000 history rows and 400 live snapshot rows"
         );
         service.set_terminal_buffer(50, 50);
         assert_eq!(
             service.terminal_buffer(),
             (100, 100),
-            "低于下限必须 clamp 到 100"
+            "values below minimum must clamp to 100"
         );
         service.set_terminal_buffer(500, 300);
-        assert_eq!(service.terminal_buffer(), (500, 300), "显式设置原样生效");
+        assert_eq!(
+            service.terminal_buffer(),
+            (500, 300),
+            "explicit valid values must apply verbatim"
+        );
         service.configure_scrollback(Some(2_000_000));
         assert_eq!(
             service.terminal_buffer(),
@@ -1511,8 +1569,8 @@ mod tests {
         );
     }
 
-    /// 每 DUT 乱码检测开关：默认全关；按 DUT 独立开启/关闭；关闭即移除条目
-    /// （map 只存开启项，新会话注入同一 map）。
+    /// Garble detection defaults to off and can be toggled per DUT.
+    /// The shared map stores enabled entries and is reused by new sessions.
     #[test]
     fn garbled_detection_switch_is_per_dut() {
         let service = test_service("garble-switch");
@@ -1521,7 +1579,10 @@ mod tests {
 
         service.set_garbled_detection_for("dut-a", true);
         assert!(service.garbled_detection_enabled("dut-a"));
-        assert!(!service.garbled_detection_enabled("dut-b"), "不得跨 DUT");
+        assert!(
+            !service.garbled_detection_enabled("dut-b"),
+            "must not leak across DUTs"
+        );
 
         service.set_garbled_detection_for("dut-a", false);
         assert!(!service.garbled_detection_enabled("dut-a"));

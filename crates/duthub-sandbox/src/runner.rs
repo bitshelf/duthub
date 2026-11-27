@@ -670,7 +670,8 @@ fn is_windows_system_dir(path: &Path) -> bool {
     #[cfg(windows)]
     {
         let win_dir = std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("windir")).map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+            .or_else(|| std::env::var_os("windir"))
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         path_within(path, &win_dir)
     }
     #[cfg(not(windows))]

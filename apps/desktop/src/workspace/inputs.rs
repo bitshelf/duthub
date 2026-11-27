@@ -1,22 +1,30 @@
-use super::{Workbench, In, FluentBuilder, AppContext, goose_path_field_value, boot_reference_path, InteractiveElement, Window, Context, InputState, InputEvent, Dd, BoundEditor, Palette, Input, Styled, StatefulInteractiveElement, px, theme, Div, i18n, IntoElement, Arc, ParentElement, div, SharedString, Textarea, TextareaState, icon, OnChangeFn, UsbDiscovery, FlashPresetTest, store, usb_debug_enabled, ViewMode, ConfigPage, Pixels, workspace_pane_widths, DragMoveEvent, PaneDivider, CENTER_PANE_MIN_WIDTH, demo_dut_template, HashMap, DutsState, JobKind, cx_spawn_job, AdbDevice, JobResult, RelayPress, AlertSource, Duration};
+use super::{
+    AdbDevice, AlertSource, AppContext, Arc, BoundEditor, CENTER_PANE_MIN_WIDTH, ConfigPage,
+    Context, Dd, Div, DragMoveEvent, Duration, DutsState, FlashPresetTest, FluentBuilder, HashMap,
+    In, Input, InputEvent, InputState, InteractiveElement, IntoElement, JobKind, JobResult,
+    OnChangeFn, Palette, PaneDivider, ParentElement, Pixels, RelayPress, SharedString,
+    StatefulInteractiveElement, Styled, Textarea, TextareaState, UsbDiscovery, ViewMode, Window,
+    Workbench, boot_reference_path, cx_spawn_job, demo_dut_template, div, goose_path_field_value,
+    i18n, icon, px, store, theme, usb_debug_enabled, workspace_pane_widths,
+};
 
 impl Workbench {
     // ------------------------------------------------------------------
-    // 输入体系
+    // Inputs
     // ------------------------------------------------------------------
 
     pub fn input_value(&self, id: In) -> String {
         let dut = self.duts.selected();
         match id {
-            In::RelayBoardName | In::RelayBoardNode => self
-                .relay_board_edit()
-                .map_or_default(|board| {
+            In::RelayBoardName | In::RelayBoardNode => {
+                self.relay_board_edit().map_or_default(|board| {
                     if id == In::RelayBoardName {
                         board.name
                     } else {
                         board.node
                     }
-                }),
+                })
+            }
             In::Find => self.find_query.clone(),
             In::CfgSearch => self.cfg_search.clone(),
             In::Target | In::AgentModel => String::new(),
@@ -28,18 +36,25 @@ impl Workbench {
             | In::AgentRegProgram
             | In::AgentRegArgs
             | In::AgentRegEnvKeys
-            | In::AgentRegEnvValue => self.drafts.get(&id).cloned().unwrap_or_default(),
+            | In::AgentRegEnvValue
+            | In::AgentAccessExtraPort => self.drafts.get(&id).cloned().unwrap_or_default(),
             In::Prompt => self.input.clone(),
             In::Port => dut.map_or_default(|d| d.serial.port.clone()),
             In::DutName => dut.map_or_default(|d| d.name.clone()),
             In::BootReference => dut
                 .and_then(|dut| {
-                    dut.serial.reference_log.clone().or_else(|| {
+                    if self.boot_reference_edits.contains(&dut.id) {
+                        dut.serial
+                            .reference_log
+                            .as_deref()
+                            .map(std::path::PathBuf::from)
+                    } else {
                         boot_reference_path(&self.artifact_root, dut)
-                            .map(|path| path.to_string_lossy().into_owned())
-                    })
+                    }
                 })
-                .unwrap_or_default(),
+                .map_or_default(|path| {
+                    crate::boot_learning::reference_path_text(&self.artifact_root, &path)
+                }),
             In::BootSimilarity => dut.map_or_else(String::new, |dut| {
                 self.boot_similarity_drafts
                     .get(&dut.id)
@@ -52,65 +67,61 @@ impl Workbench {
                     })
             }),
             In::Baud => dut.map_or_default(|d| d.serial.baud.to_string()),
-            In::SessionBaud => self
-                .sessions
-                .get(self.active_session)
-                .map_or_default(|s| {
-                    s.baud_draft.clone().unwrap_or_else(|| {
-                        if s.baud == 0 {
-                            String::new()
-                        } else {
-                            s.baud.to_string()
-                        }
-                    })
-                }),
-            In::AdbSerial => dut.map_or_default(|d| d.adb.serial.clone()),
-            In::RelayNode => dut
-                .map_or_default(|d| match &d.relay {
-                    duthub_core::model::RelayConfig::UsbSerial { node, .. } => node.clone(),
-                    _ => String::new(),
-                }),
-            In::PduAddress => dut
-                .map_or_default(|d| match &d.relay {
-                    duthub_core::model::RelayConfig::SnmpPdu { snmp, .. } => snmp.address.clone(),
-                    _ => String::new(),
-                }),
-            In::PduCredential => dut
-                .map_or_default(|d| match &d.relay {
-                    duthub_core::model::RelayConfig::SnmpPdu { snmp, .. } => {
-                        snmp.credential_ref.clone()
+            In::SessionBaud => self.sessions.get(self.active_session).map_or_default(|s| {
+                s.baud_draft.clone().unwrap_or_else(|| {
+                    if s.baud == 0 {
+                        String::new()
+                    } else {
+                        s.baud.to_string()
                     }
-                    _ => String::new(),
-                }),
-            In::McpUrl => dut
-                .map_or_default(|d| match &d.mcp {
-                    duthub_core::model::McpConfig::StreamableHttp { url } => url.clone(),
-                    _ => String::new(),
-                }),
-            In::McpCommand => dut
-                .map_or_default(|d| match &d.mcp {
-                    duthub_core::model::McpConfig::Stdio { command, .. } => command.clone(),
-                    _ => String::new(),
-                }),
-            In::McpArgs => dut
-                .map_or_default(|d| match &d.mcp {
-                    duthub_core::model::McpConfig::Stdio { args, .. } => args.join("\n"),
-                    _ => String::new(),
-                }),
-            In::McpCwd => dut
-                .map_or_default(|d| match &d.mcp {
-                    duthub_core::model::McpConfig::Stdio { cwd, .. } => cwd.clone(),
-                    _ => String::new(),
-                }),
-            In::McpEnv => dut
-                .map_or_default(|d| match &d.mcp {
-                    duthub_core::model::McpConfig::Stdio { env, .. } => env
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    _ => String::new(),
-                }),
+                })
+            }),
+            In::AdbSerial => dut.map_or_default(|d| d.adb.serial.clone()),
+            In::RelayNode => dut.map_or_default(|d| match &d.relay {
+                duthub_core::model::RelayConfig::UsbSerial { node, .. } => node.clone(),
+                _ => String::new(),
+            }),
+            In::PduAddress => dut.map_or_default(|d| match &d.relay {
+                duthub_core::model::RelayConfig::SnmpPdu { snmp, .. } => snmp.address.clone(),
+                _ => String::new(),
+            }),
+            In::PduCredential => dut.map_or_default(|d| match &d.relay {
+                duthub_core::model::RelayConfig::SnmpPdu { snmp, .. } => {
+                    snmp.credential_ref.clone()
+                }
+                _ => String::new(),
+            }),
+            In::McpUrl => dut.map_or_default(|d| match &d.mcp {
+                duthub_core::model::McpConfig::StreamableHttp { url } => url.clone(),
+                duthub_core::model::McpConfig::Stdio { .. } => String::new(),
+            }),
+            In::McpCommand => dut.map_or_default(|d| match &d.mcp {
+                duthub_core::model::McpConfig::Stdio { command, .. } => command.clone(),
+                duthub_core::model::McpConfig::StreamableHttp { .. } => String::new(),
+            }),
+            In::McpArgs => dut.map_or_default(|d| match &d.mcp {
+                duthub_core::model::McpConfig::Stdio { args, .. } => args.join("\n"),
+                duthub_core::model::McpConfig::StreamableHttp { .. } => String::new(),
+            }),
+            In::McpCwd => dut.map_or_default(|d| match &d.mcp {
+                duthub_core::model::McpConfig::Stdio { cwd, .. } => cwd.clone(),
+                duthub_core::model::McpConfig::StreamableHttp { .. } => String::new(),
+            }),
+            In::McpEnv => dut.map_or_default(|d| match &d.mcp {
+                duthub_core::model::McpConfig::Stdio { env, .. } => {
+                    let mut fields = String::new();
+                    for (key, value) in env {
+                        if !fields.is_empty() {
+                            fields.push('\n');
+                        }
+                        fields.push_str(key);
+                        fields.push('=');
+                        fields.push_str(value);
+                    }
+                    fields
+                }
+                duthub_core::model::McpConfig::StreamableHttp { .. } => String::new(),
+            }),
             In::SerialRuleRegex | In::SerialRuleDescription => self
                 .settings
                 .serial
@@ -154,10 +165,10 @@ impl Workbench {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| self.settings.dut_storage_gib().to_string()),
-            In::HeartbeatInterval => dut
-                .map_or_default(|d| self.heartbeat_config(&d.id).interval_secs.to_string()),
-            In::HeartbeatCommand => dut
-                .map_or_default(|d| self.heartbeat_config(&d.id).command),
+            In::HeartbeatInterval => {
+                dut.map_or_default(|d| self.heartbeat_config(&d.id).interval_secs.to_string())
+            }
+            In::HeartbeatCommand => dut.map_or_default(|d| self.heartbeat_config(&d.id).command),
             In::HeartbeatExpectedResponse => dut
                 .and_then(|d| self.heartbeat_config(&d.id).expected_response)
                 .unwrap_or_default(),
@@ -171,7 +182,6 @@ impl Workbench {
                 .get(&In::AgentAccessTtl)
                 .cloned()
                 .unwrap_or_else(|| self.settings.agent_access.lease_ttl_secs.to_string()),
-            In::AgentAccessExtraPort => self.drafts.get(&id).cloned().unwrap_or_default(),
             In::AgentAccessCredName => self
                 .drafts
                 .get(&In::AgentAccessCredName)
@@ -235,21 +245,15 @@ impl Workbench {
             | In::NewPresetExe
             | In::PeerName
             | In::PeerUrl
-            | In::RenameName => self
-                .modal
-                .as_ref()
-                .map_or_default(|m| match id {
-                    In::CmdName | In::NewPresetName | In::PeerName | In::RenameName => {
-                        m.draft.clone()
-                    }
-                    _ => m.draft2.clone(),
-                }),
+            | In::RenameName => self.modal.as_ref().map_or_default(|m| match id {
+                In::CmdName | In::NewPresetName | In::PeerName | In::RenameName => m.draft.clone(),
+                _ => m.draft2.clone(),
+            }),
             // Third modal field (icon / test args) keeps its own draft so an
             // empty value stays visible instead of snapping back (pit #41).
-            In::CmdIcon | In::NewPresetTestArgs => self
-                .modal
-                .as_ref()
-                .map_or_default(|m| m.draft3.clone()),
+            In::CmdIcon | In::NewPresetTestArgs => {
+                self.modal.as_ref().map_or_default(|m| m.draft3.clone())
+            }
         }
     }
 
@@ -261,16 +265,9 @@ impl Workbench {
             In::CfgSearch => self.cfg_search = value,
             In::Target | In::AgentModel => {}
             In::GoosePath => {
-                // 文本草稿保留原文（含空串）：空串是「用户已清空」的显式状态，
-                // 不能被 goose_external 的回显覆盖（详见 goose_path_field_value）。
+                // Keep the draft verbatim, including an empty string, which means the user cleared it.
+                // Do not replace a cleared draft with the resolved external goose path.
                 self.drafts.insert(In::GoosePath, value);
-            }
-            In::AgentRegName
-            | In::AgentRegProgram
-            | In::AgentRegArgs
-            | In::AgentRegEnvKeys
-            | In::AgentRegEnvValue => {
-                self.drafts.insert(id, value);
             }
             In::DutName => {
                 if let Some(dut) = dut {
@@ -281,6 +278,7 @@ impl Workbench {
             In::BootReference => {
                 if let Some(dut) = dut {
                     dut.serial.reference_log = Some(value);
+                    self.boot_reference_edits.insert(dut.id.clone());
                     self.duts.mark_connection_dirty();
                 }
             }
@@ -448,9 +446,6 @@ impl Workbench {
                     }
                 }
             }
-            In::SerialScrollback => {
-                self.drafts.insert(id, value);
-            }
             In::CaptureIdle => {
                 // Draft only: "save idle" parses and validates before the model
                 // is touched, and an empty draft means "use the default".
@@ -458,12 +453,6 @@ impl Workbench {
             }
             In::AdbExe => settings.tools.adb_executable = value,
             In::HdcExe => settings.tools.hdc_executable = value,
-            In::WorkDir => {
-                self.drafts.insert(id, value);
-            }
-            In::DutStorageGib => {
-                self.drafts.insert(id, value);
-            }
             In::Media(field) => {
                 if let Some(dest) = field.edit(&mut settings.tools.capture, dut) {
                     *dest = value;
@@ -479,7 +468,7 @@ impl Workbench {
                 a2a.agent_name = value;
             }
             In::A2aPort => {
-                // 与 In::Baud 同模式：草稿保原文（可清空），解析成功才写模型
+                // Keep the raw draft while editing and update the setting only after a successful parse.
                 if value.is_empty() {
                     self.drafts.remove(&In::A2aPort);
                 } else {
@@ -492,7 +481,15 @@ impl Workbench {
                     a2a.port = port;
                 }
             }
-            In::AgentAccessPort
+            In::AgentRegName
+            | In::AgentRegProgram
+            | In::AgentRegArgs
+            | In::AgentRegEnvKeys
+            | In::AgentRegEnvValue
+            | In::SerialScrollback
+            | In::WorkDir
+            | In::DutStorageGib
+            | In::AgentAccessPort
             | In::AgentAccessTtl
             | In::AgentAccessCredName
             | In::AgentAccessExtraPort
@@ -687,7 +684,10 @@ impl Workbench {
         state
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "GPUI form helper takes key, placeholder, value, style, and window context"
+    )]
     pub fn text_field(
         &mut self,
         id: In,
@@ -715,7 +715,6 @@ impl Workbench {
     /// Password-masked input with a reveal toggle (gpui-kit component Input
     /// `.mask_toggle()`); used for env values so secrets never render in
     /// clear text (W4b).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn masked_field(
         &mut self,
         id: In,
@@ -766,7 +765,7 @@ impl Workbench {
                 this.browse_path(id, matches!(id, In::WorkDir | In::McpCwd), cx);
             });
             if id == In::NewPresetExe {
-                // 跟随弹窗内其他按钮的绘制方式。
+                // Use the same button rendering as the other dialog actions.
                 div()
                     .id(SharedString::from(button_id))
                     .min_h(px(32.))
@@ -891,8 +890,11 @@ impl Workbench {
         self.open_dd = Some(dd.key().into());
     }
 
-    /// 下拉选择（连接页 combobox）：input + chevron + 展开列表。
-    #[allow(clippy::too_many_arguments)]
+    /// Connection-page combobox with an input, chevron, and expandable options.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "GPUI combobox helper takes options, callback, style, and window context"
+    )]
     pub fn combobox(
         &mut self,
         id: In,
@@ -1044,8 +1046,11 @@ impl Workbench {
         container
     }
 
-    /// 下拉选择（固定选项集 + 回调）：agent/settings 使用。
-    #[allow(clippy::too_many_arguments)]
+    /// Fixed-choice dropdown with a callback for the Agent and settings pages.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "GPUI select helper takes options, callback, style, and window context"
+    )]
     pub fn select_field(
         &mut self,
         key: &'static str,
@@ -1107,9 +1112,9 @@ impl Workbench {
                 .shadow_md()
                 .p(px(4.))
                 .occlude();
-            for (label, index) in options {
+            let callbacks = std::iter::repeat_n(on_change, options.len());
+            for ((label, index), on_change) in options.into_iter().zip(callbacks) {
                 let active = selected == Some(index);
-                let on_change = on_change.clone();
                 list = list.child(
                     div()
                         .id(SharedString::from(format!("{key}-opt-{index}")))
@@ -1141,7 +1146,7 @@ impl Workbench {
     }
 
     // ------------------------------------------------------------------
-    // USB 调试设备扫描
+    // USB debugging device discovery
     // ------------------------------------------------------------------
 
     pub fn usb_discovery(&self, hdc: bool) -> &UsbDiscovery {
@@ -1223,7 +1228,12 @@ impl Workbench {
                                 .get(&id)
                                 .is_some_and(|editor| editor.state == state)
                         {
-                            this.input_set(id, path.to_string_lossy().into_owned());
+                            let value = if id == In::BootReference {
+                                crate::boot_learning::reference_path_text(&this.artifact_root, path)
+                            } else {
+                                path.to_string_lossy().into_owned()
+                            };
+                            this.input_set(id, value);
                             cx.notify();
                         }
                     });
@@ -1314,9 +1324,9 @@ impl Workbench {
         self.duts.selected = index;
         self.open_dd = None;
         self.clear_dut_endpoint_drafts();
-        // F13：Agent prompt 草稿按 DUT id 保存在 `agent_prompts`，切换标签直接换实体，
-        // 不复制/不清空文本。W4c：「发送后清空」请求也按 DUT 键控——切换标签
-        // 不再丢弃其他 DUT 的挂起清空请求（旧实现的全局 Option 会误清）。
+        // Keep a separate prompt input entity for each DUT.
+        // Switch entities without copying or clearing the draft.
+        // Pending clear requests are also keyed by DUT, so changing tabs preserves them.
         if let Some(dut_id) = self.duts.selected().map(|dut| dut.id.clone()) {
             self.cache_a2a_token(&dut_id);
         }
@@ -1332,7 +1342,7 @@ impl Workbench {
             self.relay_board_draft = None;
             self.relay_board_name = None;
         }
-        // 打开设置主页或工具下载页时刷新「工具下载」行快照（读盘事实，避免每帧 stat）。
+        // Refresh the downloads snapshot when opening settings so rendering does not query the filesystem every frame.
         if matches!(page, Some(ConfigPage::Settings | ConfigPage::ToolDownloads)) {
             self.refresh_tool_rows();
         }
@@ -1413,6 +1423,7 @@ impl Workbench {
         }
         if let Some(draft) = self.duts.new_connection.take() {
             self.heartbeat_drafts.remove(&draft.dut.id);
+            self.boot_reference_edits.remove(&draft.dut.id);
             self.boot_similarity_drafts.remove(&draft.dut.id);
         }
         self.duts.editing_new_connection = false;
@@ -1484,6 +1495,12 @@ impl Workbench {
         Ok((index, connect))
     }
 
+    pub(crate) fn device_session_index(&self, dut_id: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|session| session.dut_id == dut_id && session.source == "device")
+    }
+
     pub(crate) fn save_connection(&mut self, cx: &mut Context<Self>) {
         if self.duts.editing_new_connection {
             match self.persist_new_connection() {
@@ -1496,22 +1513,16 @@ impl Workbench {
                     self.notify_toast(format!("{} {err}", crate::i18n::label("saveFailed")));
                 }
             }
-        } else {
-            if self.save_duts() {
-                self.connection_open = false;
-                let index = self.duts.selected;
-                if let Some(dut) = self.duts.file.duts.get(index) {
-                    if let Some(session_index) = self
-                        .sessions
-                        .iter()
-                        .position(|session| session.dut_id == dut.id && session.source == "device")
-                    {
-                        self.active_session = session_index;
-                        self.view = ViewMode::Serial;
-                        self.terminal_focus_pending = true;
-                    } else if !dut.serial.port.trim().is_empty() {
-                        self.connect_dut(index, cx);
-                    }
+        } else if self.save_duts() {
+            self.connection_open = false;
+            let index = self.duts.selected;
+            if let Some(dut) = self.duts.file.duts.get(index) {
+                if let Some(session_index) = self.device_session_index(&dut.id) {
+                    self.active_session = session_index;
+                    self.view = ViewMode::Serial;
+                    self.terminal_focus_pending = true;
+                } else if !dut.serial.port.trim().is_empty() {
+                    self.connect_dut(index, cx);
                 }
             }
         }
@@ -1684,9 +1695,7 @@ impl Workbench {
             })
             .map(|dut| dut.id.clone())
             .collect();
-        let ts_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
+        let ts_unix_ms = duthub_core::util::unix_ms();
         let duts = self
             .duts
             .file
@@ -1751,7 +1760,7 @@ impl Workbench {
         true
     }
 
-    /// 只接收对应扫描的最新结果。
+    /// Apply only the most recent result for the corresponding scan.
     pub(super) fn apply_job_result(&mut self, result: JobResult) {
         let scan = &mut self.usb_discovery[usize::from(result.kind == JobKind::Hdc)];
         if result.job == scan.job {

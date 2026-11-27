@@ -1,62 +1,70 @@
-//! CH340 类 USB 继电器的 4 字节串口协议。
+//! The 4-byte serial port protocol of the CH340-class USB relay.
 //!
-//! 协议参考 `bitshelf/sermcp`（sermcp/dut-ctrl/src/ch340.rs）与社区通用实现：
+//! For details on the protocol implementation, refer to `bitshelf/sermcp`
+//! (sermcp/dut-ctrl/src/ch340.rs). This is a commonly used implementation across various
+//! communities.
 //!
-//! - 命令帧 4 字节：`[0xA0, channel, opcode, checksum]`，
-//!   `checksum = (0xA0 + channel + opcode) & 0xFF`；
-//! - 通道从 1 开始编号；
-//! - opcode：`0x00` OFF、`0x01` ON、`0x05` STATUS；
-//! - 多数板卡对 ON/OFF 原样回显同一帧（用于读回校验）；
-//! - STATUS 应答帧 `[0xA0, channel, state, checksum]`（state 仅 0/1，
-//!   状态字节落在 opcode 位，校验和覆盖 A0+channel+state）；
-//! - 波特率固定 9600 8N1（板卡出厂即此，无配置项）。
+//! - Command frame: 4 bytes: `[0xA0, channel, opcode, checksum]`
+//!   where `checksum = (0xA0 + channel + opcode) & 0xFF`;
+//! - Channel numbering starts at 1.
+//! - Opcodes: `0x00` OFF, `0x01` ON, `0x05` STATUS;
+//! - Most cards echo the same frame for ON/OFF status (used for read-back verification);
+//! - STATUS response frame `[0xA0, channel, state, checksum]` (state is only 0/1; the state byte
+//!   is located at the opcode byte, and the checksum covers `0xA0 + channel + state`);
+//! - Fixed baud rate of 9600, 8N1 (factory default on the relay board; not configurable).
 
-/// 帧头。
+/// Frame header.
 pub const HEADER: u8 = 0xA0;
-/// 断开（释放）。
+/// Disconnect (release).
 pub const OP_OFF: u8 = 0x00;
-/// 吸合（按下）。
+/// Energize (pressing down).
 pub const OP_ON: u8 = 0x01;
-/// 查询通道状态。
+/// querying the status of the channel.
 pub const OP_STATUS: u8 = 0x05;
-/// CH340 继电器板出厂波特率。
+/// The baud rate for the CH340 relay board upon manufacture.
 pub const DEFAULT_BAUD: u32 = 9600;
-/// `open()` 通道枚举的探测上限（常见板卡 1-8 通道）。
+/// The upper limit for channel enumeration using `open()` method (common for boards with 1-8
+/// channels).
 pub const MAX_CHANNELS: u8 = 8;
 
-/// 构造 4 字节命令帧。
+/// Construct a 4-byte command frame.
 #[must_use]
 pub fn frame(channel: u8, opcode: u8) -> [u8; 4] {
     [HEADER, channel, opcode, checksum(channel, opcode)]
 }
 
-/// 帧校验和：`(0xA0 + channel + opcode) & 0xFF`。
+/// Frame check sum: `(0xA0 + channel + opcode) & 0xFF`.
 #[must_use]
 pub fn checksum(channel: u8, opcode: u8) -> u8 {
     HEADER.wrapping_add(channel).wrapping_add(opcode)
 }
 
-/// STATUS 应答帧的校验和（状态字节占 opcode 位）。
+/// STATUS is the checksum of the response frame (the status byte occupies the opcode bits).
 fn status_checksum(channel: u8, state: u8) -> u8 {
     checksum(channel, state)
 }
 
-/// 读回帧分类结果（参考 sermcp `EchoCheck`）。
+/// Read the frame classification results again (refer to sermcp `EchoCheck`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum EchoCheck<'a> {
-    /// 与期望通道/操作码完全一致且校验通过。
+    /// The result is consistent with the expected channel/operation code, and the verification
+    /// process was successful.
     Verified(&'a [u8]),
-    /// 通道/操作码匹配但校验字节错误——内容不可信。
+    /// Channel/operation code match, but there are errors in the verification bytes. The content
+    /// cannot be trusted.
     ChecksumBad(&'a [u8]),
-    /// 4 字节帧但通道/操作码不符（对端噪声或异协议）。
+    /// A 4-byte frame, but the channel/operation code does not match (noise from the other end or
+    /// incompatible protocols).
     Mismatch(&'a [u8]),
-    /// 帧头后不足 4 字节——可能只是读分片，不算协议违规。
+    /// Less than 4 bytes after the frame header — it may just be a read of a fragment, and does not
+    /// count as a protocol violation.
     Truncated(&'a [u8]),
-    /// 缓冲中没有任何帧头（静默板卡）。
+    /// There are no frame headers in the buffer (silent board).
     Absent,
 }
 
-/// 在读回缓冲中扫描期望的回显帧（从每个 0xA0 位置起尝试）。
+/// Scanning for the desired echo frame in the read-back buffer (attempting from each 0xA0
+/// position).
 #[must_use]
 pub fn classify_echo(buf: &[u8], channel: u8, opcode: u8) -> EchoCheck<'_> {
     let mut fallback = EchoCheck::Absent;
@@ -86,11 +94,12 @@ pub fn classify_echo(buf: &[u8], channel: u8, opcode: u8) -> EchoCheck<'_> {
     fallback
 }
 
-/// 在 STATUS 应答缓冲中扫描指定通道的状态帧。
+/// Scan the status frames of the specified channel in the STATUS response buffer.
 ///
-/// 只接受「帧头 + 通道匹配 + 状态字节 0/1 + 校验通过」的帧；串口噪声里
-/// 恰好形似的字节（如文本字节 0x50/0x72）不会误报为通道状态。
-/// 返回 `None` 表示未找到有效应答（板卡不回答 STATUS 或数据损坏）。
+/// It only accepts frames with a "frame header + channel match + status byte 0/1 + verification
+/// passed". In serial port noise, bytes that resemble the expected ones (such as text bytes
+/// 0x50/0x72) will not be misreported as channel status. Returning `None` indicates that no valid
+/// response was found (the board does not respond to STATUS requests, or the data is corrupted).
 #[must_use]
 pub fn scan_status(buf: &[u8], channel: u8) -> Option<u8> {
     if buf.len() < 4 {
@@ -115,11 +124,11 @@ mod tests {
 
     #[test]
     fn frame_layout_matches_protocol() {
-        // ch1 ON：0xA0 01 01，校验 (0xA0+1+1)=0xA2
+        // ch1 ON: 0xA0 01 01. Verification: (0xA0 + 1 + 1) = 0xA2
         assert_eq!(frame(1, OP_ON), [0xA0, 0x01, 0x01, 0xA2]);
-        // ch1 OFF：校验 (0xA0+1+0)=0xA1
+        // ch1 OFF: Verification (0xA0+1+0) = 0xA1
         assert_eq!(frame(1, OP_OFF), [0xA0, 0x01, 0x00, 0xA1]);
-        // ch4 STATUS：校验 (0xA0+4+5)=0xA9
+        // CH4 STATUS: Verification (0xA0 + 4 + 5) = 0xA9
         assert_eq!(frame(4, OP_STATUS), [0xA0, 0x04, 0x05, 0xA9]);
     }
 
@@ -185,9 +194,10 @@ mod tests {
 
     #[test]
     fn scan_status_ignores_query_echo_and_text_bytes() {
-        // 板卡先回显查询帧（opcode=0x05），再回状态帧；混杂文本字节
+        // The board card first echoes the query frame (opcode = 0x05), and then sends a status
+        // frame; mixed text bytes
         let mut buf = b"ser2net-ish text \x50\x72".to_vec();
-        buf.extend_from_slice(&frame(2, OP_STATUS)); // 回显查询帧：opcode=5 > 0x01，必须被忽略
+        buf.extend_from_slice(&frame(2, OP_STATUS)); // Echo query frame: opcode=5 > 0x01, must be ignored
         buf.extend_from_slice(&[HEADER, 2, 0x00, status_checksum(2, 0x00)]);
         assert_eq!(scan_status(&buf, 2), Some(0x00));
     }
@@ -199,6 +209,10 @@ mod tests {
         let buf = [HEADER, 3, 0x01, status_checksum(3, 0x01)];
         assert_eq!(scan_status(&buf, 2), None);
         let buf = [HEADER, 2, 0x72, status_checksum(2, 0x72)];
-        assert_eq!(scan_status(&buf, 2), None, "文本字节不得误报为状态");
+        assert_eq!(
+            scan_status(&buf, 2),
+            None,
+            "The text bytes should not be misreported as states."
+        );
     }
 }

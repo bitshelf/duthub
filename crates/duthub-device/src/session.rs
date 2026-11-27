@@ -1,9 +1,9 @@
-//! 会话管理器（M1.3）：注册表、端口互斥、级联取消、重连退避。
+//! Session registry, port ownership, cancellation, and reconnect backoff.
 //!
-//! - 同一 `(host, port)` 同时只能绑定一个有效会话 → `DeviceError::Busy`。
-//! - 关闭顺序（docs/ARCHITECTURE.md）：通知会话 task 退出（Agent 侧未来在
-//!   `pre_close` 钩子先行）→ 等 task 结束 → 移除句柄 → 释放端口锁。
-//! - 重连退避为纯函数（真实驱动用），上限可配。
+//! Only one active session may hold a host and port.
+//! Signal the actor to close and wait for it to finish.
+//! Then remove the session handle and release the port.
+//! The hardware reconnect path uses a configurable maximum backoff.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -25,23 +25,23 @@ pub enum SessionKind {
     Real,
 }
 
-/// 发送路径的行尾策略（H1.2 会话级设置）：无 / \n / \r\n。
+/// Session line ending policy for transmitted text.
 ///
-/// 默认 `Lf`（`历史行为：write_line` 自动补 \n）。
-/// 已以 \n 或 \r 结尾的文本按原文发送，不重复追加。
+/// The default appends LF to a line without an ending.
+/// A line ending in CR or LF passes through unchanged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LineEnding {
-    /// 不追加任何行尾
+    /// Send with no added line ending.
     Off,
-    /// 追加 \n（默认）
+    /// Append LF by default.
     #[default]
     Lf,
-    /// 追加 \r\n（Windows 风格设备常用）
+    /// Append CRLF for devices that expect Windows-style endings.
     Crlf,
 }
 
 impl LineEnding {
-    /// UI 展示用短标签。
+    /// Short label used by the UI.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -51,7 +51,7 @@ impl LineEnding {
         }
     }
 
-    /// 发送路径生效：按策略为不带行尾的文本追加行尾符。
+    /// Append the configured ending only when the text lacks one.
     #[must_use]
     pub fn apply(self, text: &str) -> String {
         if text.ends_with('\n') || text.ends_with('\r') {
@@ -67,8 +67,8 @@ impl LineEnding {
 
 pub struct SessionHandle {
     pub(crate) logs: Arc<Mutex<crate::logs::SessionLogWriter>>,
-    /// `会话日志写通道克隆：供电分段（log_control_boundary）同步落盘时用`。
-    /// None = 写线程未启动（无日志/构建降级），走直写兜底。
+    /// Log writer channel used for synchronous control boundary markers.
+    /// When no writer thread exists, write directly.
     pub(crate) log_tx: Option<std::sync::mpsc::Sender<crate::demo::LogMsg>>,
     pub dut_id: String,
     pub session_id: String,
@@ -77,13 +77,13 @@ pub struct SessionHandle {
     pub port: String,
     pub cmd_tx: mpsc::Sender<SessionCommand>,
     pub abort: tokio::task::AbortHandle,
-    /// 会话 task 的 JoinHandle（real 会话首开失败时由外层 watcher 等待并回收）
+    /// The session actor's join handle, taken by the watcher after an initial open failure.
     pub join: Option<tokio::task::JoinHandle<()>>,
-    /// 成功打开串口后置 true；task 结束时仍为 false = 首开失败，需要回收注册表
+    /// Set after a successful open. If the actor exits before then, reclaim its registry entry.
     pub opened_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// `手动重连唤醒：退避等待期间收到通知则提前重试。notify_one` 在无等待者时
-    /// 存一个许可（上限 1）——连接正常时点击"重连"也不丢，下一次断线退避会
-    /// 立即返回，语义即"手动请求一次立即重连"。
+    /// A manual reconnect wakes the backoff so the actor can retry immediately.
+    /// The notifier retains one permit without a waiting actor.
+    /// A request during an active connection can therefore wake the next backoff once.
     pub reconnect_notify: Arc<Notify>,
 }
 
@@ -99,7 +99,7 @@ impl std::fmt::Debug for SessionHandle {
     }
 }
 
-/// 断线重连退避：base * 2^(attempt-1)，封顶 `max`；attempt 从 1 计。
+/// Exponential reconnect backoff with a maximum. The first attempt uses the base delay.
 #[must_use]
 pub fn reconnect_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
     let exp = attempt.saturating_sub(1).min(16);
@@ -107,7 +107,7 @@ pub fn reconnect_backoff(attempt: u32, base: Duration, max: Duration) -> Duratio
     scaled.min(max)
 }
 
-/// 会话注册表 + 端口锁（独立结构便于测试）。
+/// Session registry and its exclusive port ownership map.
 #[derive(Debug, Default)]
 pub struct Registry {
     sessions: HashMap<String, SessionHandle>,
@@ -172,7 +172,7 @@ impl Registry {
     }
 }
 
-/// 会话打开参数（避免 8 参函数）。
+/// Parameters for opening a session actor.
 pub struct SessionSpec<'a> {
     pub dut_id: &'a str,
     pub session_id: &'a str,
@@ -180,18 +180,18 @@ pub struct SessionSpec<'a> {
     pub port: &'a str,
     pub baud: u32,
     pub demo_line_delay_ms: u64,
-    /// 终端回滚缓冲行数（串口设置页；real 会话建 Term 时生效）。
+    /// Terminal history capacity used when constructing a real session.
     pub scrollback_rows: usize,
-    /// 快照携带的最大行数（串口设置页；决定 UI 可回看的历史行数）。
+    /// Maximum number of history rows carried in a snapshot.
     pub snapshot_max_rows: usize,
     pub logs: Arc<Mutex<crate::logs::SessionLogWriter>>,
-    /// real 会话：成功打开串口后置 true（首开失败回收注册表用）
+    /// Tracks whether a real session opened its port at least once.
     pub opened_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// 串口 actor 在写入前验证命令携带的租约。None 表示该路径不要求租约。
+    /// The actor validates any lease declared by a command before writing bytes.
     pub lease_authority: Option<Arc<dyn LeaseAuthority>>,
-    /// 审计接收端（actor 拒绝写入时记 write.deny；None = 不落审计）。
+    /// Optional audit sink for denied writes.
     pub audit: Option<Arc<AuditSink>>,
-    /// 每 DUT 乱码检测开关（与 `DeviceService` 共享；空 map = 全关）。
+    /// Shared per-DUT garbled-output detection settings.
     pub garble_enabled: Arc<Mutex<HashMap<String, bool>>>,
 }
 
@@ -207,7 +207,7 @@ impl std::fmt::Debug for SessionSpec<'_> {
     }
 }
 
-/// 会话工厂：按 kind 构造驱动 task；返回 (句柄, 命令发送端克隆)。
+/// Start the appropriate actor and return its session handle and command sender.
 pub fn spawn_session(
     bus: Arc<EventBus>,
     spec: SessionSpec<'_>,
@@ -284,11 +284,11 @@ mod tests {
         assert_eq!(LineEnding::Lf.apply("ls"), "ls\n");
         assert_eq!(LineEnding::Crlf.apply("ls"), "ls\r\n");
         assert_eq!(LineEnding::Off.apply("ls"), "ls");
-        // 已带行尾的文本按原文发送，不重复追加
+        // Preserve text that already ends in CR or LF.
         assert_eq!(LineEnding::Lf.apply("ls\n"), "ls\n");
         assert_eq!(LineEnding::Crlf.apply("ls\r\n"), "ls\r\n");
         assert_eq!(LineEnding::Off.apply("ls\r"), "ls\r");
-        // 默认策略为 Lf（保持历史行为）
+        // LF remains the default line ending.
         assert_eq!(LineEnding::default(), LineEnding::Lf);
     }
 
@@ -304,7 +304,10 @@ mod tests {
         let mut registry = Registry::default();
         registry.lock_port("local", "COM3").unwrap();
         let err = registry.lock_port("local", "COM3").unwrap_err();
-        assert!(matches!(err, DeviceError::Busy), "同端口二次绑定必须 Busy");
+        assert!(
+            matches!(err, DeviceError::Busy),
+            "second bind on the same port must return Busy"
+        );
         registry.unlock_port("local", "COM3");
         registry.lock_port("local", "COM3").unwrap();
     }
@@ -328,10 +331,10 @@ mod tests {
         assert_eq!(reconnect_backoff(999, base, max), max);
     }
 
-    /// IO-5（纯函数面）：已带行尾（\n、\r\n、\r）的文本在全部三种策略下一律
-    /// 原文直传——不得把 \n 重复追加成 \n\r\n、把 \r\n 补成 \r\n\r\n。
-    /// 与既有 `line_ending_apply_adds_configured_suffix` 互补：那边只覆盖 3 种
-    /// 组合，这里锁 3 策略 × 3 已带行尾形态的全矩阵。
+    /// Exercise all combinations of the three policies and three existing line endings.
+    /// An existing CR, LF, or CRLF must pass through byte for byte.
+    /// The suffix test separately covers text without an ending.
+    /// Together the tests cover both paths.
     #[test]
     fn line_ending_apply_passthrough_matrix_all_policies() {
         for ending in [LineEnding::Off, LineEnding::Lf, LineEnding::Crlf] {
@@ -339,20 +342,20 @@ mod tests {
                 assert_eq!(
                     ending.apply(ended),
                     ended,
-                    "{ending:?} 不得对已带行尾的 {ended:?} 重复追加"
+                    "{ending:?} must not double-append to already terminated {ended:?}"
                 );
             }
         }
     }
 
-    /// IO-5（会话发送路径）：demo 会话对每条 Write 按当前会话 `LineEnding` 策略
-    /// 补行尾，以 .bin 线上字节为准：全新会话默认 Lf（无需 `SetEnding`）、
-    /// SetEnding(Crlf/Off) 对后续写生效、已带行尾的文本在任何策略下原文直传。
-    /// 轮询只作宽松时限上界（0 延迟会话 5s 内必达），不写会闪断的窄时序断言；
-    /// 断言前先经 Flush 屏障排空日志写线程，join 完成即 .bin 完整落盘。
+    /// A demo session applies its current line ending policy to each write.
+    /// Expect LF until a different policy is set.
+    /// Already terminated text passes through under every policy.
+    /// Use a generous deadline for the asynchronous write.
+    /// Drain the log writer before reading the raw output.
     #[tokio::test]
     async fn session_send_path_applies_line_ending_policy_to_wire_bytes() {
-        // 临时目录照既有测试写法：target/test-tmp/… + 进程 id
+        // Use the repository target directory for temporary test data.
         let dir = std::env::current_dir()
             .unwrap()
             .join("target/test-tmp/device")
@@ -385,25 +388,25 @@ mod tests {
                 lease: None,
             })
         };
-        // 全新会话默认 Lf：不设 SetEnding 也补 \n
+        // The new session starts with LF without setting a policy.
         send_write("probe-default").await.unwrap();
         cmd_tx
             .send(SessionCommand::SetEnding(LineEnding::Crlf))
             .await
             .unwrap();
         send_write("probe-crlf").await.unwrap();
-        // 已带 \n 的文本在 Crlf 策略下原文直传，不得追加成 \n\r\n
+        // An existing LF is preserved under the CRLF policy.
         send_write("probe-ends-lf\n").await.unwrap();
         cmd_tx
             .send(SessionCommand::SetEnding(LineEnding::Off))
             .await
             .unwrap();
         send_write("probe-off").await.unwrap();
-        // 已带 \r\n 的文本在 Off 策略下同样原文直传
+        // An existing CRLF is preserved when suffixes are off.
         send_write("probe-ends-crlf\r\n").await.unwrap();
 
-        // 宽松上界：末条写入的 [TX] 回显 5s 内必须到达。emit_tx 先把线上字节
-        // 入日志队列再发布总线，回显可见即全部写入已过发送路径。
+        // Wait for the final TX event before reading logs.
+        // The actor queues bytes for logging before publishing the event.
         let mut processed = false;
         for _ in 0..250 {
             processed = bus
@@ -419,17 +422,17 @@ mod tests {
         }
         assert!(
             processed,
-            "全部写入必须到达 demo 会话（末条 [TX] 回显可见）"
+            "all writes must reach the demo session (final [TX] echo visible)"
         );
 
-        // 断言前先排空：Flush 屏障等待写线程把队列全部落盘（照 flush_session_logs）
+        // Flush the log queue before reading the file.
         if let Some(tx) = &handle.log_tx {
             let (ack, rx) = std::sync::mpsc::channel();
             if tx.send(crate::demo::LogMsg::Flush(ack)).is_ok() {
                 let _ = rx.recv_timeout(Duration::from_secs(3));
             }
         }
-        // 收尾：丢弃发送端克隆让会话退出；join 完成 = SessionCtx::Drop 已等写线程收尾
+        // Drop the last sender and join the actor so the writer has time to finish.
         let join = handle.join.take();
         drop(handle);
         drop(cmd_tx);
@@ -437,43 +440,52 @@ mod tests {
 
         let raw = std::fs::read(dir.join("sess-lio.bin")).unwrap();
         let raw = String::from_utf8_lossy(&raw).to_string();
-        // 默认策略 Lf
+        // Verify the default LF suffix.
         assert!(
             raw.contains("probe-default\n"),
-            "默认策略必须补 \\n：{raw:?}"
+            "default policy must append \\n: {raw:?}"
         );
-        assert!(!raw.contains("probe-default\r\n"), "默认策略不得写出 CRLF");
-        // SetEnding(Crlf) 对后续写生效
+        assert!(
+            !raw.contains("probe-default\r\n"),
+            "default policy must not write CRLF"
+        );
+        // The new CRLF policy applies to subsequent writes.
         assert!(
             raw.contains("probe-crlf\r\n"),
-            "Crlf 策略必须补 \\r\\n：{raw:?}"
+            "Crlf policy must append \\r\\n: {raw:?}"
         );
-        // 已带行尾的文本按原文直传，任何策略都不重复追加
+        // Preserve lines that already have an ending.
         assert!(
             raw.contains("probe-ends-lf\n"),
-            "已带 \\n 的文本应原文直传：{raw:?}"
+            "text already ending in \\n must pass through verbatim: {raw:?}"
         );
         assert!(
             !raw.contains("probe-ends-lf\n\r\n"),
-            "Crlf 策略不得对已带行尾的文本重复追加：{raw:?}"
+            "Crlf policy must not double-append to terminated text: {raw:?}"
         );
-        // Off 策略不补任何行尾
-        assert!(raw.contains("probe-off"), "Off 策略正文必须保留：{raw:?}");
-        assert!(!raw.contains("probe-off\n"), "Off 策略不得补 \\n：{raw:?}");
+        // The disabled policy adds no suffix.
+        assert!(
+            raw.contains("probe-off"),
+            "Off policy must preserve body: {raw:?}"
+        );
+        assert!(
+            !raw.contains("probe-off\n"),
+            "Off policy must not append \\n: {raw:?}"
+        );
         assert!(
             !raw.contains("probe-off\r\n"),
-            "Off 策略不得补 \\r\\n：{raw:?}"
+            "Off policy must not append \\r\\n: {raw:?}"
         );
         assert!(
             raw.contains("probe-ends-crlf\r\n"),
-            "Off 策略下已带 \\r\\n 的文本按原文直传：{raw:?}"
+            "Off policy must pass through existing \\r\\n verbatim: {raw:?}"
         );
     }
 
-    /// IO-5（write_line 多行归一，P2-034）：归一顺序为先折叠 CRLF→CR、再清残留
-    /// 裸 LF，最终线上 payload 行分隔符全为 CR——无透传 CRLF、无残留裸 LF、
-    /// 折叠顺序错误会产生的 \r\r 混排不得出现；行尾策略只作用于末尾（默认 Lf
-    /// 补 \n），已以 \r 结尾的文本不再追加。
+    /// Normalize multiline writes by collapsing CRLF first, then converting remaining LF to CR.
+    /// Keep existing CR separators intact.
+    /// Apply the configured line ending only after normalizing the full payload.
+    /// A payload already ending in CR needs no suffix.
     #[test]
     fn write_line_normalizes_multiline_to_cr_without_crlf_mixing() {
         let dir = std::env::current_dir()
@@ -485,15 +497,15 @@ mod tests {
         service
             .open_session("dut-norm", "COM3", 115_200, SessionKind::Demo)
             .unwrap();
-        // 混合输入一次覆盖归一全序：CRLF 折叠 + 残留 LF 清理 + 裸 CR 直传
+        // Use mixed input to exercise each normalization step.
         service
             .write_line("dut-norm", WriteIdentity::gui(), "M1\r\nM2\nM3\rM4")
             .unwrap();
-        // 末尾为裸 CR：视为已带行尾，默认 Lf 策略不再追加
+        // A trailing CR counts as an existing line ending.
         service
             .write_line("dut-norm", WriteIdentity::gui(), "tail\r")
             .unwrap();
-        // 宽松上界：末条 [TX] 回显 5s 内到达 = 全部写入已过发送路径
+        // The final TX event confirms the send path has handled all writes.
         let mut processed = false;
         for _ in 0..250 {
             processed = service.read_log("sess-dut-norm", 0, usize::MAX).iter().any(
@@ -506,29 +518,38 @@ mod tests {
         }
         assert!(
             processed,
-            "全部写入必须到达 demo 会话（末条 [TX] 回显可见）"
+            "all writes must reach the demo session (final [TX] echo visible)"
         );
-        // 断言前先 flush：写线程逐条落盘后 .bin 才完整
+        // Flush the writer before inspecting the binary log.
         service.flush_session_logs("dut-norm");
         service.close_session("dut-norm").ok();
         let raw = std::fs::read(dir.join("sess-dut-norm.bin")).unwrap();
         let raw = String::from_utf8_lossy(&raw).to_string();
-        // 线上 payload：行分隔符全为 CR，末尾按默认 Lf 补 \n
+        // Expect CR between lines and the default LF suffix.
         assert!(
             raw.contains("M1\rM2\rM3\rM4\n"),
-            "多行 payload 必须以 CR 分隔并按默认 Lf 收尾：{raw:?}"
+            "multiline payload must separate with CR and terminate with default Lf: {raw:?}"
         );
-        assert!(!raw.contains("M1\r\n"), "CRLF 不得原样透传：{raw:?}");
+        assert!(
+            !raw.contains("M1\r\n"),
+            "CRLF must not pass through verbatim: {raw:?}"
+        );
         assert!(
             !raw.contains("M1\r\r"),
-            "折叠顺序错误会把残留 LF 折成 \\r\\r 混排：{raw:?}"
+            "folding order must not turn leftover LF into \\r\\r: {raw:?}"
         );
-        assert!(!raw.contains("M2\n"), "残留裸 LF 必须清为 CR：{raw:?}");
-        // 已以 \r 结尾的文本原文直传（write_line 端不重复追加行尾）
-        assert!(raw.contains("tail\r"), "已带行尾的文本应原文直传：{raw:?}");
+        assert!(
+            !raw.contains("M2\n"),
+            "remaining bare LF must fold to CR: {raw:?}"
+        );
+        // Preserve text that already ends in CR.
+        assert!(
+            raw.contains("tail\r"),
+            "text already ending in CR must pass through verbatim: {raw:?}"
+        );
         assert!(
             !raw.contains("tail\r\n"),
-            "默认 Lf 不得对已带行尾的文本重复追加：{raw:?}"
+            "default Lf must not double-append to terminated text: {raw:?}"
         );
     }
 }

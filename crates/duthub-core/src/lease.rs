@@ -1,15 +1,15 @@
-//! 控制租约（`docs/SECURITY.md`，SPEC §6）。
+//! Control leases and write admission.
 //!
-//! 每 DUT 至多 1 个有效租约（INV-01）；TTL 默认 120s + renew/release；
-//! generation 单调递增 fencing（INV-04：acquire/force_takeover +1，renew 不变）；
-//! FIFO 等待队列可取消/超时（上限 8）；不可中断操作期间 Protected（INV-05）；
-//! 进程重启全部作废（INV-07：纯内存态，旧 `lease_id` → `UnknownLease`）。
+//! At most one active lease per DUT. The default TTL is 120 seconds.
+//! Acquiring or taking over a lease advances its fencing generation. Renewal preserves it.
+//! The FIFO queue holds up to eight waiters and supports cancellation and deadlines.
+//! All leases live in memory. Restarting invalidates every previously issued lease ID.
 //!
-//! [`ControlLeaseManager`] 同时实现 [`LeaseAuthority`]：写入通道（duthub-device
-//! `DeviceService`）与控制入口（`ControlService`）在派发前经 admit 复核——
-//! 这是 GUI 优先与 INV-01 的无条件执行点（SPEC §6.5 唯一 Actor）。
+//! The manager also implements the lease authority used at the device boundary.
+//! Serial writes and control actions check the lease before dispatch.
+//! These checks enforce GUI precedence and exclusive control.
 //!
-//! 等待实现为 200ms 轮询（偏差 9：core 不引入 tokio；队列深度 ≤8 无性能问题）。
+//! Check waiting requests every 200 ms without requiring a Tokio runtime in core.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,14 +20,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditOutcome, AuditSink, unix_ms};
 
-/// 默认租约 TTL（SPEC §6.1：120s）。
+/// Default lease lifetime.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(120);
-/// FIFO 等待队列上限（方案 §5.2）。
+/// Maximum number of queued waiters per DUT.
 pub const QUEUE_CAP: usize = 8;
-/// 等待轮询间隔（偏差 9）。
+/// Wait queue polling interval.
 const WAIT_POLL: Duration = Duration::from_millis(200);
 
-/// 高熵不透明租约句柄（SPEC §6.3：句柄 ≠ 权限；审计允许记录）。
+/// An opaque lease handle with high entropy. It identifies a lease and may be audited.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LeaseId(String);
 
@@ -43,11 +43,11 @@ impl std::fmt::Display for LeaseId {
     }
 }
 
-/// 租约持有者（服务端确认的身份，不接受客户端自报，SPEC §7）。
+/// Identity confirmed by the service that grants the lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum LeaseHolder {
-    /// GUI 交互路径（人类在场：会话打开即自动持有）
+    /// Human GUI access. The session acquires its lease when it opens.
     Gui,
     Agent {
         agent_name: String,
@@ -56,7 +56,7 @@ pub enum LeaseHolder {
 }
 
 impl LeaseHolder {
-    /// 展示/Busy 消息用标签。
+    /// Label for display and busy responses.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
@@ -66,7 +66,22 @@ impl LeaseHolder {
     }
 }
 
-/// 成功授予的租约凭证。
+/// Validate and normalize a serial occupancy session name (1..=128 chars, no control chars).
+pub fn validate_session_name(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("sessionName must not be empty");
+    }
+    if trimmed.chars().count() > 128 {
+        return Err("sessionName must be at most 128 characters");
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("sessionName must not contain control characters");
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Credentials returned when a lease is granted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeaseGrant {
@@ -74,46 +89,52 @@ pub struct LeaseGrant {
     pub dut_id: String,
     pub generation: u64,
     pub expires_at_unix_ms: u64,
-    /// 持有者标签（GUI / Agent 名）。
+    /// Display label of the GUI or Agent currently holding the lease.
     pub holder: String,
+    /// Registered session name occupying the serial port.
+    pub session_name: String,
+    /// Unix timestamp (ms) when occupancy started.
+    pub acquired_at_unix_ms: u64,
 }
 
 /// Control lease errors (business layer of SPEC §6.4; HTTP 401 is handled at the transport layer).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LeaseError {
     /// Target DUT is held by another principal.
-    #[error("DUT 控制权被 {holder} 持有（等待队列 {queue_len}）")]
+    #[error("DUT is held by {holder} ({queue_len} queued requests)")]
     Busy { holder: String, queue_len: usize },
     /// Non-interruptible operation in progress (e.g., firmware flash).
-    #[error("DUT 处于保护状态（{op} 进行中），不接受写入与控制交接")]
+    #[error("DUT is protected while {op} is in progress. Writes and handovers are blocked")]
     Protected { op: String },
     /// Outcome of previous protected operation is unknown; manual confirmation required.
-    #[error("DUT 待人工检查（上次保护操作结果未知），确认后方可继续")]
+    #[error(
+        "DUT needs operator inspection because the previous protected operation had an unknown outcome"
+    )]
     NeedsInspection,
     /// Lease exists but has expired.
-    #[error("控制租约已过期，请重新获取")]
+    #[error("Control lease expired. Acquire a new lease")]
     Expired,
     /// Lease does not exist (expired, revoked, or process restarted).
-    #[error("控制租约不存在（已过期/撤销或进程重启）")]
+    #[error("Unknown control lease. It may have expired, been revoked, or been lost on restart")]
     UnknownLease,
     /// Caller does not own the referenced lease.
-    #[error("控制租约与请求者不匹配")]
+    #[error("The requester does not hold the control lease")]
     NotHolder,
     /// Caller is not authorized to acquire a lease.
-    #[error("未授权获取控制租约")]
+    #[error("Not authorized to acquire the control lease")]
     Unauthorized,
     /// Stale fencing generation.
-    #[error("写入代数过期（fencing 拒绝；当前代数 {current}）")]
+    #[error("Stale write generation (current generation {current})")]
     Generation { current: u64 },
     /// Write attempted without a lease while authentication is enabled.
-    #[error("需要先获取控制租约（dut_acquire_control）")]
+    #[error("Acquire a control lease with dut_acquire_control before writing")]
     LeaseRequired,
     /// FIFO wait timed out while another holder kept the lease.
-    #[error("等待控制权超时：租约仍被他人持有（等待队列 {queue_len}）")]
+    #[error("Timed out waiting for the control lease (queue length: {queue_len})")]
     WaitTimeout { queue_len: usize },
     /// FIFO fairness rejection: other waiters are already queued ahead.
     #[error(
-        "DUT 控制权空闲但已有 {queue_len} 个请求在等待队列中，不接受插队（可携带 wait=true 排队等待）"
+        "DUT is free but {queue_len} requests are queued ahead. Use wait=true to join the queue"
     )]
     QueuedAhead { queue_len: usize },
 }
@@ -131,12 +152,12 @@ impl LeaseError {
     }
 }
 
-/// 写入者身份（写入通道 admit 的判型输入）。
+/// Identity presented at write admission.
 ///
-/// GUI 不携带 `lease_id：GUI` 租约由 `DeviceService` 自动持有（会话打开即取），
-/// 管理器进程内确认 Gui 持有即放行（方案 §5.3「未取则现场 acquire」）。
-/// Agent 按 SPEC 携带 (`lease_id`, generation)；过渡期（auth 关）允许不带租约
-/// （偏差 7），GUI 租约在场仍必拒。
+/// The device service acquires the GUI lease when opening a session.
+/// The manager checks GUI ownership before admitting human input.
+/// Agents present a lease ID and generation. With authentication off, the compatibility path
+/// allows an unleased write only when no existing lease prevents it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteIdentity {
     Gui,
@@ -144,12 +165,12 @@ pub enum WriteIdentity {
         lease_id: Option<String>,
         generation: Option<u64>,
     },
-    /// 心跳 / 内部注记（Agent 控制期静默，Protected 期拒绝）
+    /// Internal work such as heartbeats, suppressed under Agent control or while protected.
     System,
-    /// 审批复核通过的写动作（P1-014 器件层前置）：一次性审批令牌在 MCP 层
-    /// 校验后以该身份进入 admit。无租约要求——Free 放行（fence ctx 由
-    /// `admit_queued_write` 按纪元补空租约上下文，与 auth 关时 Agent 无租约
-    /// 路径同型）；任何在场租约（含 GUI）、人工接管、保护/待检查一律拒。
+    /// A write authorized by a single-use approval token checked by MCP.
+    /// Approval grants access only when the DUT is free.
+    /// The queue records its generation even without a lease ID.
+    /// Existing leases, manual takeover, protected work, and pending inspection block approval writes.
     Approval,
 }
 
@@ -178,49 +199,49 @@ impl WriteIdentity {
     }
 }
 
-/// 命令携带的租约上下文：入口 admit `成功时捕获（lease_id` + generation），
-/// 会话 task actor 在写串口前最后一刻复核（SPEC §6.5.1 唯一 Actor 双点复核）。
+/// Admission captures the lease ID and generation in the command context.
+/// The serial actor checks them again immediately before writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteCtx {
     pub lease_id: String,
     pub generation: u64,
 }
 
-/// 控制动作的 admit 结果：`temp_lease` 非空表示为本次动作现场获取的短租约，
-/// 调用方执行完（无论成败）必须 [`LeaseAuthority::release_temporary`]。
+/// An admission result can include a short lease acquired for this control action.
+/// Release it with `LeaseAuthority::release_temporary` whether the action succeeds or fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlAdmission {
     pub ctx: Option<WriteCtx>,
     pub temp_lease: Option<LeaseGrant>,
 }
 
-/// 写入通道 / 控制入口的租约复核接口（duthub-device 消费）。
+/// Lease checks shared by the serial and control entry points.
 pub trait LeaseAuthority: Send + Sync {
     fn serial_io(&self) -> &tokio::sync::RwLock<()>;
-    /// 写入复核（[D] 入口点）：Ok(None) = 无租约要求（过渡/系统/审批路径）；
-    /// Ok(Some(ctx)) = 命令须携带 ctx 供 actor 复核；Err = 拒绝写入。
+    /// `Ok(None)` admits a write whose path does not require a lease.
+    /// `Ok(Some(ctx))` requires the actor to recheck the attached context. An error denies the write.
     fn admit_write(
         &self,
         dut_id: &str,
         writer: &WriteIdentity,
     ) -> Result<Option<WriteCtx>, LeaseError>;
 
-    /// 控制动作复核：与 `admit_write` 同规则；Free 时 GUI 现场获取短租约
-    /// （执行后释放，方案 §7.1）。
+    /// Control admission uses the same rules as write admission.
+    /// A GUI action on a free DUT can acquire a short lease that is released afterward.
     fn admit_control(
         &self,
         dut_id: &str,
         writer: &WriteIdentity,
     ) -> Result<ControlAdmission, LeaseError>;
 
-    /// [E] actor 复核：写串口前最后一刻验证 (`lease_id`, generation) 仍有效。
+    /// Immediately before serial I/O, validate that the lease ID and generation still match.
     fn validate_ctx(&self, dut_id: &str, ctx: &WriteCtx) -> Result<(), LeaseError>;
 
-    /// 释放临时租约（控制动作收尾；幂等——已过期/已释放时静默）。
+    /// Release the temporary lease. Expired or already released leases need no cleanup.
     fn release_temporary(&self, dut_id: &str, ctx: &WriteCtx);
 }
 
-/// 租约阶段（status 工具 / GUI 面板用）。
+/// Lease phase used by the control status tool and GUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeasePhase {
@@ -230,13 +251,22 @@ pub enum LeasePhase {
     NeedsInspection,
 }
 
-/// DUT 控制权状态快照。
+/// Snapshot of the DUT control state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeaseStatus {
     pub dut_id: String,
     pub phase: LeasePhase,
     pub holder: Option<String>,
+    /// Registered session name currently occupying the DUT serial port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// Unix timestamp (ms) when the current holder began occupying the DUT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquired_at_unix_ms: Option<u64>,
+    /// Elapsed occupancy duration in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occupied_secs: Option<u64>,
     pub generation: u64,
     pub remaining_secs: Option<u64>,
     pub queue_len: usize,
@@ -247,7 +277,9 @@ pub struct LeaseStatus {
 struct HeldLease {
     lease_id: String,
     holder: LeaseHolder,
-    /// 队列授予标记（0 = 现场获取）
+    session_name: String,
+    acquired_at_ms: u64,
+    /// Request ID that won the queue, or zero for an immediate grant.
     request_id: u64,
     expires_at_ms: u64,
     revoked: bool,
@@ -257,6 +289,7 @@ struct HeldLease {
 struct Waiter {
     request_id: u64,
     holder: LeaseHolder,
+    session_name: String,
     deadline_ms: u64,
 }
 
@@ -270,12 +303,14 @@ struct DutState {
     cancelled_waiters: HashSet<u64>,
 }
 
-/// 控制租约管理器：每 DUT 单租约 + FIFO 等待 + generation fencing + Protected。
+/// Manage exclusive leases, FIFO waiters, generation fencing, and protected operations.
 ///
-/// 纯内存态（INV-07：进程重启全部作废）；审计事件经 [`AuditSink`]（脱敏）。
+/// State lives in memory. The audit sink receives redacted events.
 pub struct ControlLeaseManager {
     states: Mutex<HashMap<String, DutState>>,
+    gui_session_names: Mutex<HashMap<String, String>>,
     manual_epoch: AtomicU64,
+    manual_started_at_ms: AtomicU64,
     device_action: tokio::sync::RwLock<()>,
     ttl_ms: AtomicU64,
     gui_session_bound: bool,
@@ -298,20 +333,49 @@ impl std::fmt::Debug for ControlLeaseManager {
 }
 
 impl ControlLeaseManager {
-    /// 产品构造：TTL 120s、轮询 200ms、审计可选。
+    /// Create the production manager with a 120-second TTL and a 200 ms polling interval.
     #[must_use]
     pub fn new(audit: Option<Arc<AuditSink>>) -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
+            gui_session_names: Mutex::new(HashMap::new()),
             manual_epoch: AtomicU64::new(0),
+            manual_started_at_ms: AtomicU64::new(0),
             device_action: tokio::sync::RwLock::new(()),
-            ttl_ms: AtomicU64::new(u64::try_from(DEFAULT_LEASE_TTL.as_millis()).unwrap_or(u64::MAX)),
+            ttl_ms: AtomicU64::new(
+                u64::try_from(DEFAULT_LEASE_TTL.as_millis()).unwrap_or(u64::MAX),
+            ),
             gui_session_bound: false,
             access: std::sync::OnceLock::new(),
             wait_poll: WAIT_POLL,
             auth_enabled: AtomicBool::new(false),
             request_seq: AtomicU64::new(0),
             audit,
+        }
+    }
+
+    /// Register the session name associated with a desktop GUI serial session on `dut_id`.
+    pub fn set_gui_session_name(&self, dut_id: &str, session_name: impl Into<String>) {
+        let raw = session_name.into();
+        let normalized = validate_session_name(&raw).unwrap_or_else(|_| format!("GUI/{dut_id}"));
+        crate::util::lock_unpoisoned(&self.gui_session_names)
+            .insert(dut_id.to_owned(), normalized.clone());
+        let mut states = crate::util::lock_unpoisoned(&self.states);
+        if let Some(st) = states.get_mut(dut_id)
+            && let Some(held) = st.lease.as_mut()
+            && held.holder == LeaseHolder::Gui
+        {
+            held.session_name = normalized;
+        }
+    }
+
+    fn default_session_name(&self, dut_id: &str, holder: &LeaseHolder) -> String {
+        match holder {
+            LeaseHolder::Gui => crate::util::lock_unpoisoned(&self.gui_session_names)
+                .get(dut_id)
+                .cloned()
+                .unwrap_or_else(|| format!("GUI/{dut_id}")),
+            LeaseHolder::Agent { agent_name, .. } => agent_name.clone(),
         }
     }
 
@@ -348,14 +412,14 @@ impl ControlLeaseManager {
         }
     }
 
-    /// 测试构造：缩短轮询间隔保证等待用例的确定性。
+    /// Use a shorter polling interval for wait queue tests.
     #[must_use]
     pub fn with_wait_poll(mut self, poll: Duration) -> Self {
         self.wait_poll = poll;
         self
     }
 
-    /// auth 总开关联动（Agent 无租约写放行与否，偏差 7）。GUI 保存设置后热更新。
+    /// Update authentication policy for admitting unleased Agent writes after settings are saved.
     pub fn set_auth_enabled(&self, enabled: bool) {
         self.auth_enabled.store(enabled, Ordering::Relaxed);
     }
@@ -376,7 +440,7 @@ impl ControlLeaseManager {
             .device_action
             .try_write()
             .map_err(|_| LeaseError::Protected {
-                op: "设备写入或控制操作".into(),
+                op: "device write or control action".into(),
             })?;
         let mut states = crate::util::lock_unpoisoned(&self.states);
         if self.manual_control() == enabled {
@@ -401,6 +465,8 @@ impl ControlLeaseManager {
                 }
             }
         }
+        self.manual_started_at_ms
+            .store(if enabled { unix_ms() } else { 0 }, Ordering::Release);
         self.manual_epoch.fetch_add(1, Ordering::Release);
         self.audit_lease(
             "lease.manual",
@@ -408,9 +474,9 @@ impl ControlLeaseManager {
             "",
             AuditOutcome::Ok,
             if enabled {
-                "人工接管已启用"
+                "Manual control enabled"
             } else {
-                "人工接管已解除"
+                "Manual control disabled"
             },
         );
         Ok(())
@@ -429,8 +495,8 @@ impl ControlLeaseManager {
     }
 
     /// Carry a fence through the serial queue even for previously unleased writes.
-    /// 审批（Approval）身份同样经此补 fence `ctx：admit_write` 放行为 Ok(None)
-    /// 时按当前纪元包装空租约 WriteCtx（P1-014 器件层前置）。
+    /// An approved write also needs a generation fence even when it has no lease.
+    /// Record the current generation with an empty lease ID for actor-side validation.
     pub fn admit_queued_write(
         &self,
         dut_id: &str,
@@ -473,19 +539,32 @@ impl ControlLeaseManager {
         );
     }
 
-    /// 获取租约：Free 即授（generation+1）；GUI 重复获取幂等返回现有凭证；
-    /// 被他人持有 → Busy（`wait=Some(dur)` 时入 FIFO 队列轮询等待，超时 Busy）。
+    /// Grant immediately when free and advance the generation.
+    /// An eligible waiting request enters the FIFO queue. Existing GUI grants are idempotent.
     pub fn acquire(
         &self,
         dut_id: &str,
         holder: &LeaseHolder,
         wait: Option<Duration>,
     ) -> Result<LeaseGrant, LeaseError> {
-        let deadline_ms = wait.map(|w| {
-            unix_ms().saturating_add(u64::try_from(w.as_millis()).unwrap_or(u64::MAX))
-        });
-        let request_id = deadline_ms
-            .map_or(0, |_| self.request_seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let session_name = self.default_session_name(dut_id, holder);
+        self.acquire_with_session(dut_id, holder, &session_name, wait)
+    }
+
+    /// Grant immediately when free with an explicit registered `session_name`.
+    pub fn acquire_with_session(
+        &self,
+        dut_id: &str,
+        holder: &LeaseHolder,
+        session_name: &str,
+        wait: Option<Duration>,
+    ) -> Result<LeaseGrant, LeaseError> {
+        let session_name = validate_session_name(session_name)
+            .unwrap_or_else(|_| self.default_session_name(dut_id, holder));
+        let deadline_ms = wait
+            .map(|w| unix_ms().saturating_add(u64::try_from(w.as_millis()).unwrap_or(u64::MAX)));
+        let request_id =
+            deadline_ms.map_or(0, |_| self.request_seq.fetch_add(1, Ordering::Relaxed) + 1);
         loop {
             let now = unix_ms();
             let poll = {
@@ -508,7 +587,7 @@ impl ControlLeaseManager {
                     return Err(LeaseError::Unauthorized);
                 }
                 self.expire_if_due(st, dut_id, now);
-                // Protected / 待检查：一律拒（SPEC §6.2 状态机；已排队者同样失败）
+                // Protected and inspection states deny acquisition, including for queued waiters.
                 if let Some(op) = &st.protected_op {
                     return Err(LeaseError::Protected { op: op.clone() });
                 }
@@ -520,11 +599,11 @@ impl ControlLeaseManager {
                         if held.revoked {
                             return Err(LeaseError::Unauthorized);
                         }
-                        // 轮询发现队列授予已落地 → 返回凭证
+                        // Return the lease if the queued request was granted since the last poll.
                         return Ok(Self::grant_view(dut_id, held, st.generation));
                     }
                     if *holder == LeaseHolder::Gui && held.holder == LeaseHolder::Gui {
-                        // 幂等：同一持有者重复 acquire（GUI 自动路径）
+                        // Return the existing grant for repeated acquisition by the GUI holder.
                         return Ok(Self::grant_view(dut_id, held, st.generation));
                     }
                     let busy = LeaseError::Busy {
@@ -534,7 +613,7 @@ impl ControlLeaseManager {
                     if deadline_ms.is_none() {
                         return Err(busy);
                     }
-                    // 排队：上限检查 + FIFO 登记
+                    // Enforce the queue limit before registering the waiter.
                     if st.queue.len() >= QUEUE_CAP {
                         return Err(busy);
                     }
@@ -542,6 +621,7 @@ impl ControlLeaseManager {
                         st.queue.push_back(Waiter {
                             request_id,
                             holder: holder.clone(),
+                            session_name: session_name.clone(),
                             deadline_ms: deadline_ms.unwrap_or(now),
                         });
                         self.audit_lease(
@@ -549,12 +629,12 @@ impl ControlLeaseManager {
                             Some(holder),
                             dut_id,
                             AuditOutcome::Ok,
-                            &format!("排队等待（第 {} 位）", st.queue.len()),
+                            &format!("Queued at position {}", st.queue.len()),
                         );
                     }
                 } else if st.queue.iter().any(|w| &w.holder != holder) {
-                    // FIFO 公平：队列中有其他等待者时，新请求不得插队
-                    // （P2-019：队列状态不是持有者名，用专用变体表述）
+                    // Preserve FIFO order when other waiters are queued.
+                    // Queue position uses its own error variant because it has no holder identity.
                     let busy = LeaseError::QueuedAhead {
                         queue_len: st.queue.len(),
                     };
@@ -568,14 +648,15 @@ impl ControlLeaseManager {
                         st.queue.push_back(Waiter {
                             request_id,
                             holder: holder.clone(),
+                            session_name: session_name.clone(),
                             deadline_ms: deadline_ms.unwrap_or(now),
                         });
                     }
                 } else {
-                    // Free：直接授予（generation +1）
-                    return Ok(self.grant_free(st, dut_id, holder, now, 0));
+                    // Grant immediately when the DUT is free.
+                    return Ok(self.grant_free(st, dut_id, holder, &session_name, now, 0));
                 }
-                // 等待截止检查（锁外休眠）
+                // Check the deadline before sleeping outside the lock.
                 let deadline = deadline_ms.unwrap_or(now);
                 if now >= deadline {
                     Self::remove_waiter(st, request_id);
@@ -584,7 +665,7 @@ impl ControlLeaseManager {
                         Some(holder),
                         dut_id,
                         AuditOutcome::Denied,
-                        "等待超时",
+                        "Wait timed out",
                     );
                     return Err(LeaseError::WaitTimeout {
                         queue_len: st.queue.len(),
@@ -597,59 +678,55 @@ impl ControlLeaseManager {
         }
     }
 
-    /// 续租（TTL 重置；generation 不变，SPEC §6.5）。过期 → Expired；
-    /// 句柄不匹配 / 不存在 → UnknownLease；Protected 期拒绝。
+    /// Renew the TTL while preserving the fencing generation.
+    /// Reject expired, unknown, and protected leases with their corresponding errors.
     pub fn renew(&self, dut_id: &str, lease_id: &str) -> Result<LeaseGrant, LeaseError> {
+        self.renew_with_clock(dut_id, lease_id, unix_ms)
+    }
+
+    fn renew_with_clock(
+        &self,
+        dut_id: &str,
+        lease_id: &str,
+        now_ms: impl FnOnce() -> u64,
+    ) -> Result<LeaseGrant, LeaseError> {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let Some(st) = states.get_mut(dut_id) else {
             return Err(LeaseError::UnknownLease);
         };
-        let now = unix_ms();
+        let now = now_ms();
         if let Some(op) = &st.protected_op {
             return Err(LeaseError::Protected { op: op.clone() });
         }
         if st.inspection {
             return Err(LeaseError::NeedsInspection);
         }
-        let current_id = st.lease.as_ref().map(|h| h.lease_id.clone());
-        match current_id {
-            Some(id) if id == lease_id => {
-                let expired = st.lease.as_ref().is_some_and(|h| now > h.expires_at_ms);
-                if expired {
-                    self.expire_if_due(st, dut_id, now);
-                    return Err(LeaseError::Expired);
-                }
-                let holder = st
-                    .lease
-                    .as_ref()
-                    .map(|h| h.holder.clone())
-                    .expect("current_id matched active lease");
-                if !self.holder_enabled(&holder) {
-                    return Err(LeaseError::Unauthorized);
-                }
-                let held = st.lease.as_mut().expect("current_id matched active lease");
-                if held.revoked {
-                    return Err(LeaseError::Unauthorized);
-                }
-                if self.gui_session_bound && holder == LeaseHolder::Gui {
-                    return Ok(Self::grant_view(dut_id, held, st.generation));
-                }
-                let ttl = self.ttl_ms.load(Ordering::Relaxed);
-                held.expires_at_ms = now.saturating_add(ttl);
-                self.audit_lease(
-                    "lease.renew",
-                    Some(&holder),
-                    dut_id,
-                    AuditOutcome::Ok,
-                    &format!("续租至 +{ttl}ms"),
-                );
-                Ok(Self::grant_view(dut_id, held, st.generation))
-            }
-            _ => Err(LeaseError::UnknownLease),
+        let Some(held) = st.lease.as_mut().filter(|held| held.lease_id == lease_id) else {
+            return Err(LeaseError::UnknownLease);
+        };
+        if now > held.expires_at_ms {
+            self.expire_if_due(st, dut_id, now);
+            return Err(LeaseError::Expired);
         }
+        if !self.holder_enabled(&held.holder) || held.revoked {
+            return Err(LeaseError::Unauthorized);
+        }
+        if self.gui_session_bound && held.holder == LeaseHolder::Gui {
+            return Ok(Self::grant_view(dut_id, held, st.generation));
+        }
+        let ttl = self.ttl_ms.load(Ordering::Relaxed);
+        held.expires_at_ms = now.saturating_add(ttl);
+        self.audit_lease(
+            "lease.renew",
+            Some(&held.holder),
+            dut_id,
+            AuditOutcome::Ok,
+            &format!("Renewed for {ttl} ms"),
+        );
+        Ok(Self::grant_view(dut_id, held, st.generation))
     }
 
-    /// 释放（持有者本人；Protected 期拒绝——失败路径不允许交接，SPEC §6.4）。
+    /// Release a matching lease. Protected operations prohibit handover.
     pub fn release(&self, dut_id: &str, lease_id: &str) -> Result<(), LeaseError> {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let Some(st) = states.get_mut(dut_id) else {
@@ -674,7 +751,7 @@ impl ControlLeaseManager {
                     Some(&holder),
                     dut_id,
                     AuditOutcome::Ok,
-                    "持有者释放租约",
+                    "Holder released the lease",
                 );
                 self.grant_to_queue_head(st, dut_id, now);
                 Ok(())
@@ -684,9 +761,9 @@ impl ControlLeaseManager {
         }
     }
 
-    /// MCP 写工具的归属 + 代数复核（方案 §6.2 [B]→[C] 合一）：租约必须在场、
-    /// 句柄匹配、持有者是当前凭据的 Agent → 返回当前 generation 供命令携带。
-    /// GUI 持有 / 他人凭据 → NotHolder；无租约 → `UnknownLease`。
+    /// Check lease ownership and generation for MCP writes.
+    /// The lease ID must match, and the authenticated credential must own the Agent lease.
+    /// Return the current generation for the command, or an ownership error if the lease is absent or belongs to another holder.
     pub fn validate_agent_lease(
         &self,
         dut_id: &str,
@@ -728,7 +805,7 @@ impl ControlLeaseManager {
         }
     }
 
-    /// 按持有者释放（GUI 会话关闭自动释放；无租约时静默成功）。
+    /// Release a holder's lease when its GUI session closes. A missing lease needs no action.
     pub fn release_for_holder(&self, dut_id: &str, holder: &LeaseHolder) {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let Some(st) = states.get_mut(dut_id) else {
@@ -736,7 +813,7 @@ impl ControlLeaseManager {
         };
         let now = unix_ms();
         if st.protected_op.is_some() || st.inspection {
-            return; // 保护/待检查期不交接（租约随 Protected 结束流程清理）
+            return; // Do not hand over during protected work or pending inspection.
         }
         let matches = st.lease.as_ref().is_some_and(|held| &held.holder == holder);
         if matches {
@@ -746,7 +823,7 @@ impl ControlLeaseManager {
                 Some(holder),
                 dut_id,
                 AuditOutcome::Ok,
-                "会话关闭自动释放",
+                "Session closed and released the lease",
             );
             self.grant_to_queue_head(st, dut_id, now);
         }
@@ -765,62 +842,102 @@ impl ControlLeaseManager {
                     Some(&held.holder),
                     dut_id,
                     AuditOutcome::Ok,
-                    "凭据停用或撤销",
+                    "Credential disabled or revoked",
                 );
                 self.expire_if_due(state, dut_id, now);
             }
         }
     }
 
-    /// 状态快照（惰性过期在此触发；GUI 控制权面板 / `dut_control_status` 数据源）。
+    /// Return current control status and process lazy expiration.
     pub fn status(&self, dut_id: &str) -> LeaseStatus {
+        self.status_with_clock(dut_id, unix_ms)
+    }
+
+    fn status_with_clock(&self, dut_id: &str, now_ms: impl FnOnce() -> u64) -> LeaseStatus {
         let mut states = crate::util::lock_unpoisoned(&self.states);
+        let now = now_ms();
         let Some(st) = states.get_mut(dut_id) else {
-            let (phase, holder) = if self.manual_control() {
-                (LeasePhase::Held, Some("人工接管".into()))
-            } else {
-                (LeasePhase::Free, None)
-            };
+            if self.manual_control() {
+                let started = self.manual_started_at_ms.load(Ordering::Acquire);
+                let acquired = (started > 0).then_some(started);
+                let occupied = acquired.map(|ts| now.saturating_sub(ts) / 1000);
+                return LeaseStatus {
+                    dut_id: dut_id.to_string(),
+                    phase: LeasePhase::Held,
+                    holder: Some("人工接管".into()),
+                    session_name: Some("人工接管".into()),
+                    acquired_at_unix_ms: acquired,
+                    occupied_secs: occupied,
+                    generation: 0,
+                    remaining_secs: None,
+                    queue_len: 0,
+                    protected_op: None,
+                };
+            }
             return LeaseStatus {
                 dut_id: dut_id.to_string(),
-                phase,
-                holder,
+                phase: LeasePhase::Free,
+                holder: None,
+                session_name: None,
+                acquired_at_unix_ms: None,
+                occupied_secs: None,
                 generation: 0,
                 remaining_secs: None,
                 queue_len: 0,
                 protected_op: None,
             };
         };
-        let now = unix_ms();
         self.expire_if_due(st, dut_id, now);
-        let (phase, holder, remaining) = if st.protected_op.is_some() {
-            (
+        let (phase, holder, session_name, acquired_at_unix_ms, remaining) = match (
+            st.protected_op.is_some(),
+            st.inspection,
+            self.manual_control(),
+            &st.lease,
+        ) {
+            (true, _, _, lease) => (
                 LeasePhase::Protected,
-                st.lease.as_ref().map(|h| h.holder.label()),
+                lease.as_ref().map(|h| h.holder.label()),
+                lease.as_ref().map(|h| h.session_name.clone()),
+                lease.as_ref().map(|h| h.acquired_at_ms),
                 None,
-            )
-        } else if st.inspection {
-            (LeasePhase::NeedsInspection, None, None)
-        } else if self.manual_control() {
-            (LeasePhase::Held, Some("人工接管".into()), None)
-        } else {
-            match &st.lease {
-                Some(held) => {
-                    // GUI 自动租约无 TTL（P3-023）：剩余时间不可报，显示层取“-”
-                    let remaining = if held.holder == LeaseHolder::Gui {
-                        None
-                    } else {
-                        Some(held.expires_at_ms.saturating_sub(now) / 1000)
-                    };
-                    (LeasePhase::Held, Some(held.holder.label()), remaining)
-                }
-                None => (LeasePhase::Free, None, None),
+            ),
+            (false, true, _, _) => (LeasePhase::NeedsInspection, None, None, None, None),
+            (false, false, true, _) => {
+                let started = self.manual_started_at_ms.load(Ordering::Acquire);
+                (
+                    LeasePhase::Held,
+                    Some("人工接管".into()),
+                    Some("人工接管".into()),
+                    (started > 0).then_some(started),
+                    None,
+                )
             }
+            (false, false, false, Some(held)) => {
+                // An automatic GUI lease has no TTL to display.
+                let remaining = if held.holder == LeaseHolder::Gui {
+                    None
+                } else {
+                    Some(held.expires_at_ms.saturating_sub(now) / 1000)
+                };
+                (
+                    LeasePhase::Held,
+                    Some(held.holder.label()),
+                    Some(held.session_name.clone()),
+                    Some(held.acquired_at_ms),
+                    remaining,
+                )
+            }
+            (false, false, false, None) => (LeasePhase::Free, None, None, None, None),
         };
+        let occupied_secs = acquired_at_unix_ms.map(|ts| now.saturating_sub(ts) / 1000);
         LeaseStatus {
             dut_id: dut_id.to_string(),
             phase,
             holder,
+            session_name,
+            acquired_at_unix_ms,
+            occupied_secs,
             generation: st.generation,
             remaining_secs: remaining,
             queue_len: st.queue.len(),
@@ -828,7 +945,7 @@ impl ControlLeaseManager {
         }
     }
 
-    /// [D]/[E] 共用验证：句柄 + 代数都匹配当前持有租约 → Ok(generation)。
+    /// Check the lease ID and generation at admission and immediately before dispatch.
     pub fn validate(
         &self,
         dut_id: &str,
@@ -869,8 +986,8 @@ impl ControlLeaseManager {
         }
     }
 
-    /// 进入保护态（不可中断操作期间：acquire/renew/release/写入全拒，INV-05）。
-    /// 要求当前有租约（Held → Protected，SPEC §6.2 状态机）。
+    /// Enter the protected phase for an uninterruptible operation and block lease changes and writes.
+    /// A current lease is required.
     pub fn enter_protected(&self, dut_id: &str, op: &str) -> Result<(), LeaseError> {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let st = states.entry(dut_id.to_string()).or_default();
@@ -891,13 +1008,13 @@ impl ControlLeaseManager {
             Some(&holder),
             dut_id,
             AuditOutcome::Ok,
-            &format!("进入保护态：{op}"),
+            &format!("Entered protected state for {op}"),
         );
         Ok(())
     }
 
-    /// 退出保护态：`outcome_ok=true` → Free；false（结果未知）→ `NeedsInspection`，
-    /// 经 [`Self::resolve_inspection`] 人工确认后回 Free。
+    /// Return to free state after verified success. An unknown outcome requires inspection.
+    /// Use `Self::resolve_inspection` to return to free state after manual review.
     pub fn exit_protected(&self, dut_id: &str, outcome_ok: bool) -> Result<(), LeaseError> {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let Some(st) = states.get_mut(dut_id) else {
@@ -907,7 +1024,7 @@ impl ControlLeaseManager {
         let Some(op) = st.protected_op.take() else {
             return Err(LeaseError::UnknownLease);
         };
-        st.lease = None; // 两种出口都回 Free（SPEC §6.2：Protected 不回 Held）
+        st.lease = None; // A protected operation never restores the previous grant.
         self.audit_lease(
             "lease.protected.exit",
             None,
@@ -918,8 +1035,8 @@ impl ControlLeaseManager {
                 AuditOutcome::Error
             },
             &format!(
-                "退出保护态：{op}（结果 {}）",
-                if outcome_ok { "成功" } else { "未知" }
+                "Exited protected state for {op} (outcome: {})",
+                if outcome_ok { "success" } else { "unknown" }
             ),
         );
         if outcome_ok {
@@ -930,7 +1047,7 @@ impl ControlLeaseManager {
         Ok(())
     }
 
-    /// 人工确认检查结果 → Free（SPEC §6.2 `NeedsInspection` --人工确认--> Free）。
+    /// Return the DUT to free state after manual inspection.
     pub fn resolve_inspection(&self, dut_id: &str, safe: bool) {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let Some(st) = states.get_mut(dut_id) else {
@@ -944,14 +1061,14 @@ impl ControlLeaseManager {
                 None,
                 dut_id,
                 AuditOutcome::Ok,
-                "人工确认完成，恢复可用",
+                "Operator inspection completed. DUT available",
             );
             self.grant_to_queue_head(st, dut_id, now);
         }
     }
 
-    /// GUI 强制接管（SPEC §6.7）：撤销旧租约（generation+1）→ 直接授予 GUI。
-    /// 旧持有者下一次写入在 admit/actor 复核被拒。Protected/待检查期不可接管。
+    /// Revoke the old grant and advance the generation before giving control to the GUI.
+    /// Reject takeover while protected or awaiting inspection. Later writes from the old holder fail admission.
     pub fn force_takeover(&self, dut_id: &str) -> Result<LeaseGrant, LeaseError> {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let st = states.entry(dut_id.to_string()).or_default();
@@ -969,22 +1086,26 @@ impl ControlLeaseManager {
                 Some(&held.holder),
                 dut_id,
                 AuditOutcome::Ok,
-                &format!("GUI 强制接管，撤销 {}", held.holder.label()),
+                &format!(
+                    "GUI took control and revoked the lease held by {}",
+                    held.holder.label()
+                ),
             );
         }
         st.lease = None;
-        st.queue.clear(); // 接管优先于等待队列（人类在场优先）
+        st.queue.clear(); // The human takeover supersedes queued requests.
         self.audit_lease(
             "lease.queue",
             None,
             dut_id,
             AuditOutcome::Ok,
-            "强制接管清空等待队列",
+            "Manual takeover cleared the wait queue",
         );
-        Ok(self.grant_free(st, dut_id, &LeaseHolder::Gui, now, 0))
+        let gui_session = self.default_session_name(dut_id, &LeaseHolder::Gui);
+        Ok(self.grant_free(st, dut_id, &LeaseHolder::Gui, &gui_session, now, 0))
     }
 
-    /// 取消排队等待（MCP `dut_acquire_control` 可取消）。
+    /// Cancel a queued control acquisition request.
     pub fn cancel_wait(&self, dut_id: &str, request_id: u64) -> bool {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let Some(st) = states.get_mut(dut_id) else {
@@ -1001,13 +1122,13 @@ impl ControlLeaseManager {
                 None,
                 dut_id,
                 AuditOutcome::Ok,
-                &format!("取消等待 request={request_id}"),
+                &format!("Cancelled queued request {request_id}"),
             );
         }
         removed
     }
 
-    /// 当前排队等待的请求 id（GUI 面板 / MCP 取消入口用）。
+    /// List queued request IDs for the GUI panel and cancellation tool.
     pub fn pending_wait_requests(&self, dut_id: &str) -> Vec<u64> {
         let states = crate::util::lock_unpoisoned(&self.states);
         states
@@ -1021,10 +1142,10 @@ impl ControlLeaseManager {
         before != st.queue.len()
     }
 
-    /// 惰性过期：租约到期 → Free（审计）→ 队首等待者按 FIFO 授予。
+    /// On expiration, record the release and grant the next eligible FIFO waiter.
     fn expire_if_due(&self, st: &mut DutState, dut_id: &str, now: u64) {
         if st.protected_op.is_some() || st.inspection {
-            return; // 保护/待检查期不惰性过期（exit_protected 统一清理）
+            return; // Skip lazy expiration during protected work or pending inspection.
         }
         if st.lease.as_ref().is_some_and(|held| held.revoked) {
             // In-flight device actions hold the read side. Keep the old lease fenced until they finish.
@@ -1042,19 +1163,20 @@ impl ControlLeaseManager {
             let holder = st.lease.as_ref().map(|h| h.holder.clone());
             st.lease = None;
             let label = holder
-                .as_ref().map_or_else(|| "?".into(), LeaseHolder::label);
+                .as_ref()
+                .map_or_else(|| "?".into(), LeaseHolder::label);
             self.audit_lease(
                 "lease.expire",
                 holder.as_ref(),
                 dut_id,
                 AuditOutcome::Ok,
-                &format!("TTL 到期，释放 {label}"),
+                &format!("Lease for {label} expired"),
             );
             self.grant_to_queue_head(st, dut_id, now);
         }
     }
 
-    /// Free → 队首有效等待者授予（deadline 已过的跳过并审计）。
+    /// Grant to the first eligible waiter and audit any expired entries that are skipped.
     fn grant_to_queue_head(&self, st: &mut DutState, dut_id: &str, now: u64) {
         while let Some(head) = st.queue.front() {
             if !self.holder_enabled(&head.holder) {
@@ -1062,35 +1184,49 @@ impl ControlLeaseManager {
                 continue;
             }
             if head.deadline_ms < now {
-                let skipped = st.queue.pop_front().expect("queue front was just inspected");
+                let skipped = st
+                    .queue
+                    .pop_front()
+                    .expect("queue front was just inspected");
                 self.audit_lease(
                     "lease.queue",
                     Some(&skipped.holder),
                     dut_id,
                     AuditOutcome::Denied,
-                    "等待截止已过，跳过",
+                    "Skipped waiter whose deadline passed",
                 );
                 continue;
             }
-            let head = st.queue.pop_front().expect("queue front was just inspected");
-            self.grant_free(st, dut_id, &head.holder, now, head.request_id);
+            let head = st
+                .queue
+                .pop_front()
+                .expect("queue front was just inspected");
+            self.grant_free(
+                st,
+                dut_id,
+                &head.holder,
+                &head.session_name,
+                now,
+                head.request_id,
+            );
             return;
         }
     }
 
-    /// 现场授予（generation +1；`request_id` 非零 = 队列授予）。
+    /// Advance the generation for a grant. A nonzero request ID identifies a queued grant.
     fn grant_free(
         &self,
         st: &mut DutState,
         dut_id: &str,
         holder: &LeaseHolder,
+        session_name: &str,
         now: u64,
         request_id: u64,
     ) -> LeaseGrant {
         st.generation = st.generation.saturating_add(1);
         let lease_id = LeaseId::new();
-        // GUI 自动租约无 TTL（P3-023 双保险）：expire_if_due 已按持有者跳过，
-        // expires_at 取 u64::MAX 让到期比较/剩余时间同样不会触发
+        // Automatic GUI leases are exempt from expiration checks.
+        // Use the maximum timestamp so their remaining lifetime cannot be mistaken for a finite TTL.
         let expires_at = if self.gui_session_bound && *holder == LeaseHolder::Gui {
             u64::MAX
         } else {
@@ -1099,6 +1235,8 @@ impl ControlLeaseManager {
         st.lease = Some(HeldLease {
             lease_id: lease_id.to_string(),
             holder: holder.clone(),
+            session_name: session_name.to_owned(),
+            acquired_at_ms: now,
             request_id,
             expires_at_ms: expires_at,
             revoked: false,
@@ -1109,7 +1247,7 @@ impl ControlLeaseManager {
             dut_id,
             AuditOutcome::Ok,
             &format!(
-                "授予 {} generation={}（队列授予={})",
+                "Granted lease to {} (session: {session_name}) at generation {} (from queue: {})",
                 lease_id,
                 st.generation,
                 request_id != 0
@@ -1121,6 +1259,8 @@ impl ControlLeaseManager {
             generation: st.generation,
             expires_at_unix_ms: expires_at,
             holder: holder.label(),
+            session_name: session_name.to_owned(),
+            acquired_at_unix_ms: now,
         }
     }
 
@@ -1131,6 +1271,8 @@ impl ControlLeaseManager {
             generation,
             expires_at_unix_ms: held.expires_at_ms,
             holder: held.holder.label(),
+            session_name: held.session_name.clone(),
+            acquired_at_unix_ms: held.acquired_at_ms,
         }
     }
 }
@@ -1160,7 +1302,7 @@ impl LeaseAuthority for ControlLeaseManager {
                     return Err(LeaseError::NeedsInspection);
                 }
                 match &st.lease {
-                    // Agent 控制期心跳静默（方案 §5.3 admit 表）
+                    // Suppress the heartbeat while an Agent has control.
                     Some(held) if held.holder != LeaseHolder::Gui => Err(LeaseError::Busy {
                         holder: held.holder.label(),
                         queue_len: st.queue.len(),
@@ -1189,8 +1331,10 @@ impl LeaseAuthority for ControlLeaseManager {
                         queue_len: st.queue.len(),
                     }),
                     None => {
-                        // Free：GUI 现场获取（人类在场自动租约，方案 §5.3 admit 表）
-                        let grant = self.grant_free(st, dut_id, &LeaseHolder::Gui, now, 0);
+                        // Acquire a GUI lease when the human operator writes to a free DUT.
+                        let gui_session = self.default_session_name(dut_id, &LeaseHolder::Gui);
+                        let grant =
+                            self.grant_free(st, dut_id, &LeaseHolder::Gui, &gui_session, now, 0);
                         Ok(Some(WriteCtx {
                             lease_id: grant.lease_id,
                             generation: grant.generation,
@@ -1215,8 +1359,8 @@ impl LeaseAuthority for ControlLeaseManager {
                 if st.inspection {
                     return Err(LeaseError::NeedsInspection);
                 }
-                // 持有者判定（GUI 优先无条件生效，偏差 7）：任何在场租约都拒绝
-                // 非持有者的 Agent 写——包括无租约的过渡形态
+                // An existing lease rejects Agent writes from other holders.
+                // This also applies to unleased writes in compatibility mode.
                 let held = st
                     .lease
                     .as_ref()
@@ -1229,7 +1373,7 @@ impl LeaseAuthority for ControlLeaseManager {
                             }) {
                                 return Err(LeaseError::Unauthorized);
                             }
-                            // 本人是持有者：代数必须匹配（fencing）
+                            // Fence the current holder against an obsolete generation.
                             let Some(expected_gen) = generation.as_ref() else {
                                 return Err(LeaseError::Busy {
                                     holder: holder_label,
@@ -1253,9 +1397,9 @@ impl LeaseAuthority for ControlLeaseManager {
                         }
                     }
                     None => match lease_id {
-                        // Free 且带句柄：句柄已不存在（过期/撤销/重启）
+                        // The supplied handle was expired, revoked, or invalidated by a restart.
                         Some(_) => Err(LeaseError::UnknownLease),
-                        // Free 且无租约：auth 关 → 过渡放行（偏差 7）；auth 开 → 拒
+                        // Authentication must be disabled to admit an unleased write to a free DUT.
                         None => {
                             if self.auth_enabled.load(Ordering::Relaxed) {
                                 Err(LeaseError::LeaseRequired)
@@ -1281,15 +1425,15 @@ impl LeaseAuthority for ControlLeaseManager {
                     return Err(LeaseError::NeedsInspection);
                 }
                 match &st.lease {
-                    // 审批写不是租约持有者：任何在场租约（含 GUI 自动租约）都拒，
-                    // Busy 指向当前持有者（GUI 优先无条件生效）
+                    // An approval is independent of the lease and cannot act while any lease is active.
+                    // Report the actual holder in the busy response.
                     Some(held) => Err(LeaseError::Busy {
                         holder: held.holder.label(),
                         queue_len: st.queue.len(),
                     }),
-                    // Free：放行。返回 Ok(None)（无租约要求路径），纪元 fence 由
-                    // admit_queued_write 补空租约 WriteCtx（与 auth 关时 Agent
-                    // 无租约路径同型；actor 侧 validate_ctx 兼容空 lease_id）
+                    // Admit approved writes on a free DUT without requiring a lease.
+                    // Queue admission adds a generation context with an empty lease ID.
+                    // The actor checks that context just like the unleased Agent compatibility path.
                     None => Ok(None),
                 }
             }
@@ -1326,8 +1470,10 @@ impl LeaseAuthority for ControlLeaseManager {
                         queue_len: st.queue.len(),
                     }),
                     None => {
-                        // 无 GUI 租约：现场获取短租约，执行后释放（方案 §7.1）
-                        let grant = self.grant_free(st, dut_id, &LeaseHolder::Gui, now, 0);
+                        // Acquire a temporary GUI lease and release it after this action.
+                        let gui_session = self.default_session_name(dut_id, &LeaseHolder::Gui);
+                        let grant =
+                            self.grant_free(st, dut_id, &LeaseHolder::Gui, &gui_session, now, 0);
                         Ok(ControlAdmission {
                             ctx: Some(WriteCtx {
                                 lease_id: grant.lease_id.clone(),
@@ -1339,7 +1485,7 @@ impl LeaseAuthority for ControlLeaseManager {
                 }
             }
             other => {
-                // Agent / System：与写入同规则（System 只在 Protected 拒）
+                // Use write admission for Agent and system actions.
                 let ctx = self.admit_write(dut_id, other)?;
                 Ok(ControlAdmission {
                     ctx,
@@ -1363,7 +1509,7 @@ impl LeaseAuthority for ControlLeaseManager {
     }
 
     fn release_temporary(&self, dut_id: &str, ctx: &WriteCtx) {
-        // 幂等：租约已过期/已被接管时静默忽略
+        // Release is idempotent after expiration or takeover.
         let _ = self.release(dut_id, &ctx.lease_id);
     }
 }
@@ -1394,6 +1540,9 @@ mod tests {
 
         manager.set_manual_control(true).unwrap();
         assert!(manager.manual_control());
+        let manual_status = manager.status("dut-b");
+        assert_eq!(manual_status.session_name.as_deref(), Some("人工接管"));
+        assert!(manual_status.acquired_at_unix_ms.is_some());
         assert!(manager.acquire("dut-b", &agent, None).is_err());
         assert!(manager.admit_write("dut-a", &previous_lease).is_err());
         assert!(
@@ -1414,6 +1563,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lease_records_session_name_and_acquired_timestamp() {
+        let manager = manager();
+        let agent = LeaseHolder::Agent {
+            agent_name: "planner".into(),
+            credential_id: "cred-1".into(),
+        };
+        assert!(validate_session_name("   ").is_err());
+        assert!(validate_session_name("bad\nname").is_err());
+        assert_eq!(
+            validate_session_name("  stress-run-01 ").unwrap(),
+            "stress-run-01"
+        );
+
+        let grant = manager
+            .acquire_with_session("dut-1", &agent, "stress-run-01", None)
+            .unwrap();
+        assert_eq!(grant.session_name, "stress-run-01");
+        assert!(grant.acquired_at_unix_ms > 0);
+
+        let status = manager.status_with_clock("dut-1", || grant.acquired_at_unix_ms + 12_500);
+        assert_eq!(status.phase, LeasePhase::Held);
+        assert_eq!(status.session_name.as_deref(), Some("stress-run-01"));
+        assert_eq!(status.acquired_at_unix_ms, Some(grant.acquired_at_unix_ms));
+        assert_eq!(status.occupied_secs, Some(12));
+
+        manager.release("dut-1", &grant.lease_id).unwrap();
+        let free = manager.status("dut-1");
+        assert_eq!(free.phase, LeasePhase::Free);
+        assert_eq!(free.session_name, None);
+        assert_eq!(free.acquired_at_unix_ms, None);
+        assert_eq!(free.occupied_secs, None);
+    }
+
     fn manager() -> ControlLeaseManager {
         ControlLeaseManager::new(Some(AuditSink::memory())).with_ttl(Duration::from_secs(120))
     }
@@ -1424,7 +1607,7 @@ mod tests {
         let g1 = m.acquire("dut", &LeaseHolder::Gui, None).unwrap();
         assert_eq!(g1.generation, 1);
         assert!(g1.lease_id.starts_with("lease-"));
-        // INV-01：第二个持有者必须 Busy，且消息带持有者
+        // A second holder is refused and the response identifies the first one.
         let err = m
             .acquire(
                 "dut",
@@ -1437,18 +1620,18 @@ mod tests {
             .unwrap_err();
         match err {
             LeaseError::Busy { holder, .. } => assert!(holder.contains("GUI"), "{holder}"),
-            other => panic!("期望 Busy，得到 {other:?}"),
+            other => panic!("Expected Busy, got {other:?}"),
         }
-        // renew 不变代数
+        // Renewal preserves the generation.
         let g1r = m.renew("dut", &g1.lease_id).unwrap();
         assert_eq!(g1r.generation, 1);
         assert!(g1r.expires_at_unix_ms >= g1.expires_at_unix_ms);
-        // release → 再次 acquire → generation+1（INV-04 基础）
+        // Releasing and acquiring again increments the generation.
         m.release("dut", &g1.lease_id).unwrap();
         let g2 = m.acquire("dut", &LeaseHolder::Gui, None).unwrap();
         assert_eq!(g2.generation, 2);
         assert_ne!(g2.lease_id, g1.lease_id);
-        // 旧代数句柄验证：新租约在场 → 旧句柄 NotHolder（不是本人）
+        // The old holder no longer owns the current grant.
         assert!(matches!(
             m.validate("dut", &g1.lease_id, 1),
             Err(LeaseError::NotHolder)
@@ -1459,8 +1642,8 @@ mod tests {
     fn ttl_expiry_is_lazy_and_renew_of_expired_is_expired() {
         let m =
             ControlLeaseManager::new(Some(AuditSink::memory())).with_ttl(Duration::from_millis(60));
-        // P3-023 后 GUI 租约不做 TTL 过期：本用例改用 Agent 持有者验证 TTL
-        // 惰性过期机制（对照组），GUI 免过期行为见 gui_lease_does_not_expire。
+        // Use an Agent lease to test lazy TTL expiration.
+        // A separate test covers the automatic GUI lease exemption.
         let g = m
             .acquire(
                 "dut",
@@ -1471,38 +1654,42 @@ mod tests {
                 None,
             )
             .unwrap();
-        let status_held = m.status("dut");
+        let expiry = g.expires_at_unix_ms;
+        let status_held = m.status_with_clock("dut", || expiry - 1);
         assert_eq!(status_held.phase, LeasePhase::Held);
-        std::thread::sleep(Duration::from_millis(90));
-        // 先 renew：租约还在（惰性过期未触发）→ 明确的 Expired（区分 UnknownLease）
-        assert_eq!(m.renew("dut", &g.lease_id), Err(LeaseError::Expired));
-        // status 触发惰性过期 → Free
-        let status = m.status("dut");
+
+        // Renewal detects expiration even if no status read has processed it.
+        let after_expiry = || expiry + 1;
+        assert_eq!(
+            m.renew_with_clock("dut", &g.lease_id, after_expiry),
+            Err(LeaseError::Expired)
+        );
+        let status = m.status_with_clock("dut", after_expiry);
         assert_eq!(status.phase, LeasePhase::Free);
-        // 过期清理后同一句柄写入复核 → UnknownLease
+        // After cleanup, the expired handle no longer identifies a lease.
         assert_eq!(
             m.validate("dut", &g.lease_id, g.generation),
             Err(LeaseError::UnknownLease)
         );
     }
 
-    /// P3-023：GUI 自动租约不做 TTL 过期——推进到过期点之后 status 仍 Held，
-    /// Agent acquire 仍 Busy（「GUI 在场→拒 Agent」防线不随 120s TTL 失效）。
+    /// Automatic GUI leases stay held beyond the normal TTL.
+    /// Agent acquisition remains blocked while the human operator holds the lease.
     #[test]
     fn gui_lease_does_not_expire_and_keeps_blocking_agent() {
         let m = ControlLeaseManager::new(Some(AuditSink::memory()))
             .with_ttl(Duration::from_millis(60))
             .with_gui_session_lifetime();
         let grant = m.acquire("dut", &LeaseHolder::Gui, None).unwrap();
-        // 双保险：GUI 授予的到期时刻为 u64::MAX
+        // The GUI grant uses the maximum expiry timestamp.
         assert_eq!(grant.expires_at_unix_ms, u64::MAX);
         std::thread::sleep(Duration::from_millis(90));
-        // 每帧 status 轮询触发的惰性清理不得清掉 GUI 租约
+        // Repeated status checks must leave the GUI grant active.
         let status = m.status("dut");
         assert_eq!(status.phase, LeasePhase::Held);
         assert_eq!(status.holder.as_deref(), Some("GUI（人类在场）"));
         assert_eq!(status.remaining_secs, None);
-        // Agent acquire 得 Busy（防线在 TTL 之外仍然生效）
+        // The GUI still takes precedence after the ordinary TTL has elapsed.
         let err = m
             .acquire(
                 "dut",
@@ -1514,9 +1701,9 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, LeaseError::Busy { .. }), "{err:?}");
-        // GUI 写入复核（admit）仍放行
+        // GUI writes remain admitted.
         assert!(m.admit_write("dut", &WriteIdentity::gui()).is_ok());
-        // 释放路径不变：GUI 释放后恢复 Free
+        // Explicitly releasing the GUI grant frees the DUT.
         m.release_for_holder("dut", &LeaseHolder::Gui);
         assert_eq!(m.status("dut").phase, LeasePhase::Free);
     }
@@ -1533,7 +1720,7 @@ mod tests {
             agent_name: "bot-b".into(),
             credential_id: "cred".into(),
         };
-        // 两个等待者：a 先 b 后（FIFO）
+        // Queue two waiters in FIFO order.
         let h = {
             let m = m.clone();
             let holder = agent_a.clone();
@@ -1548,13 +1735,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(m.status("dut").queue_len, 2);
         m.release("dut", &g1.lease_id).unwrap();
-        // FIFO：先释放授予先排队者
+        // Releasing the lease grants the first waiter.
         let ga = h.join().unwrap().unwrap();
         assert_eq!(ga.holder, "Agent bot-a");
         m.release("dut", &ga.lease_id).unwrap();
         let gb = h2.join().unwrap().unwrap();
         assert_eq!(gb.holder, "Agent bot-b");
-        assert!(ga.generation < gb.generation, "两次授予代数必须递增");
+        assert!(
+            ga.generation < gb.generation,
+            "generation must strictly increase across grants"
+        );
     }
 
     #[test]
@@ -1569,18 +1759,19 @@ mod tests {
         let err = m
             .acquire("dut", &agent, Some(Duration::from_millis(80)))
             .unwrap_err();
-        // P2-019：等待超时是专用变体（不再把状态词塞进 Busy.holder）
+        // Distinguish a queue deadline from a busy holder.
         assert!(matches!(err, LeaseError::WaitTimeout { .. }), "{err:?}");
         assert!(
-            err.message().contains("等待控制权超时"),
-            "消息必须表达等待超时：{}",
+            err.message()
+                .contains("Timed out waiting for the control lease"),
+            "error message must indicate wait timeout: {}",
             err.message()
         );
         assert!(
             started.elapsed() >= Duration::from_millis(70),
-            "必须等到截止"
+            "must wait until the deadline"
         );
-        // 取消排队：外部经 pending_wait_requests 拿到 request_id 后取消
+        // Cancel the waiter using the request ID returned by the queue listing.
         let waiter_thread = {
             let m = m.clone();
             let holder = agent.clone();
@@ -1591,10 +1782,13 @@ mod tests {
         let request_id = *m
             .pending_wait_requests("dut")
             .first()
-            .expect("排队中应可取到 request_id");
-        assert!(m.cancel_wait("dut", request_id), "取消必须移除等待者");
+            .expect("pending waiter should expose a request_id");
+        assert!(
+            m.cancel_wait("dut", request_id),
+            "cancel_wait must remove the queued waiter"
+        );
         assert_eq!(m.status("dut").queue_len, 0);
-        // 被取消的等待者最终超时（无人授予）
+        // A cancelled acquisition exits without receiving a grant.
         assert!(waiter_thread.join().unwrap().is_err());
         assert!(matches!(
             m.status("dut").phase,
@@ -1637,7 +1831,7 @@ mod tests {
             m.force_takeover("dut"),
             Err(LeaseError::Protected { .. })
         ));
-        // exit(ok) → Free；exit(unknown) → NeedsInspection → 人工确认 → Free
+        // Successful completion frees the DUT. Uncertain completion requires manual inspection first.
         m.exit_protected("dut", true).unwrap();
         assert_eq!(m.status("dut").phase, LeasePhase::Free);
         let g2 = m.acquire("dut", &LeaseHolder::Gui, None).unwrap();
@@ -1657,7 +1851,7 @@ mod tests {
     fn restart_invalidates_all_leases() {
         let m1 = manager();
         let g = m1.acquire("dut", &LeaseHolder::Gui, None).unwrap();
-        // INV-07：新管理器（进程重启）对旧句柄一律 UnknownLease
+        // A fresh manager rejects handles from before a restart.
         let m2 = manager();
         assert_eq!(
             m2.validate("dut", &g.lease_id, g.generation),
@@ -1675,14 +1869,14 @@ mod tests {
             credential_id: "cred".into(),
         };
         let g_agent = m.acquire("dut", &agent, None).unwrap();
-        // Agent 持有期间 GUI 写入被拒（INV-01 另一侧）
+        // An Agent lease prevents GUI writes until control changes hands.
         assert!(matches!(
             m.admit_write("dut", &WriteIdentity::gui()),
             Err(LeaseError::Busy { .. })
         ));
         let g_gui = m.force_takeover("dut").unwrap();
         assert!(g_gui.generation > g_agent.generation);
-        // 旧持有者句柄失效：新租约（GUI）在场 → Busy 指向 GUI（INV-04 fencing 另一侧）
+        // After takeover, the prior holder's write reports the current GUI holder.
         assert!(matches!(
             m.admit_write(
                 "dut",
@@ -1690,7 +1884,7 @@ mod tests {
             ),
             Err(LeaseError::Busy { .. })
         ));
-        // GUI 现在可以写
+        // The GUI can now write.
         assert!(m.admit_write("dut", &WriteIdentity::gui()).is_ok());
     }
 
@@ -1698,18 +1892,18 @@ mod tests {
     fn auth_enabled_requires_agent_lease_and_two_duts_are_independent() {
         let m = manager();
         m.set_auth_enabled(true);
-        // auth ON：无租约 Agent 写 → LeaseRequired
+        // With authentication on, an Agent must provide a lease.
         assert!(matches!(
             m.admit_write("dut-a", &WriteIdentity::agent(None, None)),
             Err(LeaseError::LeaseRequired)
         ));
         m.set_auth_enabled(false);
-        // auth OFF（默认）：无租约 Agent 写放行（过渡，偏差 7）
+        // With authentication off, an unleased write uses the compatibility path.
         assert_eq!(
             m.admit_write("dut-a", &WriteIdentity::agent(None, None)),
             Ok(None)
         );
-        // INV-06：跨 DUT 并行互不阻塞
+        // Separate DUTs can be controlled independently.
         let ga = m.acquire("dut-a", &LeaseHolder::Gui, None).unwrap();
         let gb = m.acquire("dut-b", &LeaseHolder::Gui, None).unwrap();
         assert_eq!(ga.generation, 1);
@@ -1725,7 +1919,7 @@ mod tests {
             credential_id: "cred".into(),
         };
         let g = m.acquire("dut", &agent, None).unwrap();
-        // GUI 拒、Agent 本人放行、System（心跳）静默被拒（Agent 控制期）
+        // The active Agent can write. GUI input and the heartbeat are blocked.
         assert!(matches!(
             m.admit_write("dut", &WriteIdentity::gui()),
             Err(LeaseError::Busy { .. })
@@ -1741,18 +1935,18 @@ mod tests {
             )
             .is_ok()
         );
-        // 错误代数 → Generation fencing
+        // Reject an obsolete generation even for the current holder.
         assert!(matches!(
             m.admit_write("dut", &WriteIdentity::agent(Some(g.lease_id), Some(999))),
             Err(LeaseError::Generation { .. })
         ));
-        // 换 GUI 持有：System 放行（人类在场心跳照发）
+        // A GUI lease allows the system heartbeat.
         m.force_takeover("dut").unwrap();
         assert_eq!(m.admit_write("dut", &WriteIdentity::system()), Ok(None));
     }
 
-    /// P1-014 器件层前置：Approval 写身份的 admit 规则——Free 放行（空租约
-    /// 纪元 fence）、任何在场租约（Agent/GUI）Busy 指向持有者、人工接管拒。
+    /// Approved writes to a free DUT are fenced by generation without a lease ID.
+    /// Any active holder or manual takeover blocks approval writes.
     #[test]
     fn approval_identity_admission_rules() {
         let m = manager();
@@ -1760,40 +1954,43 @@ mod tests {
             agent_name: "bot".into(),
             credential_id: "cred".into(),
         };
-        // Free：放行，admit_queued_write 补空租约纪元 fence
+        // Queue admission adds a generation fence to the free-state write.
         let ctx = m
             .admit_queued_write("dut-a", &WriteIdentity::approval())
             .unwrap()
-            .expect("Free 时必须有 fence ctx");
-        assert_eq!(ctx.lease_id, "", "审批写无租约句柄");
-        assert_eq!(ctx.generation, 0, "纪元 fence：未接管时 manual_epoch=0");
+            .expect("free state must return a fence context");
+        assert_eq!(ctx.lease_id, "", "approval write has no lease handle");
+        assert_eq!(
+            ctx.generation, 0,
+            "epoch fence: manual_epoch must be 0 before any takeover"
+        );
         assert!(
             m.validate_ctx("dut-a", &ctx).is_ok(),
-            "fence 必须通过 actor 复核"
+            "fence must pass actor revalidation"
         );
 
-        // Agent 持租约 → Busy 指向持有者
+        // An active Agent lease is reported as busy with the Agent holder.
         let grant = m.acquire("dut-a", &agent, None).unwrap();
         let err = m
             .admit_write("dut-a", &WriteIdentity::approval())
             .unwrap_err();
         match err {
             LeaseError::Busy { holder, .. } => assert_eq!(holder, "Agent bot"),
-            other => panic!("期望 Busy，得到 {other:?}"),
+            other => panic!("Expected Busy, got {other:?}"),
         }
-        // GUI 持租约 → 同样 Busy 指向 GUI
+        // An active GUI lease is likewise reported as busy with that holder.
         m.force_takeover("dut-a").unwrap();
         let err = m
             .admit_write("dut-a", &WriteIdentity::approval())
             .unwrap_err();
         match err {
             LeaseError::Busy { holder, .. } => assert!(holder.contains("GUI")),
-            other => panic!("期望 Busy，得到 {other:?}"),
+            other => panic!("Expected Busy, got {other:?}"),
         }
         m.release_for_holder("dut-a", &LeaseHolder::Gui);
         assert!(grant.lease_id.starts_with("lease-"));
 
-        // 硬件动作结束前接管必须等待，之后审批写仍受人工接管限制。
+        // Takeover waits for in-flight hardware work. Manual control then blocks approval writes.
         let action = m.begin_agent_action().unwrap();
         assert!(matches!(
             m.set_manual_control(true),
@@ -1806,26 +2003,27 @@ mod tests {
             .unwrap_err();
         match err {
             LeaseError::Busy { holder, .. } => assert_eq!(holder, "人工接管"),
-            other => panic!("期望 manual Busy，得到 {other:?}"),
+            other => panic!("Expected Busy during manual control, got {other:?}"),
         }
-        // 纪元 fence 在接管后失效（generation 已过时）
+        // A takeover invalidates the earlier generation fence.
         assert!(m.validate_ctx("dut-a", &ctx).is_err());
     }
 
-    /// P2-019 同族：FIFO 公平拒绝（lease=None 且队列有其他等待者的防御分支）
-    /// 用 `QueuedAhead` 表述——不把队列状态词当持有者名。该状态经公开 API 不可
-    /// 稳定构造（`grant_to_queue_head` 在释放/过期后立即授予或清空队列），此处
-    /// 直接断言两个新变体的文案面。
+    /// A free lease slot can still have waiters, so fairness errors use their own variant.
+    /// `QueuedAhead` carries queue state without implying a current holder.
+    /// `grant_to_queue_head` normally resolves that intermediate state before callers observe it.
+    /// Check the wording of both queue errors directly.
     #[test]
     fn wait_timeout_and_queued_ahead_messages_are_self_explanatory() {
         let timeout = LeaseError::WaitTimeout { queue_len: 1 };
         assert_eq!(
             timeout.message(),
-            "等待控制权超时：租约仍被他人持有（等待队列 1）"
+            "Timed out waiting for the control lease (queue length: 1)"
         );
         let ahead = LeaseError::QueuedAhead { queue_len: 2 };
         assert!(
-            ahead.message().contains("2 个请求在等待队列中") && ahead.message().contains("插队"),
+            ahead.message().contains("2 requests are queued ahead")
+                && ahead.message().contains("wait=true"),
             "{}",
             ahead.message()
         );

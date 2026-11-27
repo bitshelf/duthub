@@ -322,6 +322,7 @@ impl InstallFailure {
             ToolInstallError::MissingArchiveEntry { .. } => InstallFailureKind::MissingArchiveEntry,
             ToolInstallError::ChecksumMismatch { .. } => InstallFailureKind::ChecksumMismatch,
             ToolInstallError::Manifest { .. } => InstallFailureKind::ManifestCorrupt,
+            _ => InstallFailureKind::Internal,
         };
         InstallFailure {
             kind,

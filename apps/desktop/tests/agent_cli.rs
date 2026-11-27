@@ -147,7 +147,7 @@ fn cli_profile_streams_ndjson_and_persists_resume() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-cli"),
-        "CLI 会话未就绪：{:?} stderr={}",
+        "CLI session did not become ready: {:?} stderr={}",
         host.view("dut-cli").map(|view| view.status()),
         host.view("dut-cli")
             .map_or_default(|view| view.stderr_tail())
@@ -155,7 +155,7 @@ fn cli_profile_streams_ndjson_and_persists_resume() {
     host.prompt("dut-cli", "hello duthub").unwrap();
     assert!(
         wait_ready(&mut host, "dut-cli"),
-        "CLI 一轮未结束：{:?} stderr={}",
+        "CLI turn did not finish: {:?} stderr={}",
         host.view("dut-cli").map(|view| view.status()),
         host.view("dut-cli")
             .map_or_default(|view| view.stderr_tail())
@@ -168,14 +168,14 @@ fn cli_profile_streams_ndjson_and_persists_resume() {
             .iter()
             .any(|entry| entry.kind == TranscriptKind::Agent
                 && entry.text.contains("fixture says hello")),
-        "assistant 文本必须进入 transcript: {entries:?}"
+        "assistant text must enter transcript: {entries:?}"
     );
     assert!(
         entries
             .iter()
             .any(|entry| entry.kind == TranscriptKind::System
                 && entry.text.contains("本轮结束（success）")),
-        "result 事件必须留下本轮结束注记: {entries:?}"
+        "result event must record turn-finished system note: {entries:?}"
     );
 
     let paths = sandbox::prepare(&work, "dut-cli").unwrap();
@@ -222,7 +222,7 @@ fn cli_parses_user_tool_results_mcp_errors_and_plan_denials() {
             .any(|entry| entry.kind == TranscriptKind::Tool
                 && entry.text.contains("工具结果")
                 && entry.text.contains("boot log line")),
-        "user/tool_result 必须进入 transcript: {all}"
+        "user/tool_result must enter transcript: {all}"
     );
     assert!(
         entries
@@ -230,23 +230,23 @@ fn cli_parses_user_tool_results_mcp_errors_and_plan_denials() {
             .any(|entry| entry.kind == TranscriptKind::Error
                 && entry.text.contains("MCP 连接错误")
                 && entry.text.contains("connection refused")),
-        "mcp_server_errors 必须可见: {all}"
+        "mcp_server_errors must be visible: {all}"
     );
     assert!(
         all.contains("权限拒绝（plan 模式）") && all.contains("Bash"),
-        "permission_denials 必须可见: {all}"
+        "permission_denials must be visible: {all}"
     );
     assert!(
         all.contains("duthub 工具 2 个"),
-        "init tools[] 必须报告 duthub 工具面: {all}"
+        "init tools[] must report duthub tool surface: {all}"
     );
     assert!(
         all.contains("未处理的 CLI 事件: rate_limit_event"),
-        "合法但未渲染的事件类型应标注为未处理，而非协议噪声: {all}"
+        "valid unrendered event type should be noted as unhandled rather than protocol noise: {all}"
     );
     assert!(
         !all.contains("忽略非 NDJSON stdout"),
-        "合法 user/未知事件不得被记为协议噪声: {all}"
+        "valid user/unknown events must not be logged as protocol noise: {all}"
     );
 
     host.stop("dut-cli");
@@ -277,7 +277,7 @@ fn cli_resume_uses_session_id_on_second_turn() {
     assert!(first.contains("-p"), "{first}");
     assert!(
         !first.contains("--resume"),
-        "第一轮不得带 --resume: {first}"
+        "first turn must not pass --resume: {first}"
     );
 
     host.prompt("dut-cli", "second turn").unwrap();
@@ -287,15 +287,15 @@ fn cli_resume_uses_session_id_on_second_turn() {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    assert_eq!(lines.len(), 2, "每轮必须 spawn 一次 CLI: {second}");
+    assert_eq!(lines.len(), 2, "each turn must spawn CLI once: {second}");
     assert!(
         !lines[0].contains("--resume"),
-        "第一轮必须新建会话: {}",
+        "first turn must start a fresh session: {}",
         lines[0]
     );
     assert!(
         lines[1].contains("--resume") && lines[1].contains("sess-cli-1"),
-        "第二轮必须用 result 事件里的 session id resume: {}",
+        "second turn must resume with session id from result event: {}",
         lines[1]
     );
 
@@ -318,7 +318,7 @@ fn cli_resume_uses_session_id_on_second_turn() {
     assert_eq!(
         restarted.view("dut-cli").unwrap().session_id().as_deref(),
         Some("sess-cli-1"),
-        "新会话必须从 resume.json 恢复 session id"
+        "new session must restore session id from resume.json"
     );
     restarted.prompt("dut-cli", "third turn").unwrap();
     assert!(wait_ready(&mut restarted, "dut-cli"));
@@ -327,10 +327,10 @@ fn cli_resume_uses_session_id_on_second_turn() {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    assert_eq!(lines.len(), 3, "每轮必须 spawn 一次 CLI: {resumed}");
+    assert_eq!(lines.len(), 3, "each turn must spawn CLI once: {resumed}");
     assert!(
         lines[2].contains("--resume") && lines[2].contains("sess-cli-1"),
-        "重启后的第一轮必须用持久化的 session id resume: {}",
+        "first turn after restart must resume with persisted session id: {}",
         lines[2]
     );
 
@@ -358,17 +358,17 @@ fn cli_mcp_config_uses_env_token_not_literal() {
     assert!(args.contains("--mcp-config"), "{args}");
     assert!(
         plan.env.is_empty(),
-        "plan 不得自带 token；worker 以环境变量注入: {:?}",
+        "plan must not carry token; worker injects it via env: {:?}",
         plan.env
     );
     let config = std::fs::read_to_string(&plan.mcp_config).unwrap();
     assert!(
         config.contains("${DUTHUB_AGENT_TOKEN}"),
-        "MCP config 必须用 env 展开: {config}"
+        "MCP config must use env expansion: {config}"
     );
     assert!(
         !config.contains("Bearer dth-"),
-        "MCP config 不得含字面 token: {config}"
+        "MCP config must not contain literal token: {config}"
     );
 
     // Worker-level contract: the child sees DUTHUB_AGENT_TOKEN, and the
@@ -391,18 +391,18 @@ fn cli_mcp_config_uses_env_token_not_literal() {
         .to_owned();
     assert!(
         token.starts_with("dth-"),
-        "子进程必须收到 MCP token: {token:?}"
+        "child process must receive MCP token: {token:?}"
     );
     let config = std::fs::read_to_string(paths.sandbox.join(cli::MCP_CONFIG_FILE_NAME)).unwrap();
     assert!(
         !config.contains(&token),
-        "MCP config 不得把 token 落盘: {config}"
+        "MCP config must not persist token on disk: {config}"
     );
     assert!(
         !std::fs::read_to_string(paths.sandbox.join("argv.log"))
             .unwrap()
             .contains(&token),
-        "MCP token 不得进入 argv"
+        "MCP token must not appear in argv"
     );
 
     host.stop("dut-cli");
@@ -431,10 +431,9 @@ fn cli_stop_kills_process_tree() {
     let heartbeat = paths.sandbox.join("heartbeat.log");
     assert!(
         wait_until(Duration::from_secs(20), || {
-            std::fs::metadata(&heartbeat)
-                .is_ok_and(|metadata| metadata.len() > 0)
+            std::fs::metadata(&heartbeat).is_ok_and(|metadata| metadata.len() > 0)
         }),
-        "孙进程心跳没有启动（fixture 未运行）"
+        "grandchild heartbeat did not start (fixture did not run)"
     );
 
     host.stop("dut-cli");
@@ -446,7 +445,7 @@ fn cli_stop_kills_process_tree() {
     let after = std::fs::metadata(&heartbeat).unwrap().len();
     assert_eq!(
         before, after,
-        "host.stop 后仍有孙进程在写心跳（进程树没有被 Job 终止）"
+        "grandchild still writing heartbeat after host.stop (process tree not terminated by Job)"
     );
 
     drop(host);
@@ -605,7 +604,7 @@ fn cli_real_claude_expands_mcp_token_from_env() {
     );
     assert!(
         good_text.contains("Connected"),
-        "真实 CLI 未能用 DUTHUB_AGENT_TOKEN 连接 duthub MCP: {good_text}"
+        "real CLI failed to connect to duthub MCP using DUTHUB_AGENT_TOKEN: {good_text}"
     );
 
     // Diagnostic only: as of Claude Code 2.1.204 + rmcp 3.10.0 this reports
@@ -628,11 +627,11 @@ fn cli_real_claude_expands_mcp_token_from_env() {
     eprintln!("MCP GET: {get_text}");
     assert!(
         get_text.contains("Bearer ${DUTHUB_AGENT_TOKEN}"),
-        "真实 CLI 读取到的 header 必须是 env 占位符: {get_text}"
+        "header read by real CLI must be the env placeholder: {get_text}"
     );
     assert!(
         get_text.contains("Connected"),
-        "真实 CLI 未连上 duthub listener: {get_text}"
+        "real CLI did not connect to duthub listener: {get_text}"
     );
 
     let bad = claude_mcp_list(&program, &project, &config_dir, "dth-wrong-token");
@@ -643,7 +642,7 @@ fn cli_real_claude_expands_mcp_token_from_env() {
     );
     assert!(
         !bad_text.contains("Connected"),
-        "错误 token 不应连接成功（认证未生效）: {bad_text}"
+        "wrong token must not connect successfully (auth not enforced): {bad_text}"
     );
 
     drop(listener);
@@ -683,7 +682,7 @@ fn cli_live_claude_exposes_thirteen_plan_tools() {
         .unwrap();
     assert!(
         wait_ready_for(&mut host, "dut-cli", Duration::from_secs(120)),
-        "real CLI 未就绪：{:?} stderr={}",
+        "real CLI did not become ready: {:?} stderr={}",
         host.view("dut-cli").map(|view| view.status()),
         host.view("dut-cli")
             .map_or_default(|view| view.stderr_tail())
@@ -692,7 +691,7 @@ fn cli_live_claude_exposes_thirteen_plan_tools() {
         .unwrap();
     assert!(
         wait_ready_for(&mut host, "dut-cli", Duration::from_secs(300)),
-        "real CLI 一轮未结束：{:?} stderr={}",
+        "real CLI turn did not finish: {:?} stderr={}",
         host.view("dut-cli").map(|view| view.status()),
         host.view("dut-cli")
             .map_or_default(|view| view.stderr_tail())
@@ -706,12 +705,12 @@ fn cli_live_claude_exposes_thirteen_plan_tools() {
         .join("\n");
     assert!(
         system.contains("duthub 工具 13 个"),
-        "real init 未报告 13 个 duthub Plan 工具: {system}"
+        "real init did not report 13 duthub Plan tools: {system}"
     );
     for tool in cli::PLAN_TOOLS {
         assert!(
             system.contains(tool),
-            "real init 缺少 Plan 工具 {tool}: {system}"
+            "real init missing Plan tool {tool}: {system}"
         );
     }
 

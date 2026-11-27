@@ -276,7 +276,10 @@ mod tests {
             .iter()
             .filter(|entry| entry.text.contains("8 MiB"))
             .count();
-        assert_eq!(notes, 1, "上限注记只能由写线程回写一次");
+        assert_eq!(
+            notes, 1,
+            "The upper limit annotation can only be written back by the writing thread once."
+        );
         let _ = std::fs::remove_file(&path);
     }
 

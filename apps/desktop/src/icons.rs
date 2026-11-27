@@ -1,4 +1,4 @@
-//! 图标资产（1:1 移植自原型 SVG sprite）+ gpui `AssetSource`。
+//! Icon assets (ported from prototype SVG sprites in a 1:1 ratio) + gpui `AssetSource`.
 
 use std::borrow::Cow;
 
@@ -27,22 +27,25 @@ const EXTRA_ICONS: &[(&str, &str)] = &[
     ),
 ];
 
-/// `icon("menu")` → gpui svg 元素（颜色由 `.text_color()` 控制，尺寸由 `.size()` 控制）。
+/// `icon("menu")` → gpui svg element (color controlled by `.text_color()`, size controlled by
+/// `.size()`).
 pub fn icon(name: &str) -> Svg {
     svg().path(format!("icons/{name}.svg"))
 }
 
-/// kit Icon 包装：复用 sprite 资产路径（经全局 `AssetSource` 解析），可进 kit Button 等容器。
+/// Kit Icon packaging: Uses the same sprite asset path as before (resolved through the global
+/// `AssetSource`). This makes it suitable for use in containers like Kit Button.
 pub fn kit_icon(name: &str) -> gpui_kit::component::Icon {
     gpui_kit::component::Icon::empty().path(format!("icons/{name}.svg"))
 }
 
-/// gpui AssetSource：从编译期嵌入的图标表读取（无文件系统依赖）。
+/// GPUI `AssetSource`: Reads from the icon table embedded during compilation process (no dependency
+/// on the file system).
 pub struct IconAssets;
 
 impl gpui_kit::AssetSource for IconAssets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
-        // 首页品牌图（gen-icon.mjs 生成）
+        // Home Page Brand Images (Generated from gen Icon.mjs)
         if path == "brand/app-256.png" {
             return Ok(Some(Cow::Borrowed(include_bytes!("../assets/app-256.png"))));
         }
@@ -64,7 +67,8 @@ impl gpui_kit::AssetSource for IconAssets {
         };
         match lookup(name) {
             Some(doc) => Ok(Some(Cow::Borrowed(doc.as_bytes()))),
-            // kit 内嵌 Lucide 图标回退（TitleBar 窗口控制钮等 kit 自用图标）
+            // The kit includes embedded Lucide icons for use in TitleBar windows and other
+            // purposes.
             None => kit_fallback(path),
         }
     }
@@ -87,7 +91,8 @@ fn lookup(name: &str) -> Option<&'static str> {
         .map(|(_, doc)| *doc)
 }
 
-/// kit 内嵌资产回退（gpui-kit-assets 的 Lucide 全集）。
+/// Kit includes embedded assets for rollback purposes (complete set of Lucide components for
+/// gpui-kit-assets).
 fn kit_fallback(path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
     gpui_kit::AssetSource::load(&gpui_kit::assets::Assets, path)
 }
@@ -109,7 +114,10 @@ mod tests {
         assert!(lookup("not-exist").is_none());
         // Every SVG carries a root stroke so GPUI can tint it via text_color.
         for (name, doc) in ICONS.iter().chain(EXTRA_ICONS.iter()) {
-            assert!(doc.contains("stroke=\"#000\""), "icon {name} 缺少根 stroke");
+            assert!(
+                doc.contains("stroke=\"#000\""),
+                "The icon {name} lacks a root stroke element."
+            );
         }
     }
 }

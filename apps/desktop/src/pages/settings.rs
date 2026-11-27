@@ -1,7 +1,12 @@
-use super::{Workbench, Palette, Window, Context, IntoElement, Styled, div, px, ParentElement, SharedString, StatefulInteractiveElement, FluentBuilder, In, btn, BtnVariant, AppContext, field, InteractiveElement, switch_panel_header, toggle, collapsible_panel, Div, panel_head, subtle, IpAddr, SocketAddr, Ipv4Addr, icon_btn, Stateful, DutAction, chip, copy_text, LeasePhase, A2aStatus, icon};
+use super::{
+    A2aStatus, BtnVariant, Context, Div, DutAction, FluentBuilder, In, InteractiveElement,
+    IntoElement, IpAddr, Ipv4Addr, LeasePhase, Palette, ParentElement, SharedString, SocketAddr,
+    Stateful, StatefulInteractiveElement, Styled, Window, Workbench, btn, chip, collapsible_panel,
+    copy_text, div, field, icon, icon_btn, panel_head, px, subtle, switch_panel_header, toggle,
+};
 
 // ---------------------------------------------------------------------------
-// 设置
+// Setting up
 // ---------------------------------------------------------------------------
 
 pub fn render_settings(
@@ -420,93 +425,152 @@ pub(super) fn alerts_panel(
     }
     let garbled_on = w.dut_garbled_detection(&id).enabled;
     let garbled_id = id.clone();
-    let mut rows = div().flex().flex_col().gap(px(10.)).child(setting_row(
-        label("serialGarbledTitle"),
-        label("serialGarbledHint"),
-        toggle("opt-serial-garbled", garbled_on, p).on_click(cx.listener(
-            move |this, checked, _, cx| {
-                this.edit_dut_garbled_detection(&garbled_id, *checked);
-                cx.notify();
-            },
-        )),
-        p,
-    ));
-    let source_toggles = [
-        (
-            "opt-alert-relay",
-            "relayAlertTitle",
-            "relayAlertHint",
-            crate::alerts::AlertSource::Relay,
-        ),
-        (
-            "opt-alert-media",
-            "mediaAlertTitle",
-            "mediaAlertHint",
-            crate::alerts::AlertSource::Media,
-        ),
-        (
-            "opt-alert-usb-debug",
-            "usbDebugAlertTitle",
-            "usbDebugAlertHint",
-            crate::alerts::AlertSource::UsbDebug,
-        ),
-        (
-            "opt-alert-agent-notice",
-            "agentNoticeAlertTitle",
-            "agentNoticeAlertHint",
-            crate::alerts::AlertSource::AgentNotice,
-        ),
-    ];
-    for (toggle_key, title_key, hint_key, source) in source_toggles {
-        let on = !settings
-            .suppressed_sources
-            .iter()
-            .any(|key| key == source.key());
-        let dut_id = id.clone();
-        rows = rows.child(setting_row(
-            label(title_key),
-            label(hint_key),
-            toggle(toggle_key, on, p).on_click(cx.listener(move |this, checked, _, cx| {
-                this.edit_dut_alerts(&dut_id, |cfg| {
-                    if *checked {
-                        cfg.suppressed_sources.retain(|key| key != source.key());
-                    } else if !cfg.suppressed_sources.iter().any(|key| key == source.key()) {
-                        cfg.suppressed_sources.push(source.key().into());
-                    }
-                });
-                cx.notify();
-            })),
-            p,
-        ));
-    }
-    let managed_keys = [
-        crate::alerts::AlertSource::Relay.key(),
-        crate::alerts::AlertSource::Media.key(),
-        crate::alerts::AlertSource::UsbDebug.key(),
-        crate::alerts::AlertSource::AgentNotice.key(),
-    ];
-    let has_other_suppressed = settings
+    let agent_notice_on = !settings
         .suppressed_sources
         .iter()
-        .any(|key| !managed_keys.contains(&key.as_str()));
-    let mut body = rows;
-    if has_other_suppressed {
-        body = body.child(
-            div().pt(px(8.)).child(
-                btn(
-                    "opt-alerts-reset",
-                    label("restoreAlerts"),
-                    &BtnVariant::Tiny,
-                    p,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.edit_dut_alerts(&id, |cfg| cfg.suppressed_sources.clear());
+        .any(|key| key == crate::alerts::AlertSource::AgentNotice.key());
+    let agent_notice_id = id.clone();
+    let mut rows = div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(setting_row(
+            label("serialGarbledTitle"),
+            "",
+            toggle("opt-serial-garbled", garbled_on, p).on_click(cx.listener(
+                move |this, checked, _, cx| {
+                    this.edit_dut_garbled_detection(&garbled_id, *checked);
                     cx.notify();
-                })),
-            ),
-        );
+                },
+            )),
+            p,
+        ))
+        .child(setting_row(
+            label("agentNoticeAlertTitle"),
+            "",
+            toggle("opt-alert-agent-notice", agent_notice_on, p).on_click(cx.listener(
+                move |this, checked, _, cx| {
+                    let source = crate::alerts::AlertSource::AgentNotice;
+                    this.edit_dut_alerts(&agent_notice_id, |cfg| {
+                        if *checked {
+                            cfg.suppressed_sources.retain(|key| key != source.key());
+                        } else if !cfg.suppressed_sources.iter().any(|key| key == source.key()) {
+                            cfg.suppressed_sources.push(source.key().into());
+                        }
+                    });
+                    cx.notify();
+                },
+            )),
+            p,
+        ));
+
+    // Suppressed alert sources: users can manually add any source (including
+    // USB debug, HDMI/capture, relay, etc.) and remove any recorded source
+    // (whether added here or via "Mute this type" in an alert dialog).
+    let available_sources: Vec<crate::alerts::AlertSource> = crate::alerts::AlertSource::all()
+        .iter()
+        .copied()
+        .filter(|source| {
+            !settings
+                .suppressed_sources
+                .iter()
+                .any(|key| key == source.key())
+        })
+        .collect();
+    let add_control: gpui_kit::AnyElement = if available_sources.is_empty() {
+        subtle(label("allSourcesSuppressed"), p).into_any_element()
+    } else {
+        let options: Vec<(String, usize)> = available_sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| (source.label().to_owned(), index))
+            .collect();
+        let add_dut_id = id.clone();
+        let select_sources = available_sources.clone();
+        div()
+            .flex_none()
+            .w(px(214.))
+            .child(w.select_field(
+                "opt-add-suppressed-source",
+                label("addSuppressedSource").to_owned(),
+                options,
+                None,
+                std::sync::Arc::new(
+                    move |this: &mut Workbench,
+                          value: usize,
+                          _win: &mut Window,
+                          cx: &mut Context<Workbench>| {
+                        if let Some(source) = select_sources.get(value).copied() {
+                            this.edit_dut_alerts(&add_dut_id, |cfg| {
+                                if !cfg.suppressed_sources.iter().any(|key| key == source.key()) {
+                                    cfg.suppressed_sources.push(source.key().into());
+                                }
+                            });
+                            cx.notify();
+                        }
+                    },
+                ),
+                p,
+                cx,
+            ))
+            .into_any_element()
+    };
+    rows = rows.child(setting_row(
+        label("suppressedSourcesTitle"),
+        "",
+        add_control,
+        p,
+    ));
+
+    if settings.suppressed_sources.is_empty() {
+        rows = rows.child(subtle(label("noSuppressedSources"), p));
+    } else {
+        let mut chips = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .pt(px(2.));
+        for key in settings.suppressed_sources.clone() {
+            let display = crate::alerts::AlertSource::from_key(&key)
+                .map_or_else(|| key.clone(), |source| source.label().to_owned());
+            let remove_dut_id = id.clone();
+            let remove_key = key.clone();
+            chips = chips.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .pl(px(9.))
+                    .pr(px(5.))
+                    .py(px(3.))
+                    .rounded(px(7.))
+                    .bg(p.raised)
+                    .border_1()
+                    .border_color(p.border)
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(p.text)
+                            .child(SharedString::from(display)),
+                    )
+                    .child(
+                        icon_btn(format!("opt-remove-suppressed-{id}-{key}"), "x", p)
+                            .w(px(20.))
+                            .h(px(20.))
+                            .tooltip(label("removeSuppressedSource"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.edit_dut_alerts(&remove_dut_id, |cfg| {
+                                    cfg.suppressed_sources.retain(|item| item != &remove_key);
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        rows = rows.child(chips);
     }
-    collapsible_panel(header, Some(body), p)
+    collapsible_panel(header, Some(rows), p)
 }
 pub(super) fn settings_panel(
     title_icon: &str,
@@ -564,7 +628,7 @@ pub(super) fn setting_row(
         .child(div().flex_shrink_0().max_w_full().child(control))
 }
 
-/// 设置页「工作目录」面板。
+/// Set the "Working Directory" panel on the page.
 pub(super) fn workspace_dir_panel(
     w: &mut Workbench,
     p: &'static Palette,
@@ -647,7 +711,8 @@ pub(super) fn workspace_dir_panel(
     )
 }
 
-/// 监听器地址标签：局域网开启时同一端口同时接受回环与局域网地址。
+/// Listener Address Tag: When enabled in a local network, the same port can handle both loopback
+/// addresses and local network addresses.
 pub(super) fn listener_endpoint_label(port: u16, lan_ip: Option<IpAddr>) -> String {
     match lan_ip {
         Some(ip) => format!("127.0.0.1:{port} / {ip}:{port}"),
@@ -655,7 +720,8 @@ pub(super) fn listener_endpoint_label(port: u16, lan_ip: Option<IpAddr>) -> Stri
     }
 }
 
-/// 当前若开启局域网访问，返回探测到的本机局域网 IP（用于连接管理展示）。
+/// If LAN access is enabled, the IP address of the local machine detected during the probe process
+/// will be returned (used for connection management purposes).
 pub(super) fn detected_lan_ip(w: &Workbench) -> Option<IpAddr> {
     if !w.settings.agent_access.lan_access {
         return None;
@@ -667,19 +733,24 @@ pub(super) fn detected_lan_ip(w: &Workbench) -> Option<IpAddr> {
     (!endpoint.ip().is_loopback()).then_some(endpoint.ip())
 }
 
-/// 设置页「Agent 接入」面板（访问控制 M1 GUI，方案 §6 第 4 项；按需求只中文）：
-/// auth 总开关与监听配置 → 凭据列表（Token 原文可见 + 复制 + 启停 + 撤销）→
-/// 每凭据 DUT 授权编辑（读/写串口/ADB/继电器/电源/复位/烧录）→
-/// DUT 控制权面板（状态/持有者/剩余 TTL/队列 + 释放/强制接管/安全恢复）→
-/// 审计事件列表（最近 100 条）。
-/// 「Agent 接入」面板（Agent 页）：认证开关、监听与租约、凭据、DUT 控制权、审计。
+/// Set the "Agent Access" panel (Access Control M1 GUI, Scheme §6, item 4; only in Chinese as
+/// required):
+/// Authentication switch and monitoring configuration → Credentials list (Token visible + copy +
+/// enable/stop/revoke) →
+/// Authorization editing for each credential (read/write serial
+/// port/ADB/relay/power/reSET/recording) →
+/// DUT control panel (status/owner/residual TTL/queue + release/force takeover/security recovery) →
+/// Audit event list (last 100 items).
+/// "Agent Access" panel (Agent page): Authentication switch, monitoring and lease, credentials, DUT
+/// control, auditing.
 pub(crate) fn agent_access_panel(
     w: &mut Workbench,
     p: &'static Palette,
     window: &mut Window,
     cx: &mut Context<Workbench>,
 ) -> gpui_kit::Div {
-    // 面板内只读快照：渲染借用结束前收集全部数据，listener 闭包只捕获 clone。
+    // Snapshot within the panel: Collect all data before the rendering borrowing ends. The listener
+    // closure only captures the clone.
     let access = w.settings.agent_access.clone();
     let auth_on = w.access_runtime.enabled();
     let lan_access = access.lan_access;
@@ -734,7 +805,7 @@ pub(crate) fn agent_access_panel(
         Some(selected),
         std::sync::Arc::new(move |this, index, _, cx| {
             if let Some((id, _)) = endpoints.get(index) {
-                this.agent_credential_listener = id.clone();
+                this.agent_credential_listener.clone_from(id);
                 cx.notify();
             }
         }),
@@ -1287,18 +1358,6 @@ pub(super) fn appearance_panel(
             p,
         ))
         .child(setting_row(
-            crate::i18n::t(w.lang, "jumpLatest"),
-            crate::i18n::t(w.lang, "jumpHint"),
-            toggle("opt-jump", w.settings.terminal.jump_to_latest, p).on_click(cx.listener(
-                |this, _ev, _win, cx| {
-                    this.settings.terminal.jump_to_latest = !this.settings.terminal.jump_to_latest;
-                    this.persist_settings();
-                    cx.notify();
-                },
-            )),
-            p,
-        ))
-        .child(setting_row(
             crate::i18n::t(w.lang, "commandBar"),
             crate::i18n::t(w.lang, "commandBarHint"),
             toggle("opt-commandbar", w.settings.terminal.show_command_bar, p).on_click(
@@ -1309,6 +1368,24 @@ pub(super) fn appearance_panel(
                     cx.notify();
                 }),
             ),
+            p,
+        ))
+        .child(setting_row(
+            crate::i18n::t(w.lang, "taskbarAlerts"),
+            crate::i18n::t(w.lang, "taskbarAlertsHint"),
+            toggle(
+                "opt-taskbar-alerts",
+                !w.settings.alerts.mute_taskbar_alerts,
+                p,
+            )
+            .on_click(cx.listener(|this, checked: &bool, _win, cx| {
+                this.settings.alerts.mute_taskbar_alerts = !*checked;
+                if this.settings.alerts.mute_taskbar_alerts {
+                    this.stop_alert_flash();
+                }
+                this.persist_settings();
+                cx.notify();
+            })),
             p,
         ));
     settings_panel(
@@ -1403,7 +1480,8 @@ pub(super) fn terminal_font_panel(
     settings_panel("terminal", label("terminalFont"), None, body, p)
 }
 
-/// 「Agent 协作 · A2A」面板（Agent 页）：本机 Agent Card 配置与远端 peer 列表。
+/// "Agent Collaboration · A2A" panel (Agent page): This section displays the configuration of local
+/// agents and a list of remote peers.
 pub(crate) fn a2a_panel(
     w: &mut Workbench,
     p: &'static Palette,
@@ -1417,7 +1495,8 @@ pub(crate) fn a2a_panel(
         .clone()
         .unwrap_or_else(|| default_a2a.clone());
     let mut body = div();
-    // W4a：代理状态/失败原因逐 DUT 可见（来源 = A2aRuntime::status）。
+    // W4a: The status and reasons for failures are visible for each DUT (Source =
+    // A2aRuntime::status).
     let a2a_rows: Vec<(String, duthub_desktop::agent_ui::A2aEndpointView)> = w
         .duts
         .file
@@ -1435,7 +1514,11 @@ pub(crate) fn a2a_panel(
             )
         })
         .collect();
-    let a2a_running = if w.a2a.as_ref().is_some_and(super::super::a2a_runtime::A2aRuntime::any_running) {
+    let a2a_running = if w
+        .a2a
+        .as_ref()
+        .is_some_and(super::super::a2a_runtime::A2aRuntime::any_running)
+    {
         a2a_rows
             .iter()
             .filter(|(_, view)| view.card_url.is_some())
@@ -1566,7 +1649,8 @@ pub(crate) fn a2a_panel(
                     p,
                 )
                 .on_click(cx.listener(move |this, _ev, _win, cx| {
-                    // W4a：按钮回执真实运行时状态（不再固定「未运行」）。
+                    // W4a: The status of the button when the function is actually running (no
+                    // longer "not running").
                     this.notify_toast(a2a_summary.clone());
                     cx.notify();
                 })),
@@ -1818,7 +1902,10 @@ mod usb_discovery_tests {
         let lang = crate::i18n::Lang::from_setting("zh-CN");
         let empty = Ok(Vec::new());
         let (options, status) = usb_debug_display(Some(&empty), "RK3576USB003", false, lang);
-        assert!(options.is_empty());
+        assert_eq!(
+            options,
+            [] as [(std::string::String, std::string::String); 0]
+        );
         assert_eq!(status, "当前未检测到 ADB 设备");
 
         let connected = Ok(vec![duthub_core::AdbDevice {

@@ -1,11 +1,14 @@
-//! W3 验收：Agent 页三行边界徽标，以及旧「Plan · 只读」单行的退役。
+//! W3 acceptance: three-line boundary badges on the Agent page and retirement of the legacy
+//! single-line "Plan · Read-only" copy.
 //!
-//! UI 不在 lib target 内（workspace/pages 是 bin 模块），因此本测试按源码与
-//! locale 资源做**渲染契约**断言（坑 #4：路径运行期读取）：
-//! - 两份 locale 都带三行徽标文案，且不再保留 `agentPlanMode`；
-//! - 演示面板保留三行徽标，Agent 设置页不显示静态说明，Inspector 显示会话实际隔离状态；
-//! - Agent 页确实挂载 `agent_runtime_panel`；
-//! - 「Plan · 只读 / Plan · Read-only」字样不得回到任何源文件。
+//! UI lives in the bin target (workspace/pages are bin modules), so this test verifies the
+//! **render contract** against source files and locale resources (paths read at runtime):
+//! - Both locales carry all three badge strings and no longer contain `agentPlanMode`;
+//! - The demo panel keeps the three-line badges, Agent settings hide static notes, and Inspector
+//!   shows actual session isolation status;
+//! - Agent settings mount `agent_runtime_panel`;
+//! - Neither the zh-CN nor en-US legacy single-line "Plan · Read-only" copy may reappear in any
+//!   source file.
 
 use std::path::PathBuf;
 
@@ -18,7 +21,7 @@ const BADGES: [&str; 3] = [
 ];
 
 fn manifest_dir() -> PathBuf {
-    // 坑 #4：运行期读取，不能 env!。
+    // Read at runtime instead of env!.
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
 }
 
@@ -67,7 +70,7 @@ fn text_at<'a>(locale: &'a Value, key: &str) -> &'a str {
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| panic!("locale 缺少非空文案 {key}"))
+        .unwrap_or_else(|| panic!("locale missing non-empty text for {key}"))
 }
 
 #[test]
@@ -76,10 +79,10 @@ fn both_locales_carry_the_three_badges_and_retire_plan_readonly() {
         let locale = locale(name);
         let object = locale
             .as_object()
-            .unwrap_or_else(|| panic!("{name} 顶层必须是对象"));
+            .unwrap_or_else(|| panic!("{name} top-level JSON must be an object"));
         assert!(
             !object.contains_key("agentPlanMode"),
-            "{name} 不得再保留旧「Plan · 只读」单行文案"
+            "{name} must not retain legacy agentPlanMode single-line copy"
         );
         for key in BADGES {
             let value = text_at(&locale, key);
@@ -90,16 +93,16 @@ fn both_locales_carry_the_three_badges_and_retire_plan_readonly() {
     let zh = locale("zh-CN.json");
     assert!(
         text_at(&zh, "agentToolSurface").contains("13 个 Plan 工具（只读）"),
-        "中文工具面徽标必须写明 13 个 Plan 工具（只读）"
+        "zh-CN tool-surface badge must state 13 Plan tools (read-only)"
     );
     assert!(
         text_at(&zh, "agentLocalTools").contains("Goose 扩展已禁用")
             && text_at(&zh, "agentLocalTools").contains("OS 沙箱（MXC）已启用"),
-        "中文本机工具徽标必须写明扩展禁用与 MXC OS 沙箱已启用"
+        "zh-CN local-tools badge must state Goose extensions disabled and MXC OS sandbox enabled"
     );
     assert!(
         text_at(&zh, "agentBindingBoundary").contains("不是安全边界"),
-        "中文绑定徽标必须写明不是安全边界"
+        "zh-CN binding badge must state it is not a security boundary"
     );
 
     let en = locale("en-US.json");
@@ -123,7 +126,7 @@ fn demo_keeps_badges_and_agent_settings_keep_runtime_status() {
     let provider_models = source("provider_models.rs");
     assert!(
         provider_models.contains("agent_runtime_panel"),
-        "Agent 设置页必须挂载 agent_runtime_panel（goose 运行时）"
+        "Agent settings page must mount agent_runtime_panel (goose runtime)"
     );
     let pages = source("pages.rs");
     let runtime = pages
@@ -153,34 +156,35 @@ fn plan_readonly_single_line_must_not_come_back() {
         let text = source(file);
         assert!(
             !text.contains("agentPlanMode"),
-            "{file} 不得再引用旧 agentPlanMode 文案"
+            "{file} must not reference legacy agentPlanMode copy"
         );
         assert!(
             !text.contains("Plan · 只读") && !text.contains("Plan · Read-only"),
-            "{file} 不得再出现「Plan · 只读」单行"
+            "{file} must not reintroduce legacy Plan read-only single-line copy"
         );
     }
 }
 
-/// F1/T16/F12 的接线证据（bin 模块无法在 lib test 里实例化，按源码契约断言）。
+/// Wiring evidence for F1/T16/F12 (bin modules cannot be instantiated in lib tests; asserted via
+/// source contract).
 #[test]
 fn agent_runtime_lifecycle_is_wired_into_the_workbench() {
     let workspace = source("workspace.rs");
-    // 非阻塞停止：定义 + 关 tab + 删除 DUT 三个入口都只发停止请求。
+    // Non-blocking stop: definition + close tab + delete DUT all send stop requests only.
     assert!(
         workspace.matches("stop_agent_session").count() >= 3,
-        "stop_agent_session 必须覆盖定义、关 tab、删除 DUT 三条路径"
+        "stop_agent_session must cover definition, close tab, and delete DUT paths"
     );
-    // 退出钩子：停全部 Agent 会话 + 关闭 MCP 监听器句柄。
+    // Drop hook: stop all agent sessions and close MCP listener handles.
     assert!(workspace.contains("impl Drop for Workbench"));
     assert!(workspace.contains("mcp_runtime.shutdown()"));
-    // --self-test：宿主不构造。
+    // --self-test: host is not constructed.
     assert!(workspace.contains("agent_self_test: self_test"));
     assert!(workspace.contains("agent_host: None"));
-    // F1/T16：spawn_mcp_runtime 的返回值保存在 Workbench（Drop 时关闭）。
+    // F1/T16: spawn_mcp_runtime return value is stored on Workbench (closed on Drop).
     assert!(
         workspace.contains("wb.mcp_runtime = crate::mcp_runtime::spawn_mcp_runtime("),
-        "spawn_mcp_runtime 的 listener 句柄必须保存"
+        "listener handles from spawn_mcp_runtime must be stored"
     );
 
     let runtime = source("mcp_runtime.rs");
@@ -188,7 +192,7 @@ fn agent_runtime_lifecycle_is_wired_into_the_workbench() {
     assert!(runtime.contains("-> McpRuntimeHandles"));
     assert!(
         runtime.contains("duthub_mcp::transport::spawn_http_listener_on("),
-        "主/每 DUT listener 必须经 spawn_http_listener_on 取得句柄"
+        "main and per-DUT listeners must obtain handles via spawn_http_listener_on"
     );
     assert!(runtime.contains("shutdown_and_join_with_timeout"));
 }

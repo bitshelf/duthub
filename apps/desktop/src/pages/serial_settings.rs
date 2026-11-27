@@ -1,10 +1,15 @@
-use super::{Workbench, Palette, Window, Context, IntoElement, Styled, div, px, ParentElement, SharedString, StatefulInteractiveElement, InteractiveElement, FluentBuilder, Switch, AppContext, icon_btn, btn, BtnVariant, field, In, chip, settings_panel, Div, setting_row, toggle};
+use super::{
+    BtnVariant, Context, Div, FluentBuilder, In, InteractiveElement, IntoElement, Palette,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Switch, Window, Workbench,
+    btn, chip, div, field, icon_btn, px, setting_row, settings_panel, toggle,
+};
 
 // ---------------------------------------------------------------------------
-// 串口终端设置（设置浮层导航，与「控制设备」同级）
+// Serial Port Settings (Set the floating layer navigation, at the same level as "Control Devices")
 // ---------------------------------------------------------------------------
 
-/// 串口设置页：Prompt 高亮规则 / 键盘映射 / 终端缓冲。
+/// Serial Port Settings Page: Prompts for highlighting rules, keyboard mapping, and terminal
+/// buffering.
 pub fn render_serial_settings(
     w: &mut Workbench,
     p: &'static Palette,
@@ -203,7 +208,7 @@ pub(super) fn prompt_rules_panel(
             })),
         ),
     );
-    // 选中规则编辑器 + 实时预览
+    // Select the Rule Editor and preview in real time.
     if let Some(rule) = w.settings.serial.highlight_rules.get(selected) {
         let regex = rule.regex.clone();
         let color = rule.color.clone();
@@ -304,7 +309,8 @@ pub(super) fn prompt_rules_panel(
     )
 }
 
-/// 高亮预览块：样例行按当前规则染色（无效正则给红字提示）。
+/// Highlighted preview blocks: The sample is colored according to the current rules (regular
+/// expressions that don't match are marked in red).
 pub(super) fn regex_preview_block(
     lang: crate::i18n::Lang,
     regex: &str,
@@ -370,7 +376,7 @@ pub(super) fn regex_preview_block(
         .child(preview)
 }
 
-/// 键盘映射：退格字节 + 回车行尾（PuTTY 键盘路径消费）。
+/// Keyboard mapping: Backspace character + line terminator (used for `PuTTY` keyboard path handling).
 pub(super) fn keyboard_panel(
     w: &mut Workbench,
     p: &'static Palette,
@@ -494,7 +500,7 @@ pub(super) fn terminal_mouse_panel(
     settings_panel("mouse", label("terminalMouseTitle"), None, body, p)
 }
 
-/// 终端缓冲：滚动缓冲行数（草稿解析 + 保存按钮提交，Baud 式）。
+/// Terminal buffer and scrolling behavior (scroll-to-bottom toggles + scrollback buffer rows).
 pub(super) fn buffer_panel(
     w: &mut Workbench,
     p: &'static Palette,
@@ -503,36 +509,66 @@ pub(super) fn buffer_panel(
 ) -> gpui_kit::Div {
     let draft = w.input_value(In::SerialScrollback);
     let default = duthub_device::term::SCROLLBACK_HISTORY.to_string();
-    let body = setting_row(
-        crate::i18n::label("serialScrollback"),
-        crate::i18n::label("serialScrollbackHint"),
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(div().w(px(125.)).child(w.text_field(
-                In::SerialScrollback,
-                &draft,
-                &default,
-                true,
-                p,
-                window,
-                cx,
-            )))
-            .child(
-                btn(
-                    "save-serial-buffer",
-                    crate::i18n::label("save"),
-                    &BtnVariant::Primary,
-                    p,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.save_serial_scrollback();
-                    cx.notify();
-                })),
-            ),
+    let scroll_on_output = toggle(
+        "opt-scroll-on-output",
+        w.settings.terminal.scroll_on_output,
         p,
+    )
+    .on_click(cx.listener(|this, checked: &bool, _win, cx| {
+        this.settings.terminal.scroll_on_output = *checked;
+        this.persist_settings();
+        cx.notify();
+    }));
+    let scroll_on_key = toggle("opt-jump", w.settings.terminal.jump_to_latest, p).on_click(
+        cx.listener(|this, checked: &bool, _win, cx| {
+            this.settings.terminal.jump_to_latest = *checked;
+            this.persist_settings();
+            cx.notify();
+        }),
     );
+    let body = div()
+        .child(setting_row(
+            crate::i18n::t(w.lang, "scrollOnOutput"),
+            crate::i18n::t(w.lang, "scrollOnOutputHint"),
+            scroll_on_output,
+            p,
+        ))
+        .child(setting_row(
+            crate::i18n::t(w.lang, "jumpLatest"),
+            crate::i18n::t(w.lang, "jumpHint"),
+            scroll_on_key,
+            p,
+        ))
+        .child(setting_row(
+            crate::i18n::label("serialScrollback"),
+            crate::i18n::label("serialScrollbackHint"),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().w(px(125.)).child(w.text_field(
+                    In::SerialScrollback,
+                    &draft,
+                    &default,
+                    true,
+                    p,
+                    window,
+                    cx,
+                )))
+                .child(
+                    btn(
+                        "save-serial-buffer",
+                        crate::i18n::label("save"),
+                        &BtnVariant::Primary,
+                        p,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.save_serial_scrollback();
+                        cx.notify();
+                    })),
+                ),
+            p,
+        ));
     settings_panel(
         "list",
         crate::i18n::t(w.lang, "serialBufferTitle"),
@@ -553,9 +589,10 @@ pub(super) fn color_swatch(color: &str, p: &'static Palette) -> Div {
 
 pub fn hex_to_rgba(hex: &str, _p: &'static Palette) -> gpui_kit::Rgba {
     let hex = hex.trim_start_matches('#');
-    let value = u32::from_str_radix(hex, 16).unwrap_or(0xedbe7a);
-    let r = ((value >> 16) & 0xff) as f32 / 255.0;
-    let g = ((value >> 8) & 0xff) as f32 / 255.0;
-    let b = (value & 0xff) as f32 / 255.0;
+    let value = u32::from_str_radix(hex, 16).unwrap_or(0x00ed_be7a);
+    let [_, red, green, blue] = value.to_be_bytes();
+    let r = f32::from(red) / 255.0;
+    let g = f32::from(green) / 255.0;
+    let b = f32::from(blue) / 255.0;
     gpui_kit::Rgba { r, g, b, a: 1.0 }
 }

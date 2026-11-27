@@ -1,5 +1,5 @@
-# 提亮截图便于查看暗色元素
-# 用法: powershell -File scripts/ui-brighten.ps1 -SrcFile <png> -OutFile <png> [-Factor 2.5]
+# Brighten a screenshot to make dark UI elements easier to inspect.
+# Usage: powershell -File scripts/ui-brighten.ps1 -SrcFile <png> -OutFile <png> [-Factor 2.5]
 param(
     [string]$SrcFile = "target/ui-verify/in.png",
     [string]$OutFile = "target/ui-verify/out.png",

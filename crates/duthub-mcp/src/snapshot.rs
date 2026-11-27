@@ -1,7 +1,7 @@
-//! 快照状态源：独立 stdio 进程读取 desktop 落盘的 `mcp-state.json`（只读）。
+//! Read-only snapshot state for an MCP stdio subprocess.
 //!
-//! 写操作在快照模式下不可用（无法回调 desktop 进程）——返回只读限制说明。
-//! 写操作请连接 desktop 的 Streamable HTTP 端点（RuntimeMcpState）。
+//! The snapshot cannot dispatch writes because it has no callback to the live desktop.
+//! Clients that need device writes connect to the desktop's Streamable HTTP listener.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::state::{
     McpState, ProcessResultDto, RelayBrief, SerialBindInfo,
 };
 
-/// mcp-state.json 结构（desktop 落盘）
+/// Snapshot file written by the desktop application.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateSnapshot {
@@ -34,7 +34,7 @@ pub struct SnapshotDut {
     pub adb_serial: Option<String>,
     pub relay: Option<RelayBrief>,
     pub mcp_label: Option<String>,
-    /// 最近日志（desktop 截取）
+    /// Recent log entries retained by the desktop.
     pub lines: Vec<SnapshotLine>,
 }
 
@@ -51,7 +51,7 @@ pub struct SnapshotState {
 }
 
 impl SnapshotState {
-    /// 从 JSON 文件加载；文件缺失 → 空快照（dut.list 返回空列表）
+    /// Load the snapshot from JSON. A missing file yields an empty DUT list.
     #[must_use]
     pub fn load(path: &Path) -> Self {
         let snapshot = match std::fs::read_to_string(path) {
@@ -203,7 +203,7 @@ impl McpState for SnapshotState {
         _action: &str,
         _args_json: &str,
     ) -> ApprovalIssueResult {
-        // 快照模式只读：不发令牌（token 占位使返回类型成立）
+        // Snapshot mode cannot issue usable approval tokens.
         ApprovalIssueResult {
             token: String::new(),
             dut_id: String::new(),
@@ -225,17 +225,17 @@ impl McpState for SnapshotState {
     }
 }
 
-/// 构造共享 Arc（bin 使用）
+/// Create a shared snapshot state for the stdio executable.
 #[must_use]
 pub fn snapshot_state(path: &Path) -> Arc<dyn McpState> {
     Arc::new(SnapshotState::load(path))
 }
 
-/// 常驻 stdio 进程的动态快照：每次工具调用前重读 `mcp-state.json`。
+/// State source that reloads the snapshot for each request.
 ///
-/// MCP stdio 客户端会把子进程当常驻进程用（启动一次、整个会话复用）；
-/// desktop 每 2s `落盘新快照（mcp_runtime），固定快照会让数据永久停留在`
-/// 进程启动时刻。每请求重读保证工具返回当前状态。
+/// A client can keep the same stdio subprocess alive for an entire session.
+/// The desktop updates the persisted snapshot periodically.
+/// Reloading avoids freezing tool results at subprocess startup.
 #[derive(Debug)]
 pub struct ReloadingSnapshotState {
     path: std::path::PathBuf,
@@ -251,8 +251,8 @@ impl ReloadingSnapshotState {
         SnapshotState::load(&self.path)
     }
 
-    /// 快照路径（`<工作目录>/runtime/mcp-state.json`）反推工作目录；
-    /// 路径无父级（异常构造）返回 None。
+    /// Derive the work directory from the snapshot file under its runtime directory.
+    /// Return no work directory if the path has no parent.
     fn work_dir(&self) -> Option<std::path::PathBuf> {
         self.path
             .parent()
@@ -359,13 +359,13 @@ impl McpState for ReloadingSnapshotState {
     }
 }
 
-/// 构造动态重读快照（stdio bin 使用：常驻进程数据不冻结）
+/// Create a state source for a long-running stdio subprocess.
 #[must_use]
 pub fn reloading_snapshot_state(path: &Path) -> Arc<dyn McpState> {
     Arc::new(ReloadingSnapshotState::new(path.to_path_buf()))
 }
 
-/// 快照来源抽象（desktop 通过共享内存实现，避免子进程重复读盘时的时序问题）
+/// State capture interface also implemented by the desktop's shared memory state.
 pub trait StateSnapshotSource: Send + Sync + 'static {
     fn load(&self) -> StateSnapshot;
 }
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn reloading_state_skill_export_writes_to_snapshot_work_dir() {
-        // 工作目录 = <tmp>/<unique>；快照在其 runtime/ 下（与 bin discover_data_dir 同构）
+        // Use a temporary work directory containing the same runtime layout as the desktop.
         let work = std::env::temp_dir().join(format!(
             "duthub-skill-snap-test-{}-{}",
             std::process::id(),
@@ -385,23 +385,23 @@ mod tests {
                 .map_or_default(|d| d.as_nanos())
         ));
         let snapshot = work.join("runtime").join("mcp-state.json");
-        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("runtime 目录");
+        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("create runtime directory");
         let state = ReloadingSnapshotState::new(snapshot);
 
-        let path = std::path::PathBuf::from(state.skill_export().expect("导出成功"));
+        let path = std::path::PathBuf::from(state.skill_export().expect("skill export succeeded"));
         assert!(
             path.ends_with(
                 std::path::Path::new("skill")
                     .join("duthub")
                     .join("SKILL.md")
             ),
-            "路径应为 <work>/skill/duthub/SKILL.md: {}",
+            "expected <work>/skill/duthub/SKILL.md, got: {}",
             path.display()
         );
-        let raw = std::fs::read_to_string(&path).expect("SKILL.md 落盘");
+        let raw = std::fs::read_to_string(&path).expect("SKILL.md written to disk");
         assert!(raw.contains("name: duthub"));
 
-        // 无父级的异常路径 → 明确报错而非 panic
+        // An invalid snapshot path must return an error.
         let bad = ReloadingSnapshotState::new(std::path::PathBuf::from("mcp-state.json"));
         assert!(bad.skill_export().is_err());
         let _ = std::fs::remove_dir_all(&work);

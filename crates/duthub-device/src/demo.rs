@@ -1,9 +1,9 @@
-//! 会话驱动抽象 + Demo 驱动（M1.1）。
+//! Serial session commands, shared logging, and the demo driver.
 //!
-//! Demo 驱动回放 `tests/fixture-logs/` 样本（正常启动 + 内核 panic），随后进入
-//! 交互式模拟 shell（移植原型 `response()` 行为），无硬件即可驱动全链路。
-//! 真实驱动（M1.2）实现同一命令通道，走 tokio-serial + `alacritty_terminal` 仿真
-//! （行重组/本地回显已废弃：回显与提示符由设备 shell 经仿真器渲染）。
+//! The demo replays normal boot and kernel panic fixtures.
+//! It then starts an interactive simulated shell for testing without hardware.
+//! The hardware driver uses the same command channel with a real serial port
+//! and renders the device's own echo through the terminal emulator.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,17 +24,17 @@ use crate::logs::SessionLogWriter;
 use crate::rec::RecKind;
 use crate::session::LineEnding;
 
-/// 键入突发合并上限（字节）：退格连击等突发合并为一次 USB 写事务，
-/// 超限即落回逐条写（典型按键 ≤ 8 字节，256 ≈ 30+ 键足够覆盖一次连击）。
-/// 逻辑与单测放在 feature-free 的本模块（real 模块仅真实驱动构建）。
+/// Maximum number of bytes merged into one keyboard write.
+/// The limit covers typical keystroke bursts without delaying other commands.
+/// Keep the batching helper available when the hardware feature is disabled.
 #[cfg_attr(not(feature = "real-hardware"), allow(dead_code))]
 pub(crate) const TX_MERGE_BYTES: usize = 256;
 
-/// 吸收命令队列中连续的同租约 `WriteBytes`（键盘突发 → 一次写事务）。
-/// 返回（字节批次，首个被拉出的异型命令——调用方退回队列按序执行）。
-/// 每条原始命令保持独立元素：键入审计按原边界逐条落盘。同租约合并不
-/// 改变 admit 语义（租约上下文逐命令已在入口复核，actor 复核对同 ctx
-/// 批次等效）；异租约/异型命令不并入。
+/// Merge consecutive queued byte writes with the same lease context.
+/// Return the first incompatible command for ordered dispatch by the caller.
+/// Keep each original command separate in the batch for auditing.
+/// The admission check already ran for each command.
+/// The actor rechecks the shared lease just before writing the batch.
 #[cfg_attr(not(feature = "real-hardware"), allow(dead_code))]
 pub(crate) fn absorb_keystrokes(
     cmd_rx: &mut tokio::sync::mpsc::Receiver<SessionCommand>,
@@ -62,41 +62,41 @@ pub(crate) fn absorb_keystrokes(
     (batch, deferred)
 }
 
-/// 会话命令（单个 task 独占串口句柄，读写都进该 task，docs/ARCHITECTURE.md）。
+/// Commands sent to the task that owns the serial handle.
 pub enum SessionCommand {
-    /// 用户输入的一行（已含或不含换行均可）。`lease` 为入口 admit 捕获的
-    /// 租约上下文（None = 无租约要求路径：auth 关的 Agent 过渡写 / System）。
+    /// A line of input with or without an existing line ending.
+    /// The lease context comes from write admission and can be absent on permitted unleased paths.
     Write {
         text: String,
         lease: Option<WriteCtx>,
     },
-    /// 一次完整的多行心跳探测，保留原始脚本用于演示驱动。
+    /// A complete multiline heartbeat probe with its source script for the demo.
     WriteHeartbeatBatch {
         text: String,
         batch: std::sync::Arc<crate::heartbeat::HeartbeatBatch>,
         lease: Option<WriteCtx>,
     },
-    /// 原始字节直写（PuTTY `键盘路径：typed_char/Enter` \r/Backspace 0x7f），
-    /// 不做行尾追加、不发 [TX] 回显
+    /// Send keyboard bytes as supplied, including Enter and Backspace.
+    /// The hardware path adds neither a line ending nor local echo.
     WriteBytes {
         bytes: Vec<u8>,
         lease: Option<WriteCtx>,
     },
-    /// 重设波特率（真实驱动：断开重连协调）
+    /// Change the baud rate. Hardware sessions reopen the port.
     SetBaud(u32),
-    /// 终端网格重设尺寸（窗口 resize → term.resize(cols, rows)）
+    /// Resize the terminal grid after a viewport change.
     Resize { cols: usize, rows: usize },
-    /// 重置本地终端仿真器。
+    /// Reset local terminal emulation.
     ResetTerminal,
     ReadTerminalHistory {
         skip: usize,
         reply: tokio::sync::oneshot::Sender<crate::term::TerminalHistoryPage>,
     },
-    /// 会话级行尾策略（发送路径生效，见 LineEnding；仅 `write_line` 路径）
+    /// Set the suffix used by subsequent line writes.
     SetEnding(LineEnding),
-    /// 分段标记（日志分割）：写 `[mark] {label}` 行（Mark 样式），文本与索引同步
+    /// Write a segment marker to the text log and its corresponding index.
     Mark(String),
-    /// 请求关闭
+    /// Request session shutdown.
     Close,
 }
 
@@ -136,25 +136,25 @@ impl std::fmt::Debug for SessionCommand {
     }
 }
 
-/// 日志管道消息（异步写线程按入队顺序消费；字节与分段顺序严格保持）。
+/// Ordered messages sent to the session log writer.
 pub(crate) enum LogMsg {
-    /// RX 原始字节块：.bin 记真字节（不转码），.log 记 utf8-lossy 文本（append）。
+    /// Record raw receive bytes and their lossy UTF-8 text.
     Raw {
         bytes: Vec<u8>,
         text: String,
     },
-    /// TX 线上字节 + [TX] `标记行（append；emit_tx` / `log_tx` 共用）。
+    /// Record transmitted bytes and their TX annotation.
     Tx {
         wire: Vec<u8>,
         text: String,
     },
-    /// 键入字节审计：仅 .`bin（append_raw`）。
+    /// Record keyboard bytes in the binary log only.
     Keystrokes(Vec<u8>),
-    /// 注记行（note）。
+    /// Append a text annotation.
     Note(String),
-    /// 分段标记（mark；失败由写线程补错误注记并广播）。
+    /// Append a segment marker and emit an error annotation if it fails.
     Mark(String),
-    /// 分段标记的同步等待版：供供电分段等需要立刻拿到成败的控制边界，
+    /// Return the marker result to a control boundary that must wait for persistence.
     /// Return the result after earlier log messages have drained.
     MarkSync {
         line: String,
@@ -165,7 +165,7 @@ pub(crate) enum LogMsg {
         split: bool,
         reference: Option<crate::boot_reference::BootReference>,
     },
-    /// 排空屏障：此前入队的消息全部落盘后 ack（测试 / 排空等待用）。
+    /// Acknowledge after all earlier log messages have reached disk.
     Flush(std::sync::mpsc::Sender<()>),
 }
 
@@ -262,9 +262,9 @@ fn apply_log_msg(
     }
 }
 
-/// 日志写线程：与今天完全相同的逐条 write + flush 语义（实时落盘、零丢失），
-/// 只是移出 RX/写命令路径——磁盘 I/O 不再卡回显显示。recv 返回 Err 表示
-/// 通道关闭且队列已排空，此时才退出（会话关闭后一字节不少）。
+/// Write and flush each record on a dedicated thread.
+/// This keeps disk I/O off the serial echo path.
+/// Exit only once the channel is closed and every queued message has been received.
 fn run_log_writer(
     logs: &Arc<Mutex<SessionLogWriter>>,
     rx: &std::sync::mpsc::Receiver<LogMsg>,
@@ -295,20 +295,20 @@ fn run_log_writer(
     cvar.notify_all();
 }
 
-/// 发射器：原始字节+文本行 → 日志管道；事件 → 总线 + 会话缓冲。
+/// Send byte and text records to the writer and publish events to the session buffer and bus.
 pub struct SessionCtx {
     pub dut_id: String,
     pub session_id: String,
     bus: Arc<EventBus>,
     logs: Option<Arc<Mutex<SessionLogWriter>>>,
-    /// 日志写通道：RX/TX/注记全部异步落盘（None = 未挂日志或写线程未启动）。
+    /// Optional asynchronous channel for receive, transmit, and annotation records.
     log_tx: Option<std::sync::mpsc::Sender<LogMsg>>,
-    /// 写线程排空完成信号（Drop 关闭通道后等待，兜底超时）。
+    /// Completion signal used during shutdown after closing the channel.
     log_finished: Option<Arc<(Mutex<bool>, Condvar)>>,
     reconnect_notify: Option<std::sync::Arc<Notify>>,
-    /// 租约复核（[E] actor 复核用；None = 无租约要求路径）
+    /// Optional lease authority for the final write check.
     lease_authority: Option<Arc<dyn LeaseAuthority>>,
-    /// 审计（actor 拒绝写入记 write.deny）
+    /// Optional audit sink for denied writes.
     audit: Option<Arc<AuditSink>>,
     /// Per-DUT garbled-detection switches shared with `DeviceService`.
     /// `None` = the session never enables detection (demo/tests).
@@ -349,8 +349,8 @@ impl SessionCtx {
         }
     }
 
-    /// 挂接每 DUT 乱码检测开关（与 `DeviceService` 共享同一 map：运行中切换
-    /// 对活动会话即时生效）。
+    /// Share per-DUT garbled-output settings with the device service.
+    /// Runtime updates affect active sessions.
     #[must_use]
     pub fn with_garble(mut self, map: Arc<Mutex<HashMap<String, bool>>>) -> Self {
         self.garble_enabled = Some(map);
@@ -397,9 +397,9 @@ impl SessionCtx {
         self.with_garble_meter(crate::garbled::GarbleMeter::reset);
     }
 
-    /// 挂接日志管道（原始字节副本 + utf8-lossy 文本，M1.5）。
-    /// 同时启动专用写线程：逐条 write + flush 语义与同步路径完全一致
-    /// （实时落盘、零丢失），仅把磁盘 I/O 移出 RX 回显关键路径。
+    /// Attach the log writer and start its dedicated thread.
+    /// Each message still writes and flushes before processing the next one.
+    /// The serial actor can continue rendering echo while the writer performs disk I/O.
     #[must_use]
     pub fn with_logs(mut self, logs: Arc<Mutex<SessionLogWriter>>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<LogMsg>();
@@ -421,12 +421,12 @@ impl SessionCtx {
         self
     }
 
-    /// 写线程的发送端克隆（供电分段等控制边界同步落盘时用）。
+    /// Clone the log sender for synchronous control boundaries.
     pub(crate) fn log_sender(&self) -> Option<std::sync::mpsc::Sender<LogMsg>> {
         self.log_tx.clone()
     }
 
-    /// 入队一条日志消息。写线程不可用时内联落盘兜底（保证零丢失）。
+    /// Queue a log message, or write inline if the thread is unavailable.
     fn enqueue_log(&self, msg: LogMsg) {
         let msg = match &self.log_tx {
             Some(tx) => match tx.send(msg) {
@@ -445,7 +445,7 @@ impl SessionCtx {
         }
     }
 
-    /// 排空屏障：阻塞直到此前入队的日志全部落盘（测试与排空等待用）。
+    /// Wait until all earlier log messages have reached disk.
     pub fn flush_logs(&self) {
         if let Some(tx) = &self.log_tx {
             let (ack, rx) = std::sync::mpsc::channel();
@@ -455,32 +455,32 @@ impl SessionCtx {
         }
     }
 
-    /// 挂接手动重连唤醒（H1.4：退避等待期间可被提前唤醒）。
+    /// Attach the signal that wakes a reconnect backoff.
     #[must_use]
     pub fn with_reconnect_notify(mut self, notify: std::sync::Arc<Notify>) -> Self {
         self.reconnect_notify = Some(notify);
         self
     }
 
-    /// 挂接租约复核（[E] actor 复核：SPEC §6.5.1 唯一 Actor 写前验证代数）。
+    /// Attach the authority that checks a lease immediately before a serial write.
     #[must_use]
     pub fn with_lease_authority(mut self, authority: Option<Arc<dyn LeaseAuthority>>) -> Self {
         self.lease_authority = authority;
         self
     }
 
-    /// 挂接审计接收端。
+    /// Attach the audit sink.
     #[must_use]
     pub fn with_audit(mut self, audit: Option<Arc<AuditSink>>) -> Self {
         self.audit = audit;
         self
     }
 
-    /// [E] actor 复核：命令携带租约上下文时，写串口前最后一刻验证。
-    /// 失败 → 注记行（Error 样式）+ 审计 write.deny + 返回 false（调用方丢弃写入）。
+    /// Recheck any command lease immediately before the serial write.
+    /// On failure, return false and record an error annotation and denial.
     pub fn admit_actor_write(&self, lease: &Option<WriteCtx>) -> bool {
         let Some(ctx) = lease else {
-            return true; // 无租约要求路径（既有测试 / 过渡放行）
+            return true; // No lease required (legacy tests / transitional path).
         };
         let Some(authority) = &self.lease_authority else {
             return true;
@@ -533,8 +533,8 @@ impl SessionCtx {
         )
     }
 
-    /// 发送回显（H1.1，demo 驱动专用）：TX 标记行进终端流（Good 配色区分收发）；
-    /// .bin 原始日志记真实线上字节（含行尾），.log 文本记标记行。
+    /// The demo echoes transmitted text into the terminal stream.
+    /// The binary log stores the wire bytes and the text log stores the TX annotation.
     pub fn emit_tx(&self, wire_payload: &str, display_text: &str) {
         let display = single_line_tx(display_text);
         self.enqueue_log(LogMsg::Tx {
@@ -548,9 +548,9 @@ impl SessionCtx {
         );
     }
 
-    /// TX 仅审计（real 驱动 `write_line` 路径）：.bin 记真实线上字节、.log 记
-    /// `[TX]` 标记行，但不再进终端流/总线（PuTTY 行为：无本地回显，屏幕内容
-    /// 由设备 shell 经仿真器渲染）。
+    /// Real line writes store wire bytes and a TX annotation in the logs.
+    /// They do not emit local terminal echo or a transmit event.
+    /// The emulator renders the target shell's own output.
     pub fn log_tx(&self, wire_payload: &[u8], display_text: &str) {
         let display = single_line_tx(display_text);
         self.enqueue_log(LogMsg::Tx {
@@ -559,9 +559,9 @@ impl SessionCtx {
         });
     }
 
-    /// RX 原始字节块：.bin 记真字节（不转码），.log 记 utf8-lossy 文本，总线发
-    /// SerialChunk（MCP `serial_read` / 录制 / 审计的文本来源；终端 UI 渲染走
-    /// `SerialScreen` 网格快照，不重复显示该文本）。
+    /// Log the raw receive bytes and their lossy UTF-8 representation.
+    /// Publish a text chunk for MCP reads, recording, and audit.
+    /// The terminal itself displays the separate grid snapshot.
     pub fn emit_raw(&self, bytes: &[u8]) {
         // Garble detection samples the raw bytes before any lossy decoding and
         // before the terminal emulator (which swallows most control bytes).
@@ -583,14 +583,14 @@ impl SessionCtx {
         });
     }
 
-    /// 键入字节审计（real 驱动 `WriteBytes` 路径）：只进 .bin 原始流；.log 与终端流
-    /// 由随后的设备回显承担（避免逐键 [TX] 刷屏）。
+    /// For real keyboard writes, record only the original bytes.
+    /// The device echo supplies subsequent text.
     pub fn log_keystrokes(&self, bytes: &[u8]) {
         self.enqueue_log(LogMsg::Keystrokes(bytes.to_vec()));
     }
 
-    /// 终端网格快照 → 总线（real 驱动专用；UI 整体替换渲染源）。
-    /// 收所有权（快照是新建值，无共享需求），避免事件侧深拷贝。
+    /// Publish a new hardware terminal snapshot for complete viewport replacement.
+    /// Consume the snapshot to avoid a deep copy.
     /// The garble statistics are stamped here so every snapshot carries the
     /// latest raw-byte verdict without changing the `term` snapshot builder.
     pub fn emit_screen(&self, mut screen: duthub_core::ipc::ScreenSnapshot) {
@@ -609,7 +609,7 @@ impl SessionCtx {
         self.enqueue_log(LogMsg::Mark(format!("[mark] {label}")));
     }
 
-    /// 断线重连退避等待（H1.4）：定时到期或手动重连通知（先到先返）。
+    /// Wait for reconnect backoff or a manual reconnect notification.
     pub async fn reconnect_wait(&self, backoff: Duration) {
         match &self.reconnect_notify {
             Some(notify) => {
@@ -627,8 +627,8 @@ impl SessionCtx {
 
 impl Drop for SessionCtx {
     fn drop(&mut self) {
-        // 关闭日志通道：写线程把残余消息全部落盘后才退出（recv Err），
-        // 会话结束 = .log/.bin 完整收尾，一字节不丢。
+        // Close the log sender and let the thread drain before it exits.
+        // This preserves the queued bytes and text when the session closes.
         self.log_tx = None;
         if let Some(finished) = &self.log_finished {
             let (lock, cvar) = &**finished;
@@ -640,15 +640,15 @@ impl Drop for SessionCtx {
     }
 }
 
-/// [TX] 注记单行化（P2-034）：display_text 中的换行转义为字面 `\r` / `\n`
-/// 两个字符，保证 .log 与终端流不出现无前缀续行——按行解析 .log 的下游工具
-/// 不会把多行写入的后续行误读为设备输出。wire 原始字节不经此处理（.bin 保留
-/// 真实线上字节）。
+/// Escape CR and LF as text in TX annotations.
+/// This keeps each annotation on one log line.
+/// Readers cannot mistake continuations for device output.
+/// The binary log still preserves the transmitted bytes exactly.
 fn single_line_tx(text: &str) -> String {
     text.replace('\r', "\\r").replace('\n', "\\n")
 }
 
-/// 内核行分类：错误行（panic/oops/BUG/failed）标红、prompt 标亮，其余常规。
+/// Highlight kernel errors and prompts and render other lines normally.
 #[must_use]
 pub fn classify_line(text: &str) -> ChunkStyle {
     let lower = text.to_ascii_lowercase();
@@ -668,18 +668,18 @@ pub fn classify_line(text: &str) -> ChunkStyle {
     ChunkStyle::Normal
 }
 
-// NOTE：手写 LineAssembler（\n 分行 + 半行冲刷）已随终端仿真重构移除 ——
-// real 会话字节流直接进 alacritty_terminal 仿真器，回显/提示符/光标由设备
-// shell 负责（PuTTY 行为），文本流按读取块原样进日志管道。
+// The hardware driver feeds bytes directly into the terminal emulator.
+// The target shell supplies echo, prompts, and cursor movement.
+// The text log receives the same read chunks without reconstructing lines.
 
 // ---------------------------------------------------------------------------
-// Demo 驱动
+// Demo driver
 // ---------------------------------------------------------------------------
 
 const BOOT_FIXTURE: &str = include_str!("../../../tests/fixture-logs/rk3576-boot.log");
 const PANIC_FIXTURE: &str = include_str!("../../../tests/fixture-logs/kernel-panic.log");
 
-/// fixture 文本内容（panic 样本供测试与“模拟 panic”命令使用）。
+/// Replay data for demo boot and simulated kernel panic.
 pub fn boot_fixture() -> Vec<String> {
     BOOT_FIXTURE.lines().map(str::to_string).collect()
 }
@@ -688,7 +688,7 @@ pub fn panic_fixture() -> Vec<String> {
     PANIC_FIXTURE.lines().map(str::to_string).collect()
 }
 
-/// Demo 驱动：回放启动日志 → 交互 shell → Close/取消退出。
+/// Demo driver: replays boot logs, runs an interactive shell, and exits on `Close` or cancellation.
 pub async fn run_demo_session(
     ctx: SessionCtx,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
@@ -705,13 +705,13 @@ pub async fn run_demo_session(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             SessionCommand::Write { text, lease } => {
-                // [E] actor 复核（SPEC §6.5.1）：写前最后一刻验证租约代数；
-                // 过期/被接管 → 丢弃写入（注记 + 审计），不触串口
+                // Actor-side `[E]` recheck: verify lease generation immediately before write;
+                // if stale or taken over, drop the write (note + audit) without touching serial.
                 if !ctx.admit_actor_write(&lease) {
                     continue;
                 }
-                // 发送回显与真实驱动一致：Good 配色 + [TX] 标记（演示 shell 的
-                // 提示符行随后模拟设备侧本地回显）
+                // TX echo matches the real driver: Good style + `[TX]` prefix (the demo shell
+                // prompt line below simulates device-side local echo).
                 ctx.emit_tx(&ending.apply(&text), &text);
                 let command = text.trim();
                 if command.is_empty() {
@@ -752,11 +752,11 @@ pub async fn run_demo_session(
                 );
             }
             SessionCommand::WriteBytes { bytes, lease } => {
-                // [E] actor 复核（同 Write 分支）
+                // Actor-side `[E]` recheck (same as `Write`).
                 if !ctx.admit_actor_write(&lease) {
                     continue;
                 }
-                // demo 无仿真器：按键字节按 utf8-lossy 走通用回显路径（行为可见即可）
+                // Demo has no emulator: echo keystroke bytes via lossy UTF-8.
                 let command = String::from_utf8_lossy(&bytes).trim().to_string();
                 if !command.is_empty() {
                     ctx.emit_text(&format!("Executed (demo): {command}"), ChunkStyle::Normal);
@@ -766,7 +766,7 @@ pub async fn run_demo_session(
             SessionCommand::Resize { .. }
             | SessionCommand::ResetTerminal
             | SessionCommand::ReadTerminalHistory { .. } => {
-                // demo 无终端网格，忽略
+                // Demo has no terminal grid; ignore.
             }
             SessionCommand::Close => break,
         }
@@ -806,7 +806,7 @@ fn emit_demo_response(ctx: &SessionCtx, command: &str) {
             }
         }
         "clear" => {
-            // UI 端 clear 在 M1.6 由本地处理；demo 只给提示。
+            // The UI handles `clear` locally; the demo driver only emits a notice.
             ctx.emit_text("(demo) 屏幕已清空（本地终端处理 clear）", ChunkStyle::Dim);
         }
         "help" => {
@@ -848,7 +848,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let ctx = SessionCtx::new("dut-demo", "sess-demo", bus.clone());
         let handle = tokio::spawn(run_demo_session(ctx, rx, 0));
-        // 等启动日志播完
+        // Wait for boot log replay to finish.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         tx.send(SessionCommand::Write {
             text: "uname -a\n".into(),
@@ -868,16 +868,20 @@ mod tests {
         let boot_len = boot_fixture().len();
         assert!(
             log.len() >= boot_len + 3,
-            "启动行 + 输入回显 + 响应 + 提示符"
+            "expected boot lines + input echo + response + prompt"
         );
         assert!(log.iter().any(|l| l.contains("aarch64 GNU/Linux")));
         assert!(log.iter().any(|l| l.ends_with("root@rk3576:~# uname -a")));
         drop(tx);
         let _ = handle.await;
-        // 关闭后最后一条应是 Disconnected，且不再增长
+        // Final event after close is Disconnected, and sequence stops advancing.
         let after_close = bus.last_seq("sess-demo");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(after_close, bus.last_seq("sess-demo"), "退出后不应再有事件");
+        assert_eq!(
+            after_close,
+            bus.last_seq("sess-demo"),
+            "no further events should arrive after exit"
+        );
     }
 
     #[tokio::test]
@@ -913,18 +917,18 @@ mod tests {
             .collect();
         assert!(
             lines.iter().any(|l| l == "[TX] echo-a"),
-            "写入必须有 TX 回显行，实际 {lines:?}"
+            "write must produce TX echo line; got {lines:?}"
         );
         assert!(
             lines.iter().any(|l| l == "[TX] echo-b"),
-            "SetEnding 后的写入仍要有 TX 回显"
+            "write after SetEnding must still produce TX echo"
         );
         drop(tx);
         let _ = handle.await;
     }
 
-    /// [E] actor 复核（SPEC §6.5.1）：命令携带过期/不存在的租约上下文 →
-    /// 写入在串口前丢弃 + 注记行，绝不产生 TX 回显（INV-04 actor 侧）。
+    /// Actor-side `[E]` recheck: a command carrying a stale or unknown lease context
+    /// is dropped before serial I/O with an error note and never emits a TX echo (INV-04).
     #[tokio::test]
     async fn actor_recheck_drops_stale_generation_write() {
         use duthub_core::audit::AuditSink;
@@ -939,7 +943,7 @@ mod tests {
             .with_audit(Some(audit.clone()));
         let handle = tokio::spawn(run_demo_session(ctx, rx, 0));
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        // 无人持有该租约（管理器内不存在）：句柄任意 → validate 拒 → 丢弃
+        // No holder owns this lease in the manager: validation rejects and drops it.
         let stale = Some(WriteCtx {
             lease_id: "lease-stale".into(),
             generation: 7,
@@ -961,18 +965,18 @@ mod tests {
             .collect();
         assert!(
             lines.iter().any(|l| l.contains("过期写入已拦截")),
-            "必须有拦截注记行：{lines:?}"
+            "expected stale-write interception note: {lines:?}"
         );
         assert!(
             !lines.iter().any(|l| l == "[TX] stale-cmd"),
-            "过期写入不得触串口/产生 TX 回显：{lines:?}"
+            "stale write must not touch serial or emit TX echo: {lines:?}"
         );
-        // 审计 write.deny
+        // Audit `write.deny`.
         let denied = audit
             .recent(50)
             .iter()
             .any(|e| e.action == "write.deny" && e.dut.as_deref() == Some("dut-e"));
-        assert!(denied, "actor 拒绝必须落审计");
+        assert!(denied, "actor denial must be recorded in audit");
         drop(tx);
         let _ = handle.await;
     }
@@ -989,9 +993,9 @@ mod tests {
         );
     }
 
-    /// P2-034b：[TX] `注记单行化——emit_tx（终端流）与` `log_tx（.log` 审计流）
-    /// 把 `display_text` 的换行转义为字面 `\n` / `\r`，不出现无前缀续行；
-    /// wire 原始字节（.bin）保留真实线上字节。
+    /// Single-line `[TX]` annotations: both `emit_tx` (terminal bus) and `log_tx`
+    /// (`.log` audit stream) escape newlines in `display_text` as literal `\n`/`\r`
+    /// with no unprefixed continuation lines, while `.bin` retains exact wire bytes.
     #[test]
     fn tx_annotation_is_single_line_for_multiline_text() {
         let dir = std::env::current_dir()
@@ -1005,7 +1009,7 @@ mod tests {
         ));
         let ctx = SessionCtx::new("dut-txml", "sess-txml", bus.clone()).with_logs(logs);
         let expected = "[TX] echo C1\\necho C2";
-        // emit_tx：终端流（总线）必须单行
+        // `emit_tx`: terminal bus stream must stay on one line.
         ctx.emit_tx("echo C1\necho C2\n", "echo C1\necho C2");
         let chunks: Vec<String> = bus
             .read_log("sess-txml", 0, usize::MAX)
@@ -1017,21 +1021,21 @@ mod tests {
             .collect();
         assert!(
             chunks.iter().any(|t| t == expected),
-            "[TX] 总线注记必须单行（换行转义）：{chunks:?}"
+            "[TX] bus annotation must be single-line with escaped newlines: {chunks:?}"
         );
-        // log_tx：.log 审计流同样单行
+        // `log_tx`: `.log` audit stream must also stay on one line.
         ctx.log_tx(b"echo C1\recho C2\r\n", "echo C1\r\necho C2");
         ctx.flush_logs();
         let text = std::fs::read_to_string(dir.join("sess-txml.log")).unwrap();
         assert!(
             text.lines().any(|line| line == "[TX] echo C1\\r\\necho C2"),
-            ".log 必须有单行 [TX] 注记：{text:?}"
+            ".log must contain single-line [TX] annotation: {text:?}"
         );
         assert!(
             !text.lines().any(|line| line == "echo C2"),
-            ".log 不得出现 [TX] 的无前缀续行：{text:?}"
+            ".log must not contain unprefixed [TX] continuation lines: {text:?}"
         );
-        // .bin 保留真实线上字节（不经转义）
+        // `.bin` preserves exact wire bytes without escaping.
         let raw = std::fs::read(dir.join("sess-txml.bin")).unwrap();
         assert_eq!(
             String::from_utf8_lossy(&raw),
@@ -1039,8 +1043,8 @@ mod tests {
         );
     }
 
-    /// 日志写线程按入队顺序落盘（零丢失红线）：RX/TX/键入/注记/分段全部
-    /// 异步化后，.log 与 .bin 的字节顺序必须与调用顺序一致。
+    /// Log writer persists records in enqueue order (lossless guarantee): after
+    /// async queueing of RX/TX/keystrokes/notes/marks, `.log` and `.bin` preserve call order.
     #[test]
     fn log_writer_preserves_enqueue_order_and_drains() {
         let dir = std::env::current_dir()
@@ -1067,13 +1071,13 @@ mod tests {
             lines
                 .iter()
                 .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!(".log 缺少 {needle}：{text:?}"))
+                .unwrap_or_else(|| panic!("The log is missing {needle}: {text:?}"))
         };
-        assert_eq!(pos("rx-1"), 0, "RX 文本在最前");
+        assert_eq!(pos("rx-1"), 0, "RX text must appear first");
         assert!(pos("[TX] tx-1") > pos("rx-1"));
         assert!(pos("[note] hello") > pos("[TX] tx-1"));
         assert!(pos("[mark] seg-a") > pos("[note] hello"));
-        // 分段（mark）把后续输出切进新段文件：rx-2 必须出现在任一段文件里
+        // Mark splits subsequent output into a new segment file: `rx-2` must appear in a segment.
         let seg_files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(std::result::Result::ok)
@@ -1089,15 +1093,15 @@ mod tests {
                     .unwrap_or_default()
                     .contains("rx-2")
             }),
-            "分段后的 RX 必须落在新段：{seg_files:?}"
+            "RX after mark must land in the new segment: {seg_files:?}"
         );
         let raw = std::fs::read(dir.join("sess-logorder.bin")).unwrap();
         let raw = String::from_utf8_lossy(&raw).to_string();
-        assert!(raw.contains("rx-1tx-1key-1"), "字节顺序：{raw:?}");
+        assert!(raw.contains("rx-1tx-1key-1"), "byte order: {raw:?}");
     }
 
-    /// Drop 排空：不调用 flush 直接销毁 SessionCtx，写线程必须把残余消息
-    /// 全部落盘后才退出（会话关闭 = 日志完整收尾，一字节不丢）。
+    /// Drop drain: dropping `SessionCtx` without calling `flush_logs` must still
+    /// drain all pending messages on the writer thread before exit (zero byte loss).
     #[test]
     fn ctx_drop_drains_pending_log_messages() {
         let dir = std::env::current_dir()
@@ -1113,13 +1117,19 @@ mod tests {
         for i in 0..64 {
             ctx.emit_raw(format!("drop-{i}").as_bytes());
         }
-        drop(ctx); // 不 flush，直接销毁
+        drop(ctx); // Drop directly without flushing.
         let text = std::fs::read_to_string(dir.join("sess-logdrop.log")).unwrap();
-        assert!(text.contains("drop-63"), "最后一条必须在：{text:?}");
-        assert!(text.contains("drop-0"), "第一条必须在：{text:?}");
+        assert!(
+            text.contains("drop-63"),
+            "last record must be persisted: {text:?}"
+        );
+        assert!(
+            text.contains("drop-0"),
+            "first record must be persisted: {text:?}"
+        );
     }
 
-    // ---- TX 合并（absorb_keystrokes）----
+    // ---- TX batching (`absorb_keystrokes`) ----
 
     fn push_writes(
         tx: &tokio::sync::mpsc::Sender<SessionCommand>,
@@ -1135,8 +1145,8 @@ mod tests {
         }
     }
 
-    /// 同租约连续键入合并为一个批次，字节按入队顺序拼接，
-    /// 每条原始命令保留独立元素（键入审计按原边界落盘）。
+    /// Consecutive same-lease keystrokes merge into one batch in enqueue order while
+    /// keeping each original command as a separate element for per-command audit logging.
     #[test]
     fn consecutive_same_lease_writes_merge_in_order() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -1146,12 +1156,16 @@ mod tests {
         });
         push_writes(&tx, lease.as_ref(), &[b"a", b"bc", b"def"]);
         let (batch, deferred) = absorb_keystrokes(&mut rx, b"x".to_vec(), lease.as_ref());
-        assert!(deferred.is_none(), "无异型命令残留");
-        assert_eq!(batch.concat(), b"xabcdef".to_vec(), "顺序必须保持");
-        assert_eq!(batch.len(), 4, "逐条原始边界保留");
+        assert!(deferred.is_none(), "no foreign command should remain");
+        assert_eq!(
+            batch.concat(),
+            b"xabcdef".to_vec(),
+            "byte order must be preserved"
+        );
+        assert_eq!(batch.len(), 4, "original command boundaries preserved");
     }
 
-    /// 异租约键入不合并；异型命令立即截断并交回。
+    /// Foreign-lease keystrokes are never merged; non-keystroke commands immediately truncate and return.
     #[test]
     fn foreign_lease_and_other_commands_are_deferred() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -1167,22 +1181,30 @@ mod tests {
         tx.try_send(SessionCommand::Resize { cols: 80, rows: 24 })
             .unwrap();
         let (batch, deferred) = absorb_keystrokes(&mut rx, b"gui".to_vec(), gui.as_ref());
-        assert_eq!(batch, vec![b"gui".to_vec()], "异租约不得并入");
+        assert_eq!(
+            batch,
+            vec![b"gui".to_vec()],
+            "foreign lease must not be merged"
+        );
         let Some(SessionCommand::WriteBytes { bytes, lease }) = deferred else {
-            panic!("异租约键入必须交回队列");
+            panic!("Return input with a different lease to the queue");
         };
         assert_eq!(bytes, b"agent".to_vec());
         assert_eq!(lease, agent);
-        // 再吸收一次：Resize 必须原样交回
+        // Absorb again: `Resize` must be returned untouched.
         let (batch, deferred) = absorb_keystrokes(&mut rx, b"z".to_vec(), agent.as_ref());
-        assert_eq!(batch, vec![b"z".to_vec()], "同租约但队列中已无键入");
+        assert_eq!(
+            batch,
+            vec![b"z".to_vec()],
+            "same lease with no more queued keystrokes"
+        );
         let Some(SessionCommand::Resize { cols, rows }) = deferred else {
-            panic!("Resize 必须原样交回");
+            panic!("Return the Resize command unchanged");
         };
         assert_eq!((cols, rows), (80, 24));
     }
 
-    /// 超过合并上限即截断：超限的键入整条留给下一轮，不拆分。
+    /// Truncate at the merge byte cap: oversized keystrokes are deferred whole without splitting.
     #[test]
     fn merge_stops_at_byte_cap() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -1200,13 +1222,13 @@ mod tests {
         let (batch, deferred) = absorb_keystrokes(&mut rx, big, lease.as_ref());
         assert_eq!(batch.iter().map(std::vec::Vec::len).sum::<usize>(), 200);
         let Some(SessionCommand::WriteBytes { bytes, lease: l }) = deferred else {
-            panic!("超限键入必须整条留给下一轮");
+            panic!("Leave the entire oversized input for the next batch");
         };
-        assert_eq!(bytes, big2, "超限键入不拆分");
+        assert_eq!(bytes, big2, "oversized keystroke must not be split");
         assert_eq!(l, lease);
     }
 
-    /// 无租约路径（lease = None）与空队列：只返回首条。
+    /// Unleased path (`lease = None`) with an empty queue returns only the initial payload.
     #[test]
     fn empty_queue_returns_first_only() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -1216,11 +1238,10 @@ mod tests {
         assert!(deferred.is_none());
     }
 
-    // ---- TX 合并边界（PERF-1：cap 两侧的运行时行为）----
+    // ---- TX batching boundaries (PERF-1: behavior on both sides of cap) ----
 
-    /// PERF-1 边界①：100 + 156 = 256 恰好触顶——`<=` 允许恰好填满上限的那条
-    /// 并入，触顶后循环条件退出，后续同租约键入整条留在队列给下一轮，既不
-    /// 拆分也不丢失（不改 absorb 的进退规则，cap 语义即可回归）。
+    /// PERF-1 boundary 1: 100 + 156 = 256 hits the exact cap (`<=` absorbs it),
+    /// then the loop exits without pulling the next same-lease keystroke from the queue.
     #[test]
     fn merge_accumulates_to_exact_cap_and_leaves_next_queued() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -1237,23 +1258,33 @@ mod tests {
             &[one_fiftysix.as_slice(), ten.as_slice()],
         );
         let (batch, deferred) = absorb_keystrokes(&mut rx, hundred, lease.as_ref());
-        assert_eq!(batch.len(), 2, "恰好触顶的那条必须并入");
+        assert_eq!(
+            batch.len(),
+            2,
+            "command reaching exact cap must be included"
+        );
         assert_eq!(
             batch.iter().map(std::vec::Vec::len).sum::<usize>(),
             TX_MERGE_BYTES,
-            "合并后恰好等于上限"
+            "merged size must equal exact cap"
         );
-        assert!(deferred.is_none(), "触顶退出时不得拉出后续命令");
+        assert!(
+            deferred.is_none(),
+            "exiting at exact cap must not pull the next command"
+        );
         let SessionCommand::WriteBytes { bytes, lease: l } = rx.try_recv().unwrap() else {
-            panic!("队列剩余的应是键入命令");
+            panic!("Expected the remaining command to be keyboard input");
         };
-        assert_eq!(bytes, ten, "超限键入整条留在队列（不拆分）");
+        assert_eq!(
+            bytes, ten,
+            "overflowing keystroke remains whole in the queue"
+        );
         assert_eq!(l, lease);
-        assert!(rx.try_recv().is_err(), "队列应已排空");
+        assert!(rx.try_recv().is_err(), "queue should now be empty");
     }
 
-    /// PERF-1 边界②：首条键入恰好等于上限——不再吸收任何命令（连同租约的
-    /// 也留在队列），批次只含首条且整条不拆分。
+    /// PERF-1 boundary 2: when the initial keystroke already equals the cap, nothing
+    /// else is absorbed and the next same-lease command stays queued untouched.
     #[test]
     fn first_command_at_cap_merges_nothing() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -1265,18 +1296,22 @@ mod tests {
         let small = vec![b'y'; 5];
         push_writes(&tx, lease.as_ref(), &[small.as_slice()]);
         let (batch, deferred) = absorb_keystrokes(&mut rx, at_cap.clone(), lease.as_ref());
-        assert_eq!(batch, vec![at_cap], "已达上限：批次只含首条，整条不拆分");
+        assert_eq!(
+            batch,
+            vec![at_cap],
+            "at cap: batch holds only the first command without splitting"
+        );
         assert!(deferred.is_none());
         let SessionCommand::WriteBytes { bytes, lease: l } = rx.try_recv().unwrap() else {
-            panic!("同租约键入应整条留在队列等下一轮");
+            panic!("Leave the entire same-lease command for the next batch");
         };
         assert_eq!(bytes, small);
         assert_eq!(l, lease);
     }
 
-    /// PERF-1 持续突发：10 × 60B 同租约（600B > 256B cap）分 3 轮吸收
-    /// （4+4+2），每轮 ≤ cap、每条原始命令整条保留；deferred 原样退回后作为
-    /// 下一轮 first——三轮拼接与入队顺序严格一致，一字节不丢、不重排。
+    /// PERF-1 sustained burst: 10 x 60 B same-lease commands (600 B > 256 B cap)
+    /// absorb in 3 rounds (4 + 4 + 2), each <= cap with every command intact and
+    /// globally ordered without drops or reordering.
     #[test]
     fn sustained_burst_merges_in_order_without_splitting_commands() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -1289,22 +1324,22 @@ mod tests {
         push_writes(&tx, lease.as_ref(), &rest);
         let (b1, d1) = absorb_keystrokes(&mut rx, cmds[0].clone(), lease.as_ref());
         let Some(SessionCommand::WriteBytes { bytes, lease: l }) = d1 else {
-            panic!("第 5 条必须整条退回");
+            panic!("Return the entire fifth command to the queue");
         };
         assert_eq!(bytes, cmds[4]);
         assert_eq!(l, lease);
         let (b2, d2) = absorb_keystrokes(&mut rx, bytes, lease.as_ref());
         let Some(SessionCommand::WriteBytes { bytes, lease: l }) = d2 else {
-            panic!("第 9 条必须整条退回");
+            panic!("Return the entire ninth command to the queue");
         };
         assert_eq!(bytes, cmds[8]);
         assert_eq!(l, lease);
         let (b3, d3) = absorb_keystrokes(&mut rx, bytes, lease.as_ref());
-        assert!(d3.is_none(), "突发应全部消化");
+        assert!(d3.is_none(), "entire burst should be consumed");
         for batch in [&b1, &b2, &b3] {
             assert!(
                 batch.iter().map(std::vec::Vec::len).sum::<usize>() <= TX_MERGE_BYTES,
-                "每轮批次不得超过合并上限"
+                "batch size must not exceed merge cap"
             );
         }
         assert_eq!(b1.len(), 4);
@@ -1312,12 +1347,14 @@ mod tests {
         assert_eq!(b3.len(), 2);
         let merged: Vec<&Vec<u8>> = b1.iter().chain(b2.iter()).chain(b3.iter()).collect();
         let expected: Vec<&Vec<u8>> = cmds.iter().collect();
-        assert_eq!(merged, expected, "跨轮合并不得重排或拆分任何命令");
+        assert_eq!(
+            merged, expected,
+            "cross-round batching must not reorder or split commands"
+        );
     }
 
-    /// PERF-1 异租约截断：gui 突发中间混入 agent 键入——吸收立即截断（agent
-    /// 之后的同租约键入不得被跳过提前合并），异租约命令原样交回；按退回顺序
-    /// 逐轮执行后全局顺序与入队顺序一致。
+    /// PERF-1 interleaved lease truncation: an agent write inside a GUI burst truncates
+    /// absorption immediately without skipping ahead to later GUI commands, preserving global order.
     #[test]
     fn interleaved_lease_burst_truncates_at_foreign_command() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -1335,21 +1372,23 @@ mod tests {
         let c3 = vec![b'd'; 50];
         push_writes(&tx, agent.as_ref(), &[c1.as_slice()]);
         push_writes(&tx, gui.as_ref(), &[c2.as_slice(), c3.as_slice()]);
-        // 轮 1：c0(gui) 后紧跟异租约 c1 → 立即截断：批次只含首条，c1 原样交回
-        // （若 absorb 跳过异租约继续吸收，b1 会变成 [c0, c2, c3]）
+        // Round 1: `c0` (gui) followed by foreign `c1` truncates immediately and returns `c1`.
         let (b1, d1) = absorb_keystrokes(&mut rx, c0.clone(), gui.as_ref());
-        assert_eq!(b1, vec![c0.clone()], "异租约前的批次只含首条");
+        assert_eq!(
+            b1,
+            vec![c0.clone()],
+            "batch before foreign lease must contain only the first command"
+        );
         let Some(SessionCommand::WriteBytes {
             bytes: deferred1,
             lease: l1,
         }) = d1
         else {
-            panic!("异租约键入必须原样交回");
+            panic!("Return input with a different lease unchanged");
         };
         assert_eq!(deferred1, c1);
         assert_eq!(l1, agent);
-        // 轮 2：退回的 c1(agent) 后是 gui 的 c2 → 再次截断。deferred2 == c2
-        // 同时证明轮 1 未跳过/丢弃异租约后面的同租约键入（c2 仍在 c3 之前）。
+        // Round 2: deferred `c1` (agent) followed by gui `c2` truncates again, proving `c2` stayed before `c3`.
         let (b2, d2) = absorb_keystrokes(&mut rx, deferred1, agent.as_ref());
         assert_eq!(b2, vec![c1.clone()]);
         let Some(SessionCommand::WriteBytes {
@@ -1357,22 +1396,22 @@ mod tests {
             lease: l2,
         }) = d2
         else {
-            panic!("异租约键入必须原样交回");
+            panic!("Return input with a different lease unchanged");
         };
         assert_eq!(deferred2, c2);
         assert_eq!(l2, gui);
-        // 轮 3：c2 与 c3 同租约 → 合并，突发全部消化
+        // Round 3: `c2` and `c3` share the GUI lease and merge cleanly.
         let (b3, d3) = absorb_keystrokes(&mut rx, deferred2, gui.as_ref());
         assert!(d3.is_none());
         assert_eq!(b3, vec![c2.clone(), c3.clone()]);
     }
 
-    // ---- RX 日志管道（PERF-2：总线同步发布 + 磁盘 I/O 只在写线程）----
+    // ---- RX log pipeline (PERF-2: synchronous bus publish + disk I/O only on writer thread) ----
 
-    /// PERF-2：emit_raw 必须先同步把 `SerialChunk` 发上总线（MCP `serial_read` /
-    /// 审计源不变），且调用路径零磁盘 I/O。用「测试线程持锁卡住写线程」的
-    /// 手法确定性证明（代替会闪断的时限断言）：写线程被挡住期间 .log/.bin
-    /// 必然为空——若有同步写盘，文件早就非空；放锁 + 排空屏障后逐条落齐。
+    /// PERF-2: `emit_raw` synchronously publishes `SerialChunk` to the bus (preserving
+    /// MCP `serial_read` / audit visibility) with zero disk I/O on the caller thread.
+    /// Holding the log mutex blocks the writer thread deterministically so `.log`/`.bin`
+    /// stay empty until released, then drain in order on `flush_logs`.
     #[test]
     fn emit_raw_publishes_to_bus_synchronously_and_defers_disk_to_writer() {
         let dir = std::env::current_dir()
@@ -1385,12 +1424,12 @@ mod tests {
             SessionLogWriter::new(&dir, "sess-busio").unwrap(),
         ));
         let ctx = SessionCtx::new("dut-busio", "sess-busio", bus.clone()).with_logs(logs.clone());
-        // ① 持有日志互斥量：写线程收到消息后会卡在 lock 上，期间磁盘必然无写入
+        // 1) Hold the log mutex so the writer thread blocks on lock before writing to disk.
         let guard = logs.lock().unwrap();
         ctx.emit_raw(b"rx-bus-1");
         ctx.emit_raw(b"rx-bus-2");
         ctx.log_tx(b"tx-bus", "tx-bus");
-        // ② emit_raw 返回即能在总线读到（同步发布，MCP serial_read 源不变）
+        // 2) `emit_raw` returns with chunks already visible on the bus synchronously.
         let chunks: Vec<String> = bus
             .read_log("sess-busio", 0, usize::MAX)
             .iter()
@@ -1402,41 +1441,40 @@ mod tests {
         assert_eq!(
             chunks,
             vec!["rx-bus-1".to_string(), "rx-bus-2".to_string()],
-            "RX 块必须同步上总线"
+            "RX chunks must be published to the bus synchronously"
         );
-        // ③ 写线程被锁挡住 → 两个日志文件必须仍为空：调用线程没碰过磁盘
+        // 3) While the writer thread is blocked, both log files stay empty (no caller-thread disk I/O).
         assert_eq!(
             std::fs::read_to_string(dir.join("sess-busio.log")).unwrap(),
             "",
-            "RX 调用路径零磁盘 I/O：写线程未放行前 .log 必须为空"
+            "zero caller-thread disk I/O: .log must stay empty while writer is blocked"
         );
         assert!(
             std::fs::read(dir.join("sess-busio.bin"))
                 .unwrap()
                 .is_empty(),
-            "RX 调用路径零磁盘 I/O：写线程未放行前 .bin 必须为空"
+            "zero caller-thread disk I/O: .bin must stay empty while writer is blocked"
         );
         drop(guard);
-        // ④ 排空屏障 ack = 此前入队消息全部按旧同步语义逐条 write+flush 落盘
+        // 4) Flush barrier ensures all queued messages are written and flushed in order.
         ctx.flush_logs();
         let text = std::fs::read_to_string(dir.join("sess-busio.log")).unwrap();
         assert_eq!(
             text, "rx-bus-1\nrx-bus-2\n[TX] tx-bus\n",
-            "放锁后写线程必须按入队顺序落齐"
+            "writer thread must flush queued records in order after unlock"
         );
         assert_eq!(
             String::from_utf8_lossy(&std::fs::read(dir.join("sess-busio.bin")).unwrap()),
             "rx-bus-1rx-bus-2tx-bus",
-            ".bin 字节顺序与入队顺序一致"
+            ".bin byte order must match enqueue order"
         );
     }
 
-    // ---- 会话关闭收尾（LOG-6：Drop 排空 + 字节级无损）----
+    // ---- Session shutdown drain (LOG-6: Drop drain + byte-exact preservation) ----
 
-    /// LOG-6：不 flush 直接 drop（会话关闭路径），写线程必须把残余消息全部
-    /// 落盘后才退出（Drop 的 condvar 等待）——drop 返回后 .log/.bin 立即可读，
-    /// 且 .bin 逐字节等于入队顺序拼接（RX/TX/键入/注记不重排、不丢一字节，
-    /// 含多字节 UTF-8、\r\n 线上字节与退格 0x7f）。
+    /// LOG-6: dropping `SessionCtx` without flushing drains every queued record on the
+    /// writer thread via condvar wait; `.bin` matches the exact byte concatenation of
+    /// RX/TX/keystrokes/notes (including multibyte UTF-8, `\r\n`, and `0x7f`).
     #[test]
     fn ctx_drop_drains_mixed_stream_byte_exact_in_order() {
         let dir = std::env::current_dir()
@@ -1457,7 +1495,7 @@ mod tests {
         ctx.log_tx(b"T2\r\n", "T2");
         ctx.log_keystrokes(&[b'K', b'2', 0x7f]);
         ctx.emit_text("[note] N2", ChunkStyle::Dim);
-        drop(ctx); // 不 flush，直接销毁：Drop 关通道 → 写线程排空后才退出
+        drop(ctx); // Drop directly without flushing; Drop closes the channel and waits for drain.
         let mut expected = Vec::new();
         expected.extend_from_slice(b"R1");
         expected.extend_from_slice(b"T1");
@@ -1470,19 +1508,18 @@ mod tests {
         let raw = std::fs::read(dir.join("sess-drop6.bin")).unwrap();
         assert_eq!(
             raw, expected,
-            ".bin 必须逐字节等于入队顺序拼接（一字节不丢、不重排）"
+            ".bin must equal exact byte concatenation in enqueue order"
         );
         let text = std::fs::read_to_string(dir.join("sess-drop6.log")).unwrap();
         assert_eq!(
             text, "R1\n[TX] T1\n[note] N1\nR2-中文\n[TX] T2\n[note] N2\n",
-            ".log 行序必须与入队顺序一致"
+            ".log line order must match enqueue order"
         );
     }
 
-    /// LOG-7：`.rec` 结构化记录流与 .log/.bin 同步零丢失——同一混合流不 flush
-    /// 直接 drop，排空后 .rec 按 kind 逐一对应入队顺序；Raw/Tx/Keystrokes 载荷
-    /// 与 .bin 分段一致（多字节 UTF-8、\r\n、0x7f 原样），Note 行文本独立成
-    /// 记录；zerocopy 零拷贝解析回读全程不丢不重排。
+    /// LOG-7: structured `.rec` stream drains losslessly alongside `.log`/`.bin` on drop,
+    /// preserving record kinds, exact payloads (multibyte UTF-8, `\r\n`, `0x7f`), and
+    /// non-decreasing timestamps for zero-copy parsing.
     #[test]
     fn ctx_drop_drains_rec_records_in_order() {
         let dir = std::env::current_dir()
@@ -1522,7 +1559,7 @@ mod tests {
                 RecKind::Note,
                 RecKind::Mark,
             ],
-            ".rec 记录顺序必须与入队顺序一致"
+            ".rec record order must match enqueue order"
         );
         let payloads: Vec<&[u8]> = batch.records.iter().map(|record| record.payload).collect();
         assert_eq!(
@@ -1538,10 +1575,14 @@ mod tests {
                 b"[note] N2".as_slice(),
                 "[mark] 供电边界".as_bytes(),
             ],
-            ".rec 载荷必须与入队内容逐字节一致"
+            ".rec payloads must match enqueued bytes exactly"
         );
-        assert_eq!(batch.valid_bytes, raw.len(), "排空后不允许有残余尾记录");
-        // 时间戳按消费序单调不减（单消费者 = 入队序）
+        assert_eq!(
+            batch.valid_bytes,
+            raw.len(),
+            "no truncated trailing record allowed after drain"
+        );
+        // Timestamps are non-decreasing in consumer (enqueue) order.
         let stamps: Vec<u64> = batch
             .records
             .iter()
@@ -1549,15 +1590,14 @@ mod tests {
             .collect();
         assert!(
             stamps.windows(2).all(|pair| pair[0] <= pair[1]),
-            "时间戳必须单调不减: {stamps:?}"
+            "timestamps must be non-decreasing: {stamps:?}"
         );
     }
 
-    /// LOG-12：portable 归档模式（桌面产品实际装配形状）下写线程链路零丢失
-    /// ——saving 开启时首条消息触发段目录创建，drop 排空后 txt/bin/rec 三流
-    /// 同段落盘。名字用合法形状（COM 口名是 Windows 保留名，直传会被
-    /// `name_component` 拒绝且错误被写线程静默吞掉——桌面侧由
-    /// `archive_safe_name` 守卫兜底）。
+    /// LOG-12: portable archive mode (desktop layout) drains all three streams (`txt`/`bin`/`rec`)
+    /// losslessly on drop; the first message creates the segment directory when saving is enabled.
+    /// Uses a valid archive-safe name (raw COM port names are reserved on Windows and rejected by
+    /// `name_component`; the desktop layer guards them via `archive_safe_name`).
     #[test]
     fn ctx_portable_archive_drains_all_three_streams() {
         let root = std::env::current_dir()
@@ -1576,14 +1616,16 @@ mod tests {
         ctx.log_keystrokes(b"k1");
         ctx.emit_raw(b"R1");
         drop(ctx);
-        let logs_dir = root.join("dut-com8").join("logs");
+        let logs_dir = root
+            .join("dut-com8")
+            .join(duthub_core::dut_artifacts::SERIAL_LOGS_DIR);
         let entries: Vec<String> = std::fs::read_dir(&logs_dir)
-            .expect("portable 段目录必须被首条消息创建")
+            .expect("first message must create portable segment directory")
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().to_string())
             .filter(|name| name != ".log-sequence")
             .collect();
-        assert_eq!(entries.len(), 3, "三条流各一段: {entries:?}");
+        assert_eq!(entries.len(), 3, "one segment per stream: {entries:?}");
         assert!(entries.iter().all(|name| name.starts_with("dut-com8-001_")));
         assert!(entries.iter().any(|name| {
             std::path::Path::new(name)
@@ -1603,10 +1645,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// PERF-1 审计侧：合并批次的每条原始命令逐条喂键入审计（仅 .bin），中间
-    /// 夹设备 RX 块——.bin 必须按调用顺序逐字节落盘（键入→RX→键入→RX→键入），
-    /// 证明「每条原始命令保持独立元素」最终体现在审计流按原边界有序、一字节
-    /// 不丢；键入审计只进 .bin，.log 不受影响。
+    /// PERF-1 audit side: each element of a merged keystroke batch logs to `.bin`
+    /// independently interleaved with RX chunks, verifying exact ordering and that
+    /// keystroke audit never enters `.log`.
     #[test]
     fn merged_batch_keystroke_audit_lands_per_command_in_order() {
         let dir = std::env::current_dir()
@@ -1631,7 +1672,7 @@ mod tests {
         assert_eq!(
             batch,
             vec![b"l".to_vec(), second.clone(), backspace.clone()],
-            "合并批次必须逐元素保留原命令"
+            "merged batch must preserve each original command element"
         );
         let bus = Arc::new(EventBus::new(64));
         let logs = Arc::new(std::sync::Mutex::new(
@@ -1649,16 +1690,20 @@ mod tests {
             expected.extend_from_slice(b"<echo>");
         }
         let raw = std::fs::read(dir.join("sess-kaudit.bin")).unwrap();
-        assert_eq!(raw, expected, ".bin 必须按原始命令边界逐条有序落盘");
+        assert_eq!(
+            raw, expected,
+            ".bin must persist each original command boundary in order"
+        );
         let text = std::fs::read_to_string(dir.join("sess-kaudit.log")).unwrap();
         assert_eq!(
             text, "<echo>\n<echo>\n<echo>\n",
-            "键入审计只进 .bin，不进 .log"
+            "keystroke audit must go only to .bin, not .log"
         );
     }
 
-    /// 乱码检测接线：开关来自共享的每 DUT map，原始字节在 `emit_raw` 采样，
-    /// 结论随快照发布；关闭即复位为 Clean。SerialChunk 文本/顺序不受影响。
+    /// Garble detection wiring: enabled via the shared per-DUT map, raw bytes are sampled
+    /// in `emit_raw`, verdicts attach to published snapshots, disabling resets to `Clean`,
+    /// and `SerialChunk` text/order remain unchanged.
     #[test]
     fn garble_reaches_the_snapshot_only_when_enabled() {
         let bus = Arc::new(EventBus::new(64));
@@ -1686,7 +1731,7 @@ mod tests {
         assert_eq!(
             chunks,
             vec!["\0".repeat(512), "ok\r\n".to_string()],
-            "检测不得改变 SerialChunk 的文本与顺序"
+            "garble detection must not alter SerialChunk text or order"
         );
         let screen = events
             .iter()
@@ -1695,7 +1740,7 @@ mod tests {
                 UiEvent::SerialScreen { screen } => Some(screen.clone()),
                 _ => None,
             })
-            .expect("快照必须上总线");
+            .expect("snapshot must be published to bus");
         assert_eq!(screen.garbled.level, duthub_core::ipc::GarbleLevel::Garbled);
         assert!(screen.garbled.control_permille > 0);
         assert_eq!(screen.garbled.window_bytes, 516);
@@ -1714,7 +1759,7 @@ mod tests {
                 UiEvent::SerialScreen { screen } => Some(screen),
                 _ => None,
             })
-            .expect("快照必须上总线");
+            .expect("snapshot must be published to bus");
         assert_eq!(screen.garbled.level, duthub_core::ipc::GarbleLevel::Clean);
         assert_eq!(screen.garbled.control_permille, 0);
         assert_eq!(screen.garbled.window_bytes, 0);

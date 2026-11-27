@@ -142,6 +142,14 @@ impl TerminalSelection {
         start >= end
     }
 
+    /// Shifts all row indices downward by `delta` when older lines are prepended.
+    pub fn shift_rows(&mut self, delta: usize) {
+        self.anchor_start.row = self.anchor_start.row.saturating_add(delta);
+        self.anchor_end.row = self.anchor_end.row.saturating_add(delta);
+        self.focus_start.row = self.focus_start.row.saturating_add(delta);
+        self.focus_end.row = self.focus_end.row.saturating_add(delta);
+    }
+
     /// Returns the selected character range `(start_col, end_col)` for `row`,
     /// or `None` if `row` is outside the selection or has no selected chars.
     pub fn row_range(&self, row: usize, row_char_len: usize) -> Option<(usize, usize)> {
@@ -427,6 +435,33 @@ mod tests {
         assert_eq!(
             sel.extract_text(2, rows(&["alpha", "beta"])).as_deref(),
             Some("alpha\nbeta")
+        );
+    }
+
+    #[test]
+    fn shift_rows_keeps_selection_aligned_after_history_prepend() {
+        let mut sel = TerminalSelection::start_char(TextPoint { row: 2, col: 1 });
+        sel.update(TextPoint { row: 4, col: 5 }, "123456");
+        sel.shift_rows(3000);
+        assert_eq!(
+            sel.normalized(),
+            (
+                TextPoint { row: 3002, col: 1 },
+                TextPoint { row: 3004, col: 5 }
+            )
+        );
+    }
+
+    #[test]
+    fn hit_test_row_stays_accurate_deep_in_scrollback_with_snapped_row_height() {
+        // Simulates a 4000-row scrollback where Taffy snapped 20.6 px to 21.0 px (100% DPI).
+        let snapped_row_height = 21.0_f32;
+        let item_count = 4000;
+        let target_row = 3950;
+        let rel_y = 3950.0_f32 * snapped_row_height + 5.0;
+        assert_eq!(
+            hit_test_row(rel_y, snapped_row_height, item_count),
+            Some(RowHit::Row(target_row))
         );
     }
 }

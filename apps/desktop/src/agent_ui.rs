@@ -868,21 +868,21 @@ pub fn transcript_agent_tag(
 pub enum ProgramSource {
     /// Legacy variant: the build-time embedded goose that duthub used to ship.
     ///
-    /// Nothing is embedded any more (2026-11-24, goose is downloaded through the
+    /// Nothing is embedded any more (goose is downloaded through the
     /// tool-downloads page), so no product path selects this for a *session* —
     /// only the Licenses page still renders it to state that goose is not
     /// bundled. Kept as a variant because `pages.rs` names it.
     Embedded,
     /// A program duthub did not verify: a configured external program, a
     /// downloaded install or a PATH binary. duthub never runs a signature-chain
-    /// check, so the badge must say 「未验证」 (unverified) — never 「未签名」,
+    /// Check. So, the badge should display "Unverified". Never display "Unsigned".
     /// which would claim the *absence* of a signature had been proven.
     External,
 }
 
 /// Badge projection for the program source + recorded signature string.
 /// The bin layer maps each variant onto its localized text — external
-/// programs must render as 「未验证」 (unverified), never 「未签名」.
+/// Programs must be marked as "unverified", never "unsigned".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthenticodeBadge {
     /// External program: no signature-chain verification was performed.
@@ -952,7 +952,7 @@ pub fn inspector_audit_events(
 }
 
 /// Transcript System entries that record a permission denial. The host
-/// worker writes `AcpEvent::PermissionDenied` as 「已拒绝权限请求：{title}」;
+/// The worker logs "`AcpEvent::PermissionDenied`" as "Permission request denied: {title}".
 /// the Inspector lists them as the session's permission-denial evidence.
 #[must_use]
 pub fn permission_denial_entries(entries: &[TranscriptEntry]) -> Vec<String> {
@@ -968,6 +968,19 @@ pub fn permission_denial_entries(entries: &[TranscriptEntry]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Client config snippets (per-DUT MCP listener + A2A discovery)
 // ---------------------------------------------------------------------------
+
+/// Endpoint URL embedded in the `.mcp.json` snippet for one per-DUT MCP
+/// listener: prefers the detected LAN IP when LAN access is enabled so the
+/// snippet can be copied directly to remote clients, and falls back to
+/// loopback otherwise.
+#[must_use]
+pub fn mcp_client_url(port: u16, lan_ip: Option<std::net::IpAddr>) -> String {
+    let addr = std::net::SocketAddr::new(
+        lan_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        port,
+    );
+    format!("http://{addr}/mcp")
+}
 
 /// `.mcp.json` fragment for one per-DUT listener. The Bearer token is embedded
 /// verbatim: this text exists to be pasted into a client config, and the panel

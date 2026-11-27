@@ -1,4 +1,4 @@
-# 枚举指定 pid 的所有顶层窗口（含无标题）
+# List every top-level window for a PID, including untitled windows.
 param([int]$TargetPid = 0, [int]$Hwnd = 0)
 Add-Type @"
 using System;

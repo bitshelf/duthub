@@ -49,7 +49,7 @@ fn a2a_status_running_shows_only_loopback_url() {
     assert_eq!(
         view.card_url.as_deref(),
         Some("http://127.0.0.1:8790/.well-known/agent-card.json"),
-        "Running 状态必须给出且只给出回环 Agent Card URL"
+        "A running listener must expose only its loopback Agent Card URL"
     );
     assert!(view.card_url.unwrap().starts_with("http://127.0.0.1:"));
     assert!(!view.failed);
@@ -64,7 +64,7 @@ fn a2a_status_running_shows_only_loopback_url() {
         },
     ] {
         let view = a2a_endpoint_view(&config, &status);
-        assert!(view.card_url.is_none(), "{status:?} 不得给出 URL");
+        assert!(view.card_url.is_none(), "{status:?} must not expose a URL");
     }
     let failed = a2a_endpoint_view(
         &config,
@@ -72,7 +72,7 @@ fn a2a_status_running_shows_only_loopback_url() {
             reason: "A2A token 未配置".into(),
         },
     );
-    assert!(failed.failed, "Failed 必须标记为失败行");
+    assert!(failed.failed, "A failed listener must be marked as failed");
     assert!(failed.status_text.contains("A2A token 未配置"));
 }
 
@@ -92,7 +92,9 @@ fn post_jsonrpc(port: u16, bearer: Option<&str>, body: &str) -> Result<String, S
         body.len()
     );
     if let Some(bearer) = bearer {
-        request.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
+        request.push_str("Authorization: Bearer ");
+        request.push_str(bearer);
+        request.push_str("\r\n");
     }
     request.push_str("\r\n");
     request.push_str(body);
@@ -141,14 +143,14 @@ async fn a2a_token_rotation_invalidates_old_token() {
             statuses.first().map(|(_, status)| status),
             Some(A2aStatus::Running { .. })
         ) {
-            last_error = format!("start 未 Running: {statuses:?}");
+            last_error = format!("The listener never reached Running: {statuses:?}");
             continue;
         }
         let expected_ok = |response: Result<String, String>, what: &str| {
             let response = response.expect(what);
             assert!(
                 !response.starts_with("HTTP/1.1 401"),
-                "{what}: 有效 Token 不得 401: {response}"
+                "{what}: a valid token must not return 401: {response}"
             );
         };
         // Old token accepted before rotation.
@@ -160,7 +162,7 @@ async fn a2a_token_rotation_invalidates_old_token() {
             post_jsonrpc(port, Some("tok-B"), body)
                 .unwrap()
                 .starts_with("HTTP/1.1 401"),
-            "rotation before: tok-B 必须 401"
+            "Before rotation, tok-B must return 401"
         );
 
         // Rotate: persist through the token source and hot-swap the listener.
@@ -172,7 +174,7 @@ async fn a2a_token_rotation_invalidates_old_token() {
         let old = post_jsonrpc(port, Some("tok-A"), body).unwrap();
         assert!(
             old.starts_with("HTTP/1.1 401"),
-            "轮换后旧 Token 立即失效（期望 401）: {old}"
+            "The prior token must return 401 immediately after rotation: {old}"
         );
         expected_ok(
             post_jsonrpc(port, Some("tok-B"), body),
@@ -181,7 +183,7 @@ async fn a2a_token_rotation_invalidates_old_token() {
         runtime.shutdown().await;
         return;
     }
-    panic!("A2A 监听器始终无法绑定: {last_error}");
+    panic!("The A2A listener could not bind: {last_error}");
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +192,7 @@ async fn a2a_token_rotation_invalidates_old_token() {
 
 #[test]
 fn a2a_port_zero_and_reserved_rejected() {
-    assert!(validate_a2a_port(0, &[]).is_err(), "port 0 必须拒绝");
+    assert!(validate_a2a_port(0, &[]).is_err(), "Reject port zero");
     assert!(validate_a2a_port(0, &[8797]).is_err());
     let reserved_err = validate_a2a_port(8797, &[8797]).unwrap_err();
     assert!(reserved_err.contains("8797"));
@@ -204,7 +206,7 @@ fn a2a_port_zero_and_reserved_rejected() {
     assert_eq!(
         reserved.iter().filter(|&&port| port == 9000).count(),
         1,
-        "重复端口必须去重"
+        "Remove duplicate ports"
     );
     assert!(reserved.contains(&9001));
 }
@@ -266,7 +268,7 @@ impl DutCleanupOps for MockOps {
 #[test]
 fn remove_plan_runs_strip_before_persist_and_stops_before_dir_delete() {
     let mut ops = MockOps::default();
-    let outcome = run_remove_dut(&mut ops, "dut-1").expect("完整清理应成功");
+    let outcome = run_remove_dut(&mut ops, "dut-1").expect("complete cleanup successfully");
     assert_eq!(
         ops.trace,
         [
@@ -276,13 +278,13 @@ fn remove_plan_runs_strip_before_persist_and_stops_before_dir_delete() {
             "delete_a2a_token",
             "delete_agent_dir"
         ],
-        "五步清理必须按固定顺序执行"
+        "Run the five cleanup stages in order"
     );
     let position = |step: &str| ops.trace.iter().position(|s| *s == step).unwrap();
     assert!(position("strip_mcp") < position("persist_removal"));
     assert!(position("stop_and_join") < position("delete_agent_dir"));
     assert_eq!(outcome.dut_id, "dut-1");
-    assert!(outcome.complete, "无失败时不得有 warning");
+    assert!(outcome.complete, "Successful cleanup must have no warnings");
     assert_eq!(outcome.warnings, [] as [std::string::String; 0]);
     assert_eq!(
         outcome.steps,
@@ -302,12 +304,12 @@ fn remove_plan_persist_failure_stops_before_stop() {
         persist_error: Some("duts.json 写盘失败".into()),
         ..Default::default()
     };
-    let error = run_remove_dut(&mut ops, "dut-2").expect_err("persist 失败必须 Err");
+    let error = run_remove_dut(&mut ops, "dut-2").expect_err("return the persistence failure");
     assert!(error.contains("duts.json"));
     assert_eq!(
         ops.trace,
         ["strip_mcp", "persist_removal"],
-        "persist 失败后不得停止任何运行时（DUT 保持原状）"
+        "A persistence failure must leave the DUT runtimes intact"
     );
     assert!(!ops.trace.contains(&"stop_and_join"));
 }
@@ -319,8 +321,12 @@ fn remove_plan_token_failure_writes_pending_cleanup() {
         dir_error: Some("目录被占用".into()),
         ..Default::default()
     };
-    let outcome = run_remove_dut(&mut ops, "dut-3").expect("best-effort 失败不改变 Ok 结果");
-    assert!(!outcome.complete, "Token/目录失败不得谎称清理完成");
+    let outcome =
+        run_remove_dut(&mut ops, "dut-3").expect("continue after a best-effort cleanup failure");
+    assert!(
+        !outcome.complete,
+        "Token or directory cleanup failure must leave the operation incomplete"
+    );
     assert_eq!(outcome.warnings.len(), 2);
     assert!(outcome.warnings[0].contains("A2A Token"));
     assert!(outcome.warnings[1].contains("Agent 目录"));
@@ -352,7 +358,7 @@ fn remove_dir_idempotent_when_missing() {
     delete_agent_dir_idempotent(&work, "dut-missing").unwrap();
     assert!(
         !work.join("agent").join("dut").exists(),
-        "删除不得把目录重新建出来"
+        "Deletion must not recreate the directory"
     );
     // Existing directory: deleted on the first call and Ok again afterwards.
     let key = duthub_core::store::agent_dut_key("dut-gone").unwrap();
@@ -377,7 +383,7 @@ fn export_contains_secret_blocks_write() {
         name: "workbench peer".into(),
         card_url: "http://127.0.0.1:8790/.well-known/agent-card.json".into(),
     }];
-    let payload = a2a_export_payload(&clean).expect("干净的 peers 必须放行");
+    let payload = a2a_export_payload(&clean).expect("export peers without credentials");
     assert!(payload.is_array());
     assert_eq!(payload[0]["agentCardUrl"], clean[0].card_url);
 
@@ -386,7 +392,7 @@ fn export_contains_secret_blocks_write() {
         name: "smuggler".into(),
         card_url: "https://remote.example/agent-card?token=supersecret-token-value".into(),
     }];
-    let error = a2a_export_payload(&smuggled).expect_err("疑似密钥必须 fail closed");
+    let error = a2a_export_payload(&smuggled).expect_err("reject suspected credentials");
     assert!(error.contains("拒绝") || error.contains("fail closed"));
     // Keyed fields are refused too, not just values.
     let payload_with_key = serde_json::json!({"apiKey": "sk-1234567890"});
@@ -418,11 +424,14 @@ fn os_isolation_badge_never_says_os_sandboxed_when_probe_false() {
     );
 
     let label = effective_trust_label("os_sandboxed", SandboxBoundaryProof::Unverified);
-    assert!(label.contains("未验证"), "无后端证明必须降级: {label}");
+    assert!(
+        label.contains("未验证"),
+        "Without backend proof, the label must show an unverified state: {label}"
+    );
     assert!(!label.contains("os_sandboxed"));
     assert!(
         !label.contains("OS 沙箱") && !label.contains("已验证"),
-        "降级文案不得同时宣称沙箱已启用: {label}"
+        "An unverified label must not claim an active OS sandbox: {label}"
     );
 
     // Partial backend (supported, but missing read_deny) must stay Unverified.
@@ -468,7 +477,7 @@ fn os_isolation_badge_never_says_os_sandboxed_when_probe_false() {
     assert_eq!(proven, "OS 沙箱（已验证）");
     assert!(
         !proven.contains("未验证"),
-        "已验证口径不得混入未验证: {proven}"
+        "A verified label must not report an unverified state: {proven}"
     );
 
     // Other levels are unchanged.
@@ -486,15 +495,15 @@ fn os_isolation_badge_never_says_os_sandboxed_when_probe_false() {
     let pages = source_of("pages.rs");
     assert!(
         pages.contains("sandbox_boundary_proof(&sandbox_status)"),
-        "Agent 页必须由真实 MXC status 推导边界证明"
+        "Agent settings must derive isolation proof from the actual MXC status"
     );
     assert!(
         pages.contains("format_sandbox_status(&sandbox_status)"),
-        "Agent 页必须展示本地化 MXC 沙箱状态"
+        "Agent settings must show localized MXC isolation status"
     );
     assert!(
         !pages.contains("SandboxBoundaryProof::Unverified"),
-        "Agent 页不再硬编码 Unverified 占位"
+        "Agent settings must not hard-code an unverified placeholder"
     );
 }
 
@@ -502,47 +511,51 @@ fn os_isolation_badge_never_says_os_sandboxed_when_probe_false() {
 // 10. MCP bind failure is recorded and shown
 // ---------------------------------------------------------------------------
 
-/// W4a 契约：MCP 端点绑定失败不再只有 eprintln —— 记录进
-/// `McpRuntimeHandles::failures`（带原因），Agent 接入页/连接管理 MCP 卡经
-/// `failure_for_port` / `failures` 展示，退出钩子仍关闭句柄。
+/// W4a contract: MCP endpoint bind failures are no longer only logged via `eprintln!` — they are
+/// recorded in `McpRuntimeHandles::failures` (with reasons), surfaced on the Agent access page and
+/// connection-management MCP card via `failure_for_port` / `failures`, and shutdown still closes
+/// handles.
 ///
-/// `spawn_mcp_runtime`/`McpRuntimeHandles` 被 `plan_badges.rs` 的源码契约钉
-/// 在 bin target（lib test 无法实例化 bin 模块），因此按同款模式做源码断言。
+/// `spawn_mcp_runtime` / `McpRuntimeHandles` are pinned in the bin target by `plan_badges.rs`
+/// (lib tests cannot instantiate bin modules), so this follows the same source-contract pattern.
 #[test]
 fn mcp_bind_failure_recorded_and_shown() {
     let runtime = source_of("mcp_runtime.rs");
     assert!(
         runtime.contains("pub failures: Vec<(u16, String)>"),
-        "McpRuntimeHandles 必须携带绑定失败记录容器"
+        "McpRuntimeHandles must report bind failures"
     );
     assert!(
         runtime.contains("failure_for_port"),
-        "必须提供按端口查询失败原因的展示入口"
+        "Expose the failure reason by listener port"
     );
     assert!(
         runtime.contains("绑定 {bind_addr} 失败") && runtime.contains("启动 HTTP 服务失败"),
-        "bind/spawn 失败必须记录可读原因，不得静默 continue"
+        "Bind and startup failures must record a readable reason"
     );
 
     let pages = source_of("pages.rs");
     assert!(
         pages.contains("failure_for_port") && pages.contains("w.mcp_runtime.failures"),
-        "Agent 接入页 / MCP 卡必须实际展示监听失败原因"
+        "Agent access and the MCP card must surface listener failures"
     );
 
     let workspace = source_of("workspace.rs");
     assert!(
         workspace.contains("impl Drop for Workbench")
             && workspace.contains("mcp_runtime.shutdown()"),
-        "退出钩子必须关闭监听器句柄（T16）"
+        "Shutdown must close listener handles"
     );
 
-    // 真实内核行为佐证：同一回环端口二次绑定必然失败——spawn_mcp_runtime
-    // 记录的正是这个条件，而不是编造的错误。
+    // Real kernel behavior evidence: binding the same loopback port twice must fail —
+    // spawn_mcp_runtime records this exact condition rather than fabricating an error.
     let holder = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let held = holder.local_addr().unwrap().port();
     let second = std::net::TcpListener::bind(("127.0.0.1", held));
-    assert!(second.is_err(), "端口 {held} 已被占用，二次绑定必须失败");
+    assert!(
+        second.is_err(),
+        "A second bind must fail while port {held} is in use"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -552,13 +565,20 @@ fn mcp_bind_failure_recorded_and_shown() {
 #[test]
 fn pending_cleanup_journal_roundtrip_and_retry() {
     let work = temp_dir("pending-cleanup");
-    assert!(load_pending_cleanup(&work).is_empty(), "缺失文件 = 空清单");
+    assert!(
+        load_pending_cleanup(&work).is_empty(),
+        "A missing file must return an empty list"
+    );
 
     append_pending_cleanup(&work, "dut-x", CleanupStep::DeleteA2aToken, "keyring 拒绝").unwrap();
     append_pending_cleanup(&work, "dut-x", CleanupStep::DeleteA2aToken, "重复必须去重").unwrap();
     append_pending_cleanup(&work, "dut-x", CleanupStep::DeleteAgentDir, "目录占用").unwrap();
     let entries = load_pending_cleanup(&work);
-    assert_eq!(entries.len(), 2, "同 DUT 同步骤去重");
+    assert_eq!(
+        entries.len(),
+        2,
+        "Deduplicate identical steps for the same DUT"
+    );
     let PendingCleanupEntry { dut_id, step, .. } = &entries[0];
     assert_eq!(dut_id, "dut-x");
     assert_eq!(step, "delete_a2a_token");
@@ -566,9 +586,15 @@ fn pending_cleanup_journal_roundtrip_and_retry() {
     // Retry: the DUT never existed on this machine, so both idempotent steps
     // succeed and the journal empties out.
     let (completed, failures) = duthub_desktop::agent_ui::retry_pending_cleanup(&work);
-    assert_eq!(completed, 2, "重试成功条目应清零: {failures:?}");
+    assert_eq!(
+        completed, 2,
+        "Successful retries must clear their entries: {failures:?}"
+    );
     assert!(failures.is_empty(), "{failures:?}");
-    assert_eq!(load_pending_cleanup(&work), [] as [duthub_desktop::agent_ui::PendingCleanupEntry; 0]);
+    assert_eq!(
+        load_pending_cleanup(&work),
+        [] as [duthub_desktop::agent_ui::PendingCleanupEntry; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -628,20 +654,26 @@ fn args_json_roundtrip_preserves_quoted_argument() {
     assert_eq!(
         parse_args_json(&raw).unwrap(),
         args,
-        "JSON 往返必须逐字保留含空格/引号的参数: {raw}"
+        "Preserve spaces and quotes in arguments across a JSON round trip: {raw}"
     );
     // Empty draft = no args; non-array JSON and non-string elements are refused.
     assert_eq!(parse_args_json("").unwrap(), Vec::<String>::new());
     assert_eq!(parse_args_json("   \n").unwrap(), Vec::<String>::new());
     assert!(
         parse_args_json("--acp --stdio").is_err(),
-        "裸参数不是 JSON 数组，必须拒绝"
+        "Reject an argument draft that is not a JSON array"
     );
-    assert!(parse_args_json("[1, 2]").is_err(), "非字符串元素必须拒绝");
-    assert!(parse_args_json("{\"a\":1}").is_err(), "对象不是数组");
+    assert!(
+        parse_args_json("[1, 2]").is_err(),
+        "Reject non-string elements"
+    );
+    assert!(
+        parse_args_json("{\"a\":1}").is_err(),
+        "Reject an object in place of an array"
+    );
     assert!(
         parse_args_json("[\"--acp\",").is_err(),
-        "截断 JSON 必须拒绝"
+        "Reject truncated JSON"
     );
 }
 
@@ -650,7 +682,7 @@ fn args_invalid_json_does_not_save() {
     use duthub_desktop::agent_ui::validate_agent_editor_draft;
     // The save gate refuses malformed args before anything reaches agents.json.
     let error = validate_agent_editor_draft("C:/tools/acme.exe", "[\"--acp\",", "ACME_API_KEY")
-        .expect_err("截断 JSON 必须拒绝");
+        .expect_err("Reject truncated JSON");
     assert!(error.contains("JSON"), "{error}");
     // A valid draft parses args/keys and keeps the absolute program.
     let draft = validate_agent_editor_draft(
@@ -670,15 +702,15 @@ fn args_invalid_json_does_not_save() {
     let workspace = source_of("workspace.rs");
     assert!(
         workspace.contains("duthub_desktop::agent_ui::validate_agent_editor_draft("),
-        "save_agent_registry 必须经统一草稿门"
+        "Registry saves must use the shared draft validator"
     );
     assert!(
         workspace.contains("invalid drafts never reach agents.json"),
-        "保存门必须 fail closed（保存前拒绝）"
+        "Reject invalid drafts before writing the registry"
     );
     assert!(
         !workspace.contains("split_whitespace()"),
-        "args 不得再按空白切分（引号/空格参数会被破坏）"
+        "Argument parsing must preserve quoted and space-containing arguments"
     );
 }
 
@@ -696,17 +728,17 @@ fn reserved_env_key_rejected() {
         "USERPROFILE",
         "SystemRoot",
     ] {
-        let error = validate_env_keys(&[key.to_owned()]).expect_err("保留变量必须拒绝");
+        let error = validate_env_keys(&[key.to_owned()]).expect_err("reject reserved variables");
         assert!(error.contains("保留"), "{key}: {error}");
         let error =
             validate_agent_editor_draft("C:/tools/acme.exe", "[]", &format!("ACME_API_KEY, {key}"))
-                .expect_err("组合草稿门同样必须拒绝");
+                .expect_err("reject reserved variables in the combined draft");
         assert!(error.contains("保留"), "{key}: {error}");
     }
     // Legal keys pass; duplicates are refused.
     assert!(validate_env_keys(&["ACME_API_KEY".to_owned(), "ACME_ENDPOINT".to_owned()]).is_ok());
     let duplicate = validate_env_keys(&["DUP_KEY".to_owned(), "DUP_KEY".to_owned()])
-        .expect_err("重复键必须拒绝");
+        .expect_err("reject duplicate keys");
     assert!(duplicate.contains("重复"), "{duplicate}");
     // Key naming rules still apply through the gate.
     assert!(validate_env_keys(&["1BAD".to_owned()]).is_err());
@@ -732,8 +764,8 @@ fn external_program_relative_rejected() {
     for path in ["C:/tools/acme.exe", r"c:\tools\acme.exe"] {
         assert!(validate_external_program_path(path).is_ok(), "{path}");
     }
-    let error =
-        validate_agent_editor_draft("tools/acme.exe", "[]", "").expect_err("相对路径必须拒绝");
+    let error = validate_agent_editor_draft("tools/acme.exe", "[]", "")
+        .expect_err("reject relative program paths");
     assert!(error.contains("绝对路径"), "{error}");
     // Empty program = embedded (goose) and skips path validation entirely.
     assert!(validate_agent_editor_draft("", "[]", "").is_ok());
@@ -771,13 +803,17 @@ fn delete_agent_removes_keyring_entries_and_reports_failures() {
     assert_eq!(
         removed.borrow().as_slice(),
         ["ACME_OK", "ACME_BROKEN"],
-        "失败后不得中止剩余键的删除"
+        "A deletion failure must not stop cleanup of the remaining keys"
     );
-    assert_eq!(pending, ["ACME_BROKEN"], "失败键必须进待清理列表");
+    assert_eq!(
+        pending,
+        ["ACME_BROKEN"],
+        "Failed keys must remain in the pending cleanup list"
+    );
     // All-success path and the invalid-id guard.
     assert_eq!(
-        delete_agent_env_entries_with("acme", &["ACME_OK".to_owned()], |_| Ok(()))
-            .unwrap(), [] as [std::string::String; 0]
+        delete_agent_env_entries_with("acme", &["ACME_OK".to_owned()], |_| Ok(())).unwrap(),
+        [] as [std::string::String; 0]
     );
     assert!(delete_agent_env_entries_with("  ", &[], |_| Ok(())).is_err());
     // Real entry naming goes through core (`acp/<id>/env/<KEY>`); the
@@ -789,7 +825,10 @@ fn delete_agent_removes_keyring_entries_and_reports_failures() {
         env_keys: Vec::new(),
         ..AgentDefinition::goose()
     };
-    assert_eq!(delete_agent_env_entries(&empty).unwrap(), [] as [std::string::String; 0]);
+    assert_eq!(
+        delete_agent_env_entries(&empty).unwrap(),
+        [] as [std::string::String; 0]
+    );
     // Failed keys are journalled per agent (merged, never duplicated rows)
     // for the next-startup retry.
     let work = temp_dir("agent-env-cleanup");
@@ -797,11 +836,15 @@ fn delete_agent_removes_keyring_entries_and_reports_failures() {
     append_agent_env_pending_cleanup(&work, "acme", &["ACME_EXTRA".to_owned()], "补充").unwrap();
     append_agent_env_pending_cleanup(&work, "goose", &["G_KEY".to_owned()], "其他 Agent").unwrap();
     let entries = load_pending_cleanup(&work);
-    assert_eq!(entries.len(), 2, "同 Agent 同步骤必须合并为一行");
+    assert_eq!(
+        entries.len(),
+        2,
+        "Merge equivalent cleanup steps for the same Agent"
+    );
     let acme = entries
         .iter()
         .find(|entry| entry.dut_id == "acme")
-        .expect("acme 条目");
+        .expect("find the acme entry");
     assert_eq!(acme.step, "delete_agent_env_keys");
     assert_eq!(acme.env_keys, ["ACME_BROKEN", "ACME_EXTRA"]);
     assert!(acme.reason.contains("keyring"));
@@ -820,15 +863,15 @@ fn start_agent_session_uses_start_entry_for_cli() {
     assert!(
         workspace.contains("host\n                .start_entry(dut_id, binding, agent)")
             || workspace.contains("host.start_entry(dut_id, binding, agent)"),
-        "start_agent_session 必须调用 host.start_entry（CLI 由它路由到 cli 分支）"
+        "start_agent_session must call host.start_entry (which routes CLI profiles)"
     );
     assert!(
         !workspace.contains("start_with_agent"),
-        "产品路径不得再直调 start_with_agent（绕过 CLI 分支与绑定门）"
+        "product path must not call start_with_agent directly (bypasses CLI routing and binding gate)"
     );
     assert!(
         workspace.contains("agent.kind == duthub_core::agent_config::AgentKind::Acp"),
-        "模型绑定只给 goose ACP；CLI 条目不进入绑定分支"
+        "model binding is only for goose ACP; CLI entries do not enter the binding branch"
     );
 }
 
@@ -838,26 +881,26 @@ fn start_agent_session_never_passes_model_binding_to_non_goose() {
     // FromSettings is gated on goose; everything else gets None.
     assert!(
         workspace.contains("agent.is_goose()"),
-        "必须按 goose 门控绑定来源"
+        "binding source must be gated on agent.is_goose()"
     );
     assert!(
         workspace.contains("BindingSource::FromSettings(&settings)"),
-        "goose 从设置解析绑定"
+        "goose resolves model binding from settings"
     );
     assert!(
         workspace.contains("BindingSource::None"),
-        "非 goose 产品路径必须传 None（永不转发模型 Token）"
+        "non-goose product path must pass BindingSource::None (never forward model tokens)"
     );
     // host.rs is owned by another wave; read-only cross-check that
     // start_entry itself drops bindings for non-goose FromSettings sources.
     let host = source_of("agent_host/host.rs");
     assert!(
         host.contains("BindingSource::FromSettings(settings) if agent.is_goose()"),
-        "host: FromSettings 仅对 goose 生效"
+        "host: FromSettings applies only to goose"
     );
     assert!(
         host.contains("BindingSource::FromSettings(_) | BindingSource::None => None"),
-        "host: 非 goose 的绑定来源必须被丢弃"
+        "host: non-goose binding sources must be dropped"
     );
 }
 
@@ -874,13 +917,13 @@ fn running_selector_disabled_and_shows_actual_launch() {
     ] {
         assert!(
             running_agent_selector_disabled(&status),
-            "{status:?} 必须锁定选择器"
+            "{status:?} must lock the agent selector"
         );
     }
     for status in [SessionStatus::Stopped, SessionStatus::Failed("x".into())] {
         assert!(
             !running_agent_selector_disabled(&status),
-            "{status:?} 是终止态，必须允许修改选择"
+            "{status:?} is terminal and must allow changing selection"
         );
     }
     // The running panel shows the actually launched agent id, never the
@@ -906,15 +949,15 @@ fn running_selector_disabled_and_shows_actual_launch() {
     let pages = source_of("pages.rs");
     assert!(
         pages.contains("running_agent_selector_disabled(&status)"),
-        "会话面板必须用运行状态锁定选择器"
+        "session panel must lock selector using running status"
     );
     assert!(
         pages.contains("running_launch_line("),
-        "运行中必须显示实际 launch"
+        "running panel must show actual launch line"
     );
     assert!(
         pages.contains("agentSessionSelectorNextStart"),
-        "必须提示更改在下一次启动生效"
+        "must display next-start hint for selector changes"
     );
 }
 
@@ -928,7 +971,8 @@ fn agent_toggle_forbids_disabling_default_goose_and_last_enabled() {
     use duthub_desktop::agent_ui::validate_agent_toggle;
     let mut file = duthub_core::agent_config::default_agents();
     // Default goose can never be disabled.
-    let error = validate_agent_toggle(&file, "goose").expect_err("默认 goose 必须拒绝停用");
+    let error =
+        validate_agent_toggle(&file, "goose").expect_err("default goose must refuse disabling");
     assert!(error.contains("goose"), "{error}");
     // Enabling is always allowed.
     file.goose_mut().unwrap().enabled = false;
@@ -945,7 +989,8 @@ fn agent_toggle_forbids_disabling_default_goose_and_last_enabled() {
     assert!(validate_agent_toggle(&file, "acme").is_ok());
     // ...but the last enabled entry cannot be disabled (goose disabled case).
     file.goose_mut().unwrap().enabled = false;
-    let error = validate_agent_toggle(&file, "acme").expect_err("最后一个启用条目必须拒绝停用");
+    let error =
+        validate_agent_toggle(&file, "acme").expect_err("last enabled entry must refuse disabling");
     assert!(error.contains("最后一个启用"), "{error}");
     // Unknown ids are refused either way.
     assert!(validate_agent_toggle(&file, "missing").is_err());
@@ -980,15 +1025,15 @@ fn prompt_clear_only_if_value_matches() {
     let workspace = source_of("workspace.rs");
     assert!(
         workspace.contains("duthub_desktop::agent_ui::should_clear_prompt(&current, &sent)"),
-        "渲染帧清空必须走值匹配判定"
+        "deferred render-frame clear must use value-matched check"
     );
     assert!(
         workspace.contains("agent_prompt_clear: HashMap<String, (String, u64)>"),
-        "挂起的清空请求必须按 DUT 键控（不再用全局 Option 误清/丢请求）"
+        "pending clear requests must be keyed per DUT (not a global Option)"
     );
     assert!(
         workspace.contains("self.agent_prompt_clear.remove(dut_id);"),
-        "删除 DUT 必须连带清掉该 DUT 的挂起请求"
+        "removing a DUT must also clear its pending prompt-clear request"
     );
 }
 
@@ -1005,7 +1050,7 @@ fn prompt_clear_keeps_draft_on_enqueue_failure() {
     // visible and retryable.
     let rejected = prompt_send_outcome(Err::<(), &str>("会话忙（Busy）"));
     let PromptSendOutcome::Rejected { reason } = rejected else {
-        panic!("入队失败必须返回 Rejected");
+        panic!("A failed enqueue must return Rejected");
     };
     assert!(reason.contains("会话忙（Busy）"), "{reason}");
 
@@ -1015,15 +1060,15 @@ fn prompt_clear_keeps_draft_on_enqueue_failure() {
     assert!(
         workspace
             .contains("duthub_desktop::agent_ui::prompt_send_outcome(host.prompt(dut_id, &text))"),
-        "发送路径必须经纯函数判定（测试钉住保留草稿契约）"
+        "send path must route through pure prompt_send_outcome helper"
     );
     assert!(
         workspace.contains("PromptSendOutcome::Rejected { reason }"),
-        "失败分支必须把文本与原因写进 transcript"
+        "rejected branch must write attempted text and reason into transcript"
     );
     assert!(
         workspace.contains("\"agentPromptSendFailed\""),
-        "失败 transcript 行必须走 locale 文案（含原文与原因）"
+        "rejected transcript line must use localized agentPromptSendFailed copy"
     );
 }
 
@@ -1038,7 +1083,10 @@ fn should_follow_after_2000_entries() {
     // Basic rule: follow only when new entries arrived since the last frame.
     assert!(should_follow(0, 1));
     assert!(!should_follow(5, 5));
-    assert!(!should_follow(7, 5), "回退的序号（重置后）也不得触发跟随");
+    assert!(
+        !should_follow(7, 5),
+        "A sequence reset must not trigger automatic scrolling"
+    );
 
     // The point of the monotonic counter: the in-memory transcript is capped
     // at 2000, so after the cap `transcript.len()` stops growing. The old
@@ -1052,7 +1100,7 @@ fn should_follow_after_2000_entries() {
     assert_eq!(view.total_entries(), 2001);
     assert!(
         should_follow(2000, view.total_entries()),
-        "2000 条截断后新条目仍必须触发贴底"
+        "New entries must still trigger scrolling after the 2,000-entry limit"
     );
     assert!(!should_follow(2001, view.total_entries()));
 
@@ -1061,12 +1109,12 @@ fn should_follow_after_2000_entries() {
     let pages = source_of("pages.rs");
     assert!(
         pages.contains("duthub_desktop::agent_ui::should_follow(seen, total_entries)"),
-        "transcript 贴底必须用单调序号判定"
+        "transcript auto-follow must use monotonic total_entries counter"
     );
     let workspace = source_of("workspace.rs");
     assert!(
         workspace.contains("pub(crate) agent_transcript_seen: HashMap<String, u64>"),
-        "已见序号必须以 u64 记录"
+        "seen sequence counter must be stored as u64"
     );
 }
 
@@ -1112,15 +1160,15 @@ fn transcript_tag_uses_selected_agent() {
     let pages = source_of("pages.rs");
     assert!(
         pages.contains("agent_transcript_row(entry, &transcript_tag, p)"),
-        "transcript 行必须携带当前 Agent 标签"
+        "transcript row must carry current agent tag"
     );
     assert!(
         !pages.contains("(\"GOOSE\", p.text)"),
-        "Agent 行不得再硬编码 GOOSE 标签"
+        "agent rows must not hardcode GOOSE tag"
     );
     assert!(
         pages.contains("w.transcript_agent_tag(&dut.id)"),
-        "标签来自 workbench 的 launch/注册表回退逻辑"
+        "tag must come from workbench launch/registry fallback helper"
     );
 }
 
@@ -1135,7 +1183,7 @@ fn external_badge_is_unverified_not_unsigned() {
         AuthenticodeBadge, ProgramSource, authenticode_badge, program_source,
     };
     // External programs never get a signature-chain check: the badge is the
-    // unverified variant, whose localized text says 「未验证」 and must not
+    // unverified variant, whose localized text says "Unverified" and must not
     // claim the *absence* of a signature was proven.
     assert_eq!(
         authenticode_badge(ProgramSource::External, "NotSigned"),
@@ -1164,8 +1212,8 @@ fn external_badge_is_unverified_not_unsigned() {
     );
 
     // Source resolution: the launch spec wins; before launch nothing is
-    // verified either (2026-11-24: goose is downloaded, the embedded build is
-    // gone), so both pre-launch branches project to 「未验证」.
+    // verified either (goose is downloaded, not embedded), so both pre-launch
+    // branches project to ExternalUnverified.
     let spec = AgentLaunchSpec {
         agent_id: "acme".into(),
         agent_name: "Acme ACP".into(),
@@ -1190,12 +1238,12 @@ fn external_badge_is_unverified_not_unsigned() {
     assert_eq!(
         program_source(None, false),
         ProgramSource::External,
-        "未启动且无外部配置时不得再宣称内嵌 goose"
+        "must not claim embedded goose when not running and no external path configured"
     );
     assert_eq!(
         authenticode_badge(program_source(None, false), "NotSigned"),
         AuthenticodeBadge::ExternalUnverified,
-        "下载/PATH 的 goose 没有签名链验证，徽标必须是「未验证」"
+        "downloaded/PATH goose has no signature-chain check; badge must be ExternalUnverified"
     );
 
     // Wiring (source contract): the badge variant lives in agent_ui and both
@@ -1203,11 +1251,11 @@ fn external_badge_is_unverified_not_unsigned() {
     let pages = source_of("pages.rs");
     assert!(
         pages.contains("duthub_desktop::agent_ui::authenticode_badge(source, signature)"),
-        "徽标变体必须统一出自 agent_ui"
+        "badge variant must come from agent_ui::authenticode_badge"
     );
     assert!(
         !pages.contains("let status = bundle::authenticode_status();"),
-        "会话徽标不得再直接读内嵌 manifest 状态"
+        "session badge must no longer read legacy embedded manifest status"
     );
 }
 
@@ -1237,13 +1285,23 @@ fn inspector_filters_audit_by_credential() {
         event("tool.call", Some("cred-1"), AuditOutcome::Denied),
     ];
     let filtered = inspector_audit_events(&recent, Some("cred-1"));
-    assert_eq!(filtered.len(), 2, "只保留本会话凭据的 tool.call");
+    assert_eq!(
+        filtered.len(),
+        2,
+        "keep only tool.call events for this session credential"
+    );
     assert!(filtered.iter().all(
         |event| event.credential_id.as_deref() == Some("cred-1") && event.action == "tool.call"
     ));
     // A session without a credential never inherits unattributed events.
-    assert_eq!(inspector_audit_events(&recent, None), [] as [duthub_core::AuditEvent; 0]);
-    assert_eq!(inspector_audit_events(&[], Some("cred-1")), [] as [duthub_core::AuditEvent; 0]);
+    assert_eq!(
+        inspector_audit_events(&recent, None),
+        [] as [duthub_core::AuditEvent; 0]
+    );
+    assert_eq!(
+        inspector_audit_events(&[], Some("cred-1")),
+        [] as [duthub_core::AuditEvent; 0]
+    );
 
     // Permission-denial evidence comes from the transcript System entries the
     // worker writes for AcpEvent::PermissionDenied.
@@ -1262,21 +1320,24 @@ fn inspector_filters_audit_by_credential() {
     let pages = source_of("pages.rs");
     assert!(
         pages.contains("duthub_desktop::agent_ui::inspector_audit_events("),
-        "Inspector 必须经纯函数过滤审计"
+        "Inspector must filter audit events through pure helper"
     );
-    assert!(pages.contains("sink.recent(200)"), "审计窗口为最近 200 条");
+    assert!(
+        pages.contains("sink.recent(200)"),
+        "audit window must query recent 200 entries"
+    );
     assert!(
         !pages.contains("\"AGENT ROLES\"") && !pages.contains("grep · read · git · find · make"),
-        "Inspector 不得展示 demo 工具卡"
+        "Inspector must not display demo tool cards"
     );
     let side_panel = source_of("side_panel.rs");
     assert!(
         !side_panel.contains("crate::agent::render_agent_pane"),
-        "侧栏不得再挂载 demo Agent 面板"
+        "side panel must no longer mount demo Agent pane"
     );
     assert!(
         side_panel.contains("agent_inspector_panel"),
-        "Panel::Agent 必须渲染真实 Inspector"
+        "Panel::Agent must render real Inspector"
     );
 }
 
@@ -1291,30 +1352,30 @@ fn self_test_stays_pure_no_agents_json_no_listeners() {
     // bootstraps agents.json on a missing file, so it must be bypassed.
     assert!(
         workspace.contains("let (agents, mut agents_error) = if self_test {"),
-        "self-test 必须走 default_agents() 内存值分支"
+        "self-test must use in-memory default_agents() branch"
     );
     assert!(
         workspace.contains("wb.mcp_runtime = crate::mcp_runtime::spawn_mcp_runtime(")
             && workspace.contains("if !self_test {"),
-        "self-test 不得启动 MCP HTTP 监听"
+        "self-test must not start MCP HTTP listeners"
     );
     assert!(
         workspace.contains("let a2a = if self_test {"),
-        "self-test 不得构造 A2A 运行时（8790 无监听）"
+        "self-test must not construct A2A runtime (no listener on 8790)"
     );
     assert!(
         workspace.contains("pub a2a: Option<crate::a2a_runtime::A2aRuntime>"),
-        "A2A 运行时必须是 Option（self-test 为 None）"
+        "A2A runtime must be Option (None in self-test)"
     );
     assert!(
         workspace.contains("if !self_test {\n            let (pending_done, pending_failures) ="),
-        "self-test 不触碰 pending-cleanup 重试（agent/ 目录）"
+        "self-test must not touch pending-cleanup retry or agent/ directory"
     );
     // Background probes stay off too: a self-test must never unpack or probe
     // an external exe.
     assert!(
         workspace.contains("goose_probe_pending: false"),
-        "self-test 下外部 goose 探测保持关闭"
+        "external goose probe must stay disabled under self-test"
     );
 }
 
@@ -1326,15 +1387,41 @@ fn mcp_client_config_embeds_the_listener_and_token() {
         "http://127.0.0.1:8790/mcp",
         "read-token",
     );
-    assert!(text.ends_with('\n'), "配置文件以换行结尾");
+    assert!(
+        text.ends_with('\n'),
+        "The config file must end in a newline"
+    );
     assert!(
         text.contains("\"duthub-windows-pc\""),
-        "服务器键来自 DUT id"
+        "Derive the server key from the DUT ID"
     );
     assert!(text.contains("\"type\": \"http\""));
     assert!(text.contains("\"url\": \"http://127.0.0.1:8790/mcp\""));
     assert!(text.contains("\"Authorization\": \"Bearer read-token\""));
     assert!(text.contains("\"mcpServers\""));
+}
+
+#[test]
+fn mcp_client_url_prefers_lan_ip_when_available() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let lan_v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 175));
+    let lan_url = duthub_desktop::agent_ui::mcp_client_url(33612, Some(lan_v4));
+    assert_eq!(lan_url, "http://192.168.1.175:33612/mcp");
+
+    let config =
+        duthub_desktop::agent_ui::mcp_client_config("duthub-dut-1", &lan_url, "dth-secret");
+    assert!(config.contains("\"url\": \"http://192.168.1.175:33612/mcp\""));
+
+    let lan_v6 = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+    assert_eq!(
+        duthub_desktop::agent_ui::mcp_client_url(33612, Some(lan_v6)),
+        "http://[fe80::1]:33612/mcp"
+    );
+    assert_eq!(
+        duthub_desktop::agent_ui::mcp_client_url(33612, None),
+        "http://127.0.0.1:33612/mcp"
+    );
 }
 
 #[test]
@@ -1377,25 +1464,38 @@ fn agent_page_guides_the_user_to_tool_downloads_when_goose_is_missing() {
         Some(PathBuf::from("C:/bin/goose.exe")),
     );
     assert!(matches!(downloaded, GooseInstallState::Downloaded { .. }));
-    assert!(!downloaded.needs_install(), "已下载安装时不得再要求安装");
+    assert!(
+        !downloaded.needs_install(),
+        "An installed download must not prompt for installation"
+    );
     assert_eq!(
         downloaded.program(),
         Some(std::path::Path::new("C:/cfg/tools/goose/goose.exe")),
-        "下载安装必须优先于 PATH"
+        "Installed downloads take precedence over PATH"
     );
 
     let on_path = goose_install_state_from(None, Some(PathBuf::from("C:/bin/goose.exe")));
     assert!(matches!(on_path, GooseInstallState::Path { .. }));
-    assert!(!on_path.needs_install(), "PATH 上找到程序即视为已安装");
+    assert!(
+        !on_path.needs_install(),
+        "An executable on PATH counts as installed"
+    );
 
     let missing = goose_install_state_from(None, None);
     assert_eq!(missing, GooseInstallState::NotInstalled);
-    assert!(missing.needs_install(), "未安装必须触发「去工具下载」引导");
-    assert_eq!(missing.program(), None, "未安装不得凭空给出程序路径");
+    assert!(
+        missing.needs_install(),
+        "An absent install must direct the user to Tool Downloads"
+    );
+    assert_eq!(
+        missing.program(),
+        None,
+        "An absent install has no program path"
+    );
     let text = missing.to_string();
     assert!(
         text.contains("未安装") && text.contains("工具下载"),
-        "未安装状态必须可展示并指出下一步: {text}"
+        "Show the missing installation and the next action: {text}"
     );
 
     // Wiring (source contract): the panel renders the classified state, offers
@@ -1404,27 +1504,33 @@ fn agent_page_guides_the_user_to_tool_downloads_when_goose_is_missing() {
     let pages = source_of("pages.rs");
     assert!(
         pages.contains("w.agent.goose_install_state()"),
-        "运行时面板必须读内置 goose 的解析状态"
+        "runtime panel must read built-in goose install state"
     );
     assert!(
         pages.contains("builtin_goose_status_line(&goose_state)"),
-        "内置状态必须按三种事实分支渲染（下载安装 / PATH / 未安装）"
+        "built-in status line must render all three states (downloaded / PATH / not installed)"
     );
     assert!(
         pages.contains("goose_state.needs_install()")
             && pages.contains("crate::workspace::ConfigPage::ToolDownloads"),
-        "未安装时必须有「去工具下载」一键入口"
+        "must provide one-click Tool Downloads button when not installed"
     );
     assert!(
         pages.contains("\"goose-install-open-downloads\""),
-        "引导按钮需要稳定 id"
+        "guidance button needs a stable id"
     );
-    assert!(!pages.contains("GOOSE_SHA256"), "已移除内嵌摘要展示");
+    assert!(
+        !pages.contains("GOOSE_SHA256"),
+        "The embedded digest display has been removed"
+    );
     assert!(
         !pages.contains("ProgramSource::Embedded"),
-        "页面不得再引用不存在的内嵌程序来源"
+        "page must no longer reference removed ProgramSource::Embedded"
     );
-    assert!(!pages.contains("agentRuntimeVersion\""), "内嵌版本行已删除");
+    assert!(
+        !pages.contains("agentRuntimeVersion\""),
+        "The embedded version row has been removed"
+    );
 
     // Classification reads the install manifest and scans PATH, so it is cached
     // with a TTL instead of running on every render frame.
@@ -1432,11 +1538,11 @@ fn agent_page_guides_the_user_to_tool_downloads_when_goose_is_missing() {
     assert!(
         agent.contains("duthub_desktop::agent_host::goose_install_state()")
             && agent.contains("GOOSE_STATE_TTL"),
-        "内置状态必须按 TTL 缓存后复用，不得逐帧读盘/扫 PATH"
+        "built-in install state must be TTL-cached rather than scanning disk/PATH per frame"
     );
     assert!(
         agent.contains("pub goose_install: Option<("),
-        "缓存字段必须可注入"
+        "Allow the cache to be supplied"
     );
 }
 
@@ -1459,7 +1565,7 @@ fn agent_page_states_are_localized_in_both_catalogs() {
     assert_eq!(
         catalogs[0].1.len(),
         catalogs[1].1.len(),
-        "locale 键数量必须一致"
+        "The locales must have the same number of keys"
     );
     // Every state the panel can show has copy in both catalogs: the three goose
     // install facts, the guidance button, the model-not-configured states, and
@@ -1480,7 +1586,7 @@ fn agent_page_states_are_localized_in_both_catalogs() {
                     .get(key)
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|value| !value.is_empty()),
-                "{name} 缺少非空文案：{key}"
+                "{name} is missing a nonempty label for {key}"
             );
         }
     }
@@ -1490,7 +1596,7 @@ fn agent_page_states_are_localized_in_both_catalogs() {
             let text = value.as_str().unwrap_or_default();
             assert!(
                 !text.contains("内嵌 goose") && !text.contains("Embedded goose"),
-                "{name}:{key} 仍宣称内嵌 goose: {text}"
+                "{name}:{key} still claims goose is bundled: {text}"
             );
         }
     }
@@ -1498,6 +1604,6 @@ fn agent_page_states_are_localized_in_both_catalogs() {
     // copy must be wired there, not merely present in the catalogs.
     assert!(
         source_of("pages.rs").contains("\"agentRuntimeNoModel\""),
-        "未配置模型时必须渲染明确状态与下一步"
+        "Show the missing model configuration and the next action"
     );
 }

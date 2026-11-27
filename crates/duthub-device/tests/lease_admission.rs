@@ -1,9 +1,11 @@
-//! 写入通道租约复核集成测试（方案 N6；docs/SECURITY.md）：
-//! GUI 打开会话自动持有租约 / 关闭释放 / GUI 持有期间 Agent 写被拒（INV-01）/
-//! System（心跳）放行 / 过期代数 admit 拒（INV-04 [D] 侧）/ 审计 write.deny /
-//! 控制入口（ControlService）同规则复核。
+//! Integration tests for write-channel lease admission (`docs/SECURITY.md`):
+//! GUI auto-holds a lease on open / releases on close / blocks agent writes
+//! while held (INV-01) / allows System (heartbeat) writes / rejects stale
+//! generations at admission (INV-04 `[D]`) / audits `write.deny` / enforces the
+//! same rules on `ControlService`.
 //!
-//! [E] actor 侧复核（demo 会话）见 `src/demo.rs::actor_recheck_drops_stale_generation_write`。
+//! Actor-side `[E]` re-check (demo session) is covered by
+//! `src/demo.rs::actor_recheck_drops_stale_generation_write`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,8 +46,8 @@ fn agent(name: &str) -> LeaseHolder {
     }
 }
 
-/// GUI 交互路径：打开会话即自动持有租约，关闭释放；期间 Agent 写被拒、
-/// System（心跳）放行（INV-01 双写互斥在写入通道的执行点）。
+/// GUI interactive path: opening a session auto-holds the lease and closing releases it;
+/// while held, agent writes are rejected and System (heartbeat) writes pass (INV-01).
 #[test]
 fn gui_session_auto_holds_lease_and_blocks_agent_writes() {
     let (service, mgr, sink) = service_with_lease("auto-hold");
@@ -53,17 +55,20 @@ fn gui_session_auto_holds_lease_and_blocks_agent_writes() {
         .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
         .unwrap();
     std::thread::sleep(Duration::from_millis(120));
-    // 打开即 GUI 持有
+    // GUI holds the lease immediately on open.
     let status = mgr.status("dut-a");
     assert_eq!(status.phase, LeasePhase::Held);
     assert_eq!(status.holder.as_deref(), Some("GUI（人类在场）"));
-    // Agent 写（auth 关过渡无租约形态）→ GUI 优先必拒（INV-01）
+    // Agent write without a lease (transitional auth-off mode) must be rejected while GUI holds control (INV-01).
     let err = service
         .write_line("dut-a", WriteIdentity::agent(None, None), "agent-cmd")
         .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("GUI"), "拒绝消息必须指明 GUI 在场：{msg}");
-    // Agent 带（无效）租约句柄写 → 同样拒
+    assert!(
+        msg.contains("GUI"),
+        "denial message must indicate GUI presence: {msg}"
+    );
+    // Agent write with an invalid lease handle is also rejected.
     assert!(
         service
             .write_line(
@@ -73,49 +78,49 @@ fn gui_session_auto_holds_lease_and_blocks_agent_writes() {
             )
             .is_err()
     );
-    // GUI 自己写放行（自动租约上下文）
+    // GUI writes pass with automatic lease context.
     service
         .write_line("dut-a", WriteIdentity::gui(), "gui-cmd")
         .unwrap();
-    // System（心跳）放行
+    // System (heartbeat) writes pass.
     service
         .write_line("dut-a", WriteIdentity::system(), "uname -a")
         .unwrap();
-    // GUI 持有期间 Agent acquire 被拒（Busy → GUI）
+    // Agent acquire is rejected with Busy while GUI holds the lease.
     assert!(matches!(
         mgr.acquire("dut-a", &agent("claude"), None),
         Err(duthub_core::lease::LeaseError::Busy { .. })
     ));
-    // 拒绝落审计 write.deny
+    // Denial is recorded as `write.deny` in the audit sink.
     assert!(sink.recent(200).iter().any(|e| e.action == "write.deny"
         && e.dut.as_deref() == Some("dut-a")
         && e.result == AuditOutcome::Denied));
-    // 关闭会话 → 自动释放（人类离场）
+    // Closing the session automatically releases the lease.
     service.close_session("dut-a").unwrap();
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(mgr.status("dut-a").phase, LeasePhase::Free);
-    // 释放后 Agent 立即能取到控制权
+    // Once released, the agent can acquire control immediately.
     mgr.acquire("dut-a", &agent("claude"), None).unwrap();
 }
 
-/// GUI 关闭会话释放后，Agent 取得租约期间 GUI 写被拒（互斥对称性）。
+/// Symmetry check: once the agent acquires the lease after GUI closes, GUI writes are blocked until takeover.
 #[test]
 fn agent_controlled_gui_write_denied_until_takeover() {
     let (service, mgr, _sink) = service_with_lease("agent-holds");
-    // Agent 先取控制权（无 GUI 会话）
+    // Agent acquires control while no GUI session is open.
     let grant = mgr.acquire("dut-a", &agent("claude"), None).unwrap();
-    // GUI 打开会话：仍成功（读不受限），但拿不到租约
+    // Opening a GUI session still succeeds (read-only is unrestricted) without acquiring the lease.
     service
         .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
         .unwrap();
     std::thread::sleep(Duration::from_millis(120));
     assert_eq!(mgr.status("dut-a").holder.as_deref(), Some("Agent claude"));
-    // GUI 写 → 拒（指向 Agent）
+    // GUI write is rejected, naming the holding agent.
     let err = service
         .write_line("dut-a", WriteIdentity::gui(), "gui-cmd")
         .unwrap_err();
     assert!(err.to_string().contains("claude"), "{err}");
-    // Agent 本人凭 (lease_id, generation) 写 → 放行
+    // Agent write with matching `(lease_id, generation)` passes.
     service
         .write_line(
             "dut-a",
@@ -123,7 +128,7 @@ fn agent_controlled_gui_write_denied_until_takeover() {
             "agent-cmd",
         )
         .unwrap();
-    // GUI 强制接管（SPEC §6.7）→ 代数 +1 → Agent 旧代数写 admit 拒（INV-04 [D] 侧）
+    // GUI force takeover increments generation; stale agent writes are rejected at admission (INV-04 [D]).
     let takeover = mgr.force_takeover("dut-a").unwrap();
     assert!(takeover.generation > grant.generation);
     let stale = service.write_line(
@@ -131,19 +136,23 @@ fn agent_controlled_gui_write_denied_until_takeover() {
         WriteIdentity::agent(Some(grant.lease_id.clone()), Some(grant.generation)),
         "stale-agent-cmd",
     );
-    assert!(stale.is_err(), "旧代数写入必须在入口被拒");
-    // 接管后 GUI 写放行
+    assert!(
+        stale.is_err(),
+        "stale generation write must be rejected at admission"
+    );
+    // After takeover, GUI writes pass.
     service
         .write_line("dut-a", WriteIdentity::gui(), "gui-cmd-2")
         .unwrap();
     service.close_session("dut-a").unwrap();
 }
 
-/// 控制入口（ControlService）同规则复核：GUI 会话在场时 Agent 控制动作被拒，
-/// GUI 路径放行；admit 失败不消费审批令牌（M10）。
+/// `ControlService` enforces the same lease rules: agent control actions are rejected
+/// while a GUI session is present, GUI actions pass, and failed admission does not
+/// consume the approval token (M10).
 #[test]
 fn control_entry_lease_admission_gates_agent_actions() {
-    // 记录型假后端：验证驱动只在 admit 放行后被调用
+    // Recording mock backend to verify the driver is only called after admission succeeds.
     #[derive(Default)]
     struct MockBackend {
         power_calls: std::sync::Mutex<u32>,
@@ -183,7 +192,7 @@ fn control_entry_lease_admission_gates_agent_actions() {
         .with_lease_authority(mgr.clone());
     control.register_dut(DutConfig {
         id: "dut-a".into(),
-        name: "样机".into(),
+        name: "Prototype".into(),
         serial: SerialConfig {
             host: "local".into(),
             port: "COM3".into(),
@@ -212,9 +221,9 @@ fn control_entry_lease_admission_gates_agent_actions() {
         a2a: duthub_core::model::DutA2aConfig::default(),
         flash: duthub_core::model::FlashConfig::default(),
         media: duthub_core::model::DutMediaConfig::default(),
-        heartbeat: duthub_core::model::HeartbeatConfig::default(),
+        heartbeat: duthub_core::heartbeat::HeartbeatConfig::default(),
     });
-    // GUI 会话在场 → Agent 控制动作被租约拒（INV-01 扩展到控制通道）
+    // GUI session active: agent control action is denied by lease (INV-01 on control channel).
     let token = approval.issue("dut-a", "control.power", r#"{"on":true}"#);
     let err = control
         .execute_by_id_as(
@@ -226,11 +235,15 @@ fn control_entry_lease_admission_gates_agent_actions() {
         .unwrap_err();
     assert!(
         err.to_string().contains("GUI"),
-        "控制拒绝必须指明 GUI 在场：{err}"
+        "control denial must indicate GUI presence: {err}"
     );
-    assert_eq!(*backend.power_calls.lock().unwrap(), 0, "驱动不得被调用");
-    // 同一枚令牌仍可用（admit 失败不消费，M10）
-    // GUI 路径（人类在场，按钮即授权）→ 放行并驱动被调
+    assert_eq!(
+        *backend.power_calls.lock().unwrap(),
+        0,
+        "driver must not be invoked"
+    );
+    // The same token remains valid because failed admission does not consume it (M10).
+    // GUI path (human present) passes and invokes the driver.
     control
         .execute_by_id("dut-a", ControlAction::Power { on: true }, &token.token)
         .unwrap();
@@ -238,7 +251,7 @@ fn control_entry_lease_admission_gates_agent_actions() {
     service.close_session("dut-a").unwrap();
 }
 
-/// 未接线租约的 DeviceService（既有路径）：写行为零改动（回归护栏）。
+/// Legacy `DeviceService` without lease authority wired preserves existing write behavior.
 #[test]
 fn legacy_service_without_lease_behaves_unchanged() {
     let dir = std::env::current_dir()
@@ -251,7 +264,7 @@ fn legacy_service_without_lease_behaves_unchanged() {
         .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
         .unwrap();
     std::thread::sleep(Duration::from_millis(120));
-    // 无租约复核：Agent 无租约形态也直接放行（既有测试等价路径）
+    // Without lease checks, agent writes without a lease pass directly (legacy path).
     service
         .write_line("dut-a", WriteIdentity::agent(None, None), "uname -a")
         .unwrap();

@@ -1,10 +1,10 @@
-//! 终端仿真网格（PuTTY `模式，alacritty_terminal` 0.26）。
+//! Terminal emulation for the serial viewport.
 //!
-//! - real 会话持 `Term` + `vte::ansi::Processor`：串口原始字节直接
-//!   `processor.advance(&mut term, bytes)`——设备 shell 自己负责回显/提示符/
-//!   光标（无本地 [TX] 伪造行，与 `PuTTY` 行为一致）。
-//! - UI 渲染从 Term 网格提取：[`snapshot_screen`] 把可见区 + 适度回滚历史
-//!   转成文本行 + 前景/背景色（`ScreenSnapshot`），经总线整体替换到 UI。
+//! Real sessions feed raw bytes to the terminal emulator's ANSI processor.
+//! The device controls echo, prompts, and cursor movement.
+//! The desktop does not synthesize local TX echo.
+//! Extract visible rows and a bounded history from the terminal grid.
+//! The UI replaces its previous snapshot with the one published on the event bus.
 //! - Scrollback defaults to one million rows and grows as output arrives.
 //!   Live snapshots use a separate row budget.
 
@@ -20,7 +20,7 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb, StdSyncHa
 
 use duthub_core::ipc::{ScreenRow, ScreenSnapshot};
 
-/// 快照携带的最大行数（屏幕 + 回滚历史合计；超过只保留最近行）。
+/// Maximum snapshot rows, including visible rows and history.
 pub const SNAPSHOT_MAX_ROWS: usize = 400;
 /// The live frame budget is independent of stored history.
 pub const LIVE_SNAPSHOT_ROW_CAP: usize = 1_000;
@@ -31,11 +31,11 @@ pub const MIN_SCROLLBACK_ROWS: usize = 100;
 pub const MAX_SCROLLBACK_ROWS: usize = i32::MAX as usize;
 /// Older rows are read on demand, independently of live frame publication.
 pub const HISTORY_PAGE_ROWS: usize = 4_000;
-/// 新会话的初始网格（打开后 UI 会按视口尺寸下发 Resize）。
+/// Initial session grid. The UI sends a resize after measuring the viewport.
 pub const DEFAULT_COLS: usize = 100;
 pub const DEFAULT_ROWS: usize = 30;
 
-/// [`Term::new`] / [`Term::resize`] 的尺寸描述（alacritty 的 `Dimensions`）。
+/// Grid dimensions supplied to the terminal constructor and resize operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TermGrid {
     pub cols: usize,
@@ -61,13 +61,13 @@ impl Dimensions for TermGrid {
     }
 }
 
-/// 新建 real 会话的仿真终端（VoidListener：驱动事件全部丢弃）。
+/// Create a terminal for a hardware session and discard emulator-generated events.
 #[must_use]
 pub fn create_term() -> Term<VoidListener> {
     create_term_with_scrollback(SCROLLBACK_HISTORY)
 }
 
-/// 按设置的回滚行数建终端（「串口」设置段；下限 100，默认 [`SCROLLBACK_HISTORY`]）。
+/// Create a terminal with the configured number of scrollback rows.
 #[must_use]
 pub fn create_term_with_scrollback(scrollback_rows: usize) -> Term<VoidListener> {
     let mut term = create_term_with_grid(TermGrid::new(DEFAULT_COLS, DEFAULT_ROWS));
@@ -95,7 +95,7 @@ pub fn reset_terminal(term: &mut Term<VoidListener>, parser: &mut Processor<StdS
     *parser = Processor::new();
 }
 
-/// 在同步更新结束序列丢失时，按 VTE 的时限提交已收到的画面。
+/// Commit a pending synchronized update when the ANSI synchronization deadline expires.
 pub fn flush_expired_sync(
     term: &mut Term<VoidListener>,
     parser: &mut Processor<StdSyncHandler>,
@@ -112,7 +112,7 @@ pub fn flush_expired_sync(
     false
 }
 
-/// xterm-256 标准调色板的前 16 色（暗色主题友好的常规取值）。
+/// The first 16 colors in the standard xterm palette.
 const BASE16: [Rgb; 16] = [
     Rgb {
         r: 0x2e,
@@ -196,11 +196,11 @@ const BASE16: [Rgb; 16] = [
     }, // bright white
 ];
 
-/// Indexed(16..231) 的 6×6×6 色立方层级。
+/// Six intensities along each axis of the ANSI color cube.
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
-/// ANSI 色值 → 0xRRGGBB；默认前景/背景返回 `None`（UI 用主题默认）。
-/// `dyn_colors` 是 OSC 4/10/11 动态覆写（未覆写为 `None` 时走标准调色板）。
+/// Convert an ANSI color to RGB. Unspecified foreground and background use the UI theme.
+/// OSC 4, 10, and 11 colors override the standard palette when provided.
 fn resolve_color(color: Color, dyn_colors: &DynColors, is_fg: bool) -> Option<u32> {
     let rgb = match color {
         Color::Named(named) => {
@@ -272,17 +272,17 @@ fn rgb_to_u32(rgb: Rgb) -> u32 {
     (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
 }
 
-/// 从 Term 网格提取快照：最近 [`SNAPSHOT_MAX_ROWS`] 行（屏幕行全保留，历史行
-/// 按需截断），行文本去除尾部空白；前景/背景取行内第一个有色单元格。
-/// 光标映射为（快照行索引, 行内字符偏移）；光标隐藏（DECSET 25）时为 `None`。
-/// 例外：光标落在尾随空白区时保留空白至光标列（否则键入空格/退格的回显在
-/// 前后两帧快照间完全一致，UI 上表现为"按键无效果"）。
+/// Keep the visible grid and cap the amount of history in the snapshot.
+/// Use the first explicit cell color on each row and normally trim trailing blanks.
+/// The cursor is a row and character offset, or is absent when hidden.
+/// Keep trailing blanks up to the cursor when it lies beyond the printed text.
+/// This preserves the visible effect of echoed spaces and erasures.
 #[tracing::instrument(name = "serial.snapshot", skip_all)]
 pub fn snapshot_screen(term: &Term<VoidListener>) -> ScreenSnapshot {
     snapshot_screen_scrollback(term, SNAPSHOT_MAX_ROWS)
 }
 
-/// 快照行数上限可配置版（「串口」设置段滚动缓冲；决定 UI 可回看的历史行数）。
+/// Build a snapshot with a caller-supplied row limit.
 #[tracing::instrument(name = "serial.snapshot", skip_all)]
 pub fn snapshot_screen_scrollback(term: &Term<VoidListener>, max_rows: usize) -> ScreenSnapshot {
     let grid = term.grid();
@@ -294,6 +294,19 @@ pub fn snapshot_screen_scrollback(term: &Term<VoidListener>, max_rows: usize) ->
         .saturating_sub(max_rows)
         .max(topmost);
     snapshot_screen_range(term, start..=bottommost, true)
+}
+
+/// Format a rendered VT100 [`ScreenSnapshot`] as plain text for Agent screen inspection.
+///
+/// Trims trailing horizontal whitespace from each row and removes trailing blank lines
+/// while preserving internal vertical spacing.
+#[must_use]
+pub fn render_screen_text(screen: &ScreenSnapshot) -> String {
+    let mut lines: Vec<&str> = screen.rows.iter().map(|row| row.text.trim_end()).collect();
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 #[derive(Debug)]
@@ -463,7 +476,8 @@ mod tests {
         assert_eq!(
             snapshot_terminal_history(&term, SCROLLBACK_HISTORY)
                 .screen
-                .rows, [] as [duthub_core::ipc::ScreenRow; 0]
+                .rows,
+            [] as [duthub_core::ipc::ScreenRow; 0]
         );
     }
 
@@ -493,7 +507,10 @@ mod tests {
                 frame.rows[frame.cursor_row.unwrap() as usize].text,
                 expected
             );
-            assert_eq!(frame.cursor_char, Some(u32::try_from(expected.len()).unwrap()));
+            assert_eq!(
+                frame.cursor_char,
+                Some(u32::try_from(expected.len()).unwrap())
+            );
             assert!(frame.bracketed_paste);
         }
     }
@@ -546,7 +563,10 @@ mod tests {
         reset_terminal(&mut term, &mut parser);
         assert_eq!((term.columns(), term.screen_lines()), (82, 19));
         assert!(!term.mode().contains(TermMode::ALT_SCREEN));
-        assert_eq!(snapshot_screen(&term).rows, [] as [duthub_core::ipc::ScreenRow; 0]);
+        assert_eq!(
+            snapshot_screen(&term).rows,
+            [] as [duthub_core::ipc::ScreenRow; 0]
+        );
 
         parser.advance(&mut term, b"fresh shell");
         let after = snapshot_screen(&term);
@@ -566,7 +586,9 @@ mod tests {
         assert!(!flush_expired_sync(
             &mut term,
             &mut parser,
-            deadline.checked_sub(std::time::Duration::from_millis(1)).unwrap(),
+            deadline
+                .checked_sub(std::time::Duration::from_millis(1))
+                .unwrap(),
         ));
         assert!(
             snapshot_screen(&term)
@@ -594,12 +616,12 @@ mod tests {
         assert!(!screen.application_cursor && !screen.bracketed_paste);
     }
 
-    /// `终端仿真重构（alacritty_terminal）单元级验证：字节流进` Processor →
-    /// Term 网格承载设备侧回显与 ANSI（代替旧 `LineAssembler` 行重组测试）。
+    /// Feed a raw serial byte stream through the ANSI processor.
+    /// The grid should contain device echo and interpreted ANSI formatting.
     #[test]
     fn term_simulator_renders_remote_echo_and_sgr_colors() {
         let mut term = create_term();
-        // 模拟设备 shell 回显（含 CRLF）+ SGR 红色 + 光标定位
+        // Simulate shell echo with CRLF, red text, and cursor positioning.
         feed(
             &mut term,
             b"root@rk3576:~# echo hi\r\nhi\r\n\x1b[31mred\x1b[0m",
@@ -609,7 +631,7 @@ mod tests {
             snap.rows
                 .iter()
                 .any(|r| r.text.contains("root@rk3576:~# echo hi")),
-            "回显行必须在网格里：{:?}",
+            "echoed line must be present in grid: {:?}",
             snap.rows
         );
         assert!(snap.rows.iter().any(|r| r.text.contains("hi")));
@@ -617,17 +639,21 @@ mod tests {
             .rows
             .iter()
             .find(|r| r.text.contains("red"))
-            .expect("ANSI 输出行存在");
-        assert_eq!(red.fg, Some(0x00cc_6666), "SGR 31 必须映射为红色前景");
+            .expect("ANSI output row should exist");
+        assert_eq!(
+            red.fg,
+            Some(0x00cc_6666),
+            "SGR 31 must map to red foreground"
+        );
         assert!(
             snap.cursor_row.is_some() && snap.cursor_char.is_some(),
-            "光标必须定位（提示符在等输入）"
+            "cursor must be positioned at prompt"
         );
     }
 
-    /// 光标定位（CUP）与擦除（ED/EL）由仿真器处理：清屏后新内容在提示位置。
-    /// 注：alacritty 0.26 的 ED2 会把被清内容卷入回滚历史（与真实终端一致），
-    /// 所以断言落在"新内容 + 光标位置"，而不是"旧内容从快照消失"。
+    /// The emulator handles cursor positioning and line or display erasure.
+    /// ED2 moves cleared content into scrollback.
+    /// Check the new visible text and cursor without expecting the old history to vanish.
     #[test]
     fn term_simulator_handles_clear_and_cursor_positioning() {
         let mut term = create_term();
@@ -637,12 +663,12 @@ mod tests {
             .rows
             .iter()
             .position(|r| r.text.contains("fresh"))
-            .expect("清屏后新内容必须可见");
+            .expect("new text must be visible after clear");
         assert_eq!(snap.cursor_row, Some(u32::try_from(fresh_idx).unwrap()));
-        assert_eq!(snap.cursor_char, Some(5), "光标在 fresh 之后");
+        assert_eq!(snap.cursor_char, Some(5), "cursor should follow \"fresh\"");
     }
 
-    /// 回滚历史：行数超过屏幕高度后旧行进 history，快照按上限携带。
+    /// When the viewport fills, retain older rows in the snapshot's bounded history.
     #[test]
     fn term_simulator_keeps_scrollback_history() {
         let mut term = create_term();
@@ -652,61 +678,71 @@ mod tests {
         }
         feed(&mut term, &stream);
         let snap = snapshot_screen(&term);
-        // 屏幕外的历史行也在快照里（最多 SNAPSHOT_MAX_ROWS）
-        assert!(snap.rows.len() > DEFAULT_ROWS, "快照必须含回滚历史行");
+        // The snapshot contains scrollback rows as well as the current viewport.
+        assert!(
+            snap.rows.len() > DEFAULT_ROWS,
+            "snapshot must include scrollback history rows"
+        );
         assert!(
             snap.rows.iter().any(|r| r.text.contains("row-0000")),
-            "最早的行必须仍在（历史上限内）：{:?}",
+            "earliest row must remain within history limit: {:?}",
             snap.rows.first()
         );
         assert!(
             snap.rows
                 .iter()
                 .any(|r| r.text.contains(&format!("row-{:04}", DEFAULT_ROWS + 19))),
-            "最新行必须在"
+            "latest row must be present"
         );
     }
 
-    /// 256 色与 RGB 直写色都映射为 0xRRGGBB（分两行避免行锚色互相覆盖）。
+    /// Verify indexed and true-color RGB on separate rows.
     #[test]
     fn indexed_and_spec_colors_resolve() {
         let mut term = create_term();
-        // 256 色板：indexed 196 = 立方红 (255,0,0)；spec 直写 #12ff34
+        // Use color index 196 for red and an explicit RGB value for the second row.
         feed(
             &mut term,
             b"\x1b[38;5;196mA\x1b[0m\r\n\x1b[38;2;18;255;52mB",
         );
         let snap = snapshot_screen(&term);
         let row = snap.rows.iter().find(|r| r.text.contains('A')).unwrap();
-        assert_eq!(row.fg, Some(0x00ff_0000), "indexed 196 → 立方红");
+        assert_eq!(row.fg, Some(0x00ff_0000), "indexed 196 -> color cube red");
         let row = snap.rows.iter().find(|r| r.text.contains('B')).unwrap();
-        assert_eq!(row.fg, Some(0x0012_ff34), "SGR 38;2 直写 RGB");
+        assert_eq!(row.fg, Some(0x0012_ff34), "SGR 38;2 direct RGB");
     }
 
-    /// 光标隐藏（DECTCEM ?25）时快照不携带光标。
+    /// Omit the cursor from the snapshot when the device hides it.
     #[test]
     fn hidden_cursor_is_absent() {
         let mut term = create_term();
         feed(&mut term, b"\x1b[?25lhide");
         let snap = snapshot_screen(&term);
-        assert!(snap.cursor_row.is_none(), "光标隐藏时不得有光标坐标");
+        assert!(
+            snap.cursor_row.is_none(),
+            "hidden cursor must not report coordinates"
+        );
         assert!(snap.rows.iter().any(|r| r.text.contains("hide")));
     }
 
-    /// 键入尾随空格的回显必须可见：光标落在尾随空白区时快照保留空白至
-    /// 光标列，否则前后两帧快照逐字节相同，UI 表现为"按键无效果"。
+    /// Preserve an echoed space when the cursor moves into trailing blanks.
+    /// Otherwise two successive snapshots could be identical.
     #[test]
     fn trailing_space_before_cursor_stays_in_snapshot() {
         let mut term = create_term();
         feed(&mut term, b"abc");
-        feed(&mut term, b" "); // 设备回显：写入空格并推进光标
+        feed(&mut term, b" "); // Device echoes space and advances cursor.
         let snap = snapshot_screen(&term);
-        assert_eq!(snap.rows[0].text, "abc ", "尾随空格保留");
-        assert_eq!(snap.cursor_char, Some(4), "光标推进到空格之后");
+        assert_eq!(snap.rows[0].text, "abc ", "trailing space preserved");
+        assert_eq!(
+            snap.cursor_char,
+            Some(4),
+            "cursor advances past trailing space"
+        );
     }
 
-    /// 退格（BS SP BS）擦除行尾字符后，光标停在原字符位置：文本裁剪到
-    /// 非空白前缀，光标偏移不变（UI 在被擦除单元上画反显光标块）。
+    /// A backspace-space-backspace sequence erases the tail character.
+    /// Trim the erased cell's text while leaving the cursor at that position.
     #[test]
     fn backspace_echo_keeps_cursor_on_erased_cell() {
         let mut term = create_term();
@@ -716,19 +752,26 @@ mod tests {
         assert_eq!(snap.cursor_char, Some(2));
     }
 
-    /// 无光标行维持裁剪；行中光标不受尾随裁剪影响。
+    /// Trim trailing blanks on rows without the cursor or with the cursor inside the text.
     #[test]
     fn rows_without_cursor_tail_are_trimmed() {
         let mut term = create_term();
         feed(&mut term, b"line1  \r\nabc  \x1b[2D");
         let snap = snapshot_screen(&term);
-        assert_eq!(snap.rows[0].text, "line1", "无光标行裁掉尾随空白");
+        assert_eq!(
+            snap.rows[0].text, "line1",
+            "non-cursor row trims trailing blanks"
+        );
         assert_eq!(snap.rows[1].text, "abc");
-        assert_eq!(snap.cursor_char, Some(3), "行中光标偏移不变");
+        assert_eq!(
+            snap.cursor_char,
+            Some(3),
+            "mid-line cursor offset unchanged"
+        );
     }
 
-    /// 多字节行尾：空白边界按字符数计，宽字符行尾 + 尾随空格 + 光标
-    /// 偏移之间不再混用字节长度。
+    /// Count characters when deciding how much whitespace to keep on a multibyte row.
+    /// A byte offset cannot be compared directly with the cursor's character offset.
     #[test]
     fn multibyte_tail_boundary_uses_char_offsets() {
         let mut term = create_term();
@@ -736,24 +779,28 @@ mod tests {
         feed(&mut term, b" ");
         let snap = snapshot_screen(&term);
         assert_eq!(snap.rows[0].text, "中文 ");
-        assert_eq!(snap.cursor_char, Some(3), "宽字符按 1 字符计偏移");
+        assert_eq!(
+            snap.cursor_char,
+            Some(3),
+            "wide chars count as 1 char per offset"
+        );
     }
 
-    // ===== IO-1：串口 RX 原始字节 → vte Processor → snapshot_screen =====
+    // Snapshots from raw serial receive bytes
 
-    /// IO-1（本地不伪造）：快照里的每一行都必须来自设备发送的字节。
-    /// 新会话设备什么都没发时快照必须为空（本地不得伪造欢迎语/提示符）；
-    /// 只喂提示符字节时快照内容逐字节等于设备发送内容——TX 注记等本地
-    /// 伪造行只进 .log，永不进终端流（AGENTS.md 坑 #22）。
+    /// Each new terminal row must originate from bytes received from the device.
+    /// An empty stream must not create a welcome line or prompt.
+    /// A device prompt appears on its own when its bytes arrive.
+    /// Local TX annotations remain in the log and never enter the terminal grid.
     #[test]
     fn snapshot_carries_only_device_bytes_without_local_fabrication() {
         let mut term = create_term();
         assert!(
             snapshot_screen(&term).rows.is_empty(),
-            "设备未发送任何字节时快照必须为空"
+            "snapshot must be empty before the device sends any bytes"
         );
-        // 只喂设备侧提示符字节（SGR 绿 + 冒号结尾 + 尾随空格）：快照必须
-        // 恰好等于发送内容，无任何本地补写的行。
+        // Feed only a device prompt with the ANSI green color and trailing space.
+        // The snapshot must contain that prompt without extra local lines.
         feed(&mut term, b"\x1b[32mroot@board:~#\x1b[0m ");
         let snap = snapshot_screen(&term);
         let texts: Vec<&str> = snap
@@ -765,39 +812,59 @@ mod tests {
         assert_eq!(
             &texts[..],
             ["root@board:~# "],
-            "快照只能携带设备发送的字节（尾随空格因光标在其上而保留）：{:?}",
+            "snapshot must carry only device bytes (trailing space kept at cursor): {:?}",
             snap.rows
         );
-        assert_eq!(snap.rows[0].fg, Some(0x00b5_bd68), "SGR 32 → 调色板绿");
+        assert_eq!(
+            snap.rows[0].fg,
+            Some(0x00b5_bd68),
+            "SGR 32 -> palette green"
+        );
         assert_eq!(snap.cursor_row, Some(0));
-        assert_eq!(snap.cursor_char, Some(14), "光标停在提示符空格之后");
+        assert_eq!(
+            snap.cursor_char,
+            Some(14),
+            "cursor stops after prompt space"
+        );
     }
 
-    /// IO-1（主场景，模拟 real.rs 读循环分块到达）：设备侧回显行、提示符、
-    /// SGR 颜色与光标位置全部由仿真器承载并出现在 `snapshot_screen` 的快照
-    /// 行中，本地不伪造任何回显。逐帧喂入（提示符 → 逐字节回显键入 →
-    /// 命令输出 + 新提示符），每帧快照必须如实反映已收字节。
+    /// Simulate hardware reads split into several byte chunks.
+    /// Each snapshot shows device echo, prompts, ANSI colors, and cursor position.
+    /// Feed the prompt, individual echoed keystrokes, and command output in sequence.
+    /// Each frame reflects the bytes already received.
     #[test]
     fn device_echo_prompt_color_and_cursor_are_carried_by_simulator() {
         let mut term = create_term();
-        // 帧一：设备发送绿色提示符（真实串口依赖设备回显，本地不补 prompt）
+        // Feed the green prompt from the device.
         feed(&mut term, b"\x1b[32mroot@rk3576:~#\x1b[0m ");
         let snap = snapshot_screen(&term);
         assert_eq!(snap.rows[0].text, "root@rk3576:~# ");
-        assert_eq!(snap.rows[0].fg, Some(0x00b5_bd68), "提示符 SGR 32 → 调色板绿");
+        assert_eq!(
+            snap.rows[0].fg,
+            Some(0x00b5_bd68),
+            "prompt SGR 32 -> palette green"
+        );
         assert_eq!(snap.cursor_row, Some(0));
-        assert_eq!(snap.cursor_char, Some(15), "光标停在提示符空格之后");
+        assert_eq!(
+            snap.cursor_char,
+            Some(15),
+            "cursor stops after prompt space"
+        );
 
-        // 帧二：键入逐字节回显（'l'、's' 各一次读循环，模拟分块 RX）
+        // Feed the two echoed keystrokes as separate reads.
         feed(&mut term, b"l");
         let snap = snapshot_screen(&term);
         assert_eq!(snap.rows[0].text, "root@rk3576:~# l");
         feed(&mut term, b"s");
         let snap = snapshot_screen(&term);
         assert_eq!(snap.rows[0].text, "root@rk3576:~# ls");
-        assert_eq!(snap.cursor_char, Some(17), "光标随设备回显推进");
+        assert_eq!(
+            snap.cursor_char,
+            Some(17),
+            "cursor advances with device echo"
+        );
 
-        // 帧三：命令输出（红色）+ 新提示符；已回显的命令行必须保留在网格
+        // Feed red command output and the next prompt while keeping the command line in the grid.
         feed(
             &mut term,
             b"\r\n\x1b[31mERR: not found\x1b[0m\r\n\x1b[32mroot@rk3576:~#\x1b[0m ",
@@ -812,25 +879,31 @@ mod tests {
         assert_eq!(
             &texts[..],
             ["root@rk3576:~# ls", "ERR: not found", "root@rk3576:~# "],
-            "回显行、输出行、新提示符必须按序出现在快照中：{:?}",
+            "echo row, output row, and new prompt must appear in order: {:?}",
             snap.rows
         );
-        assert_eq!(snap.rows[1].fg, Some(0x00cc_6666), "SGR 31 → 调色板红");
-        let cursor_row = snap.cursor_row.expect("光标必须可见（提示符在等输入）") as usize;
+        assert_eq!(snap.rows[1].fg, Some(0x00cc_6666), "SGR 31 -> palette red");
+        let cursor_row = snap
+            .cursor_row
+            .expect("cursor must be visible at input prompt") as usize;
         assert!(
             snap.rows[cursor_row].text.contains("root@rk3576:~#"),
-            "光标行必须是快照中的提示符行：{:?}",
+            "cursor row must be the prompt row in the snapshot: {:?}",
             snap.rows[cursor_row]
         );
-        assert_eq!(snap.cursor_char, Some(15), "光标停在提示符之后等输入");
+        assert_eq!(
+            snap.cursor_char,
+            Some(15),
+            "cursor waits for input after prompt"
+        );
     }
 
-    // ===== IO-2：尾随空白 × 光标（坑 #46「按键无效果」回归）=====
+    // Cursor positions in trailing whitespace
 
-    /// IO-2（聚合不变量）：空格/退格这类「光标推进型」按键，前后两帧快照
-    /// 不得逐字节相同——否则叠加无本地回显时，用户看到「按键无效果」。
-    /// 空格回显：文本多出保留到光标列的尾随空格 + 光标推进；退格擦除
-    /// （BS SP BS）：文本裁到被擦字符前，光标停在擦除单元。
+    /// An echoed space or erase should change the terminal snapshot.
+    /// The device echo is the only visible confirmation that the keystroke took effect.
+    /// Retain an echoed space up to the new cursor position.
+    /// An erase trims the text and leaves the cursor in the erased cell.
     #[test]
     fn space_and_backspace_keystroke_frames_differ_in_snapshot() {
         let mut term = create_term();
@@ -838,18 +911,21 @@ mod tests {
         let before_space = snapshot_screen(&term);
         assert_eq!(before_space.rows[0].text, "abc");
         assert_eq!(before_space.cursor_char, Some(3));
-        feed(&mut term, b" "); // 设备回显空格并推进光标
+        feed(&mut term, b" "); // Device echoes space and advances cursor.
         let after_space = snapshot_screen(&term);
-        assert_eq!(after_space.rows[0].text, "abc ", "尾随空格必须保留到光标列");
+        assert_eq!(
+            after_space.rows[0].text, "abc ",
+            "trailing space must be kept up to cursor column"
+        );
         assert_eq!(after_space.cursor_char, Some(4));
         assert_ne!(
             before_space.rows[0].text, after_space.rows[0].text,
-            "空格按键前后两帧文本不得逐字节相同"
+            "frames before and after space must differ"
         );
         assert_ne!(before_space.cursor_char, after_space.cursor_char);
 
-        // 退格擦除可见字符：先 BS SP BS 擦掉刚键入的空格（光标停在擦除
-        // 单元），键入 d 覆写擦除位 → "abcd"，再 BS SP BS 擦掉 d。
+        // Erase the trailing space, type a visible letter into that cell,
+        // then erase the letter with the same backspace sequence.
         feed(&mut term, b"\x08 \x08");
         feed(&mut term, b"d");
         let before_backspace = snapshot_screen(&term);
@@ -857,55 +933,70 @@ mod tests {
         feed(&mut term, b"\x08 \x08");
         let after_backspace = snapshot_screen(&term);
         assert_eq!(after_backspace.rows[0].text, "abc");
-        assert_eq!(after_backspace.cursor_char, Some(3), "光标停在擦除单元");
+        assert_eq!(
+            after_backspace.cursor_char,
+            Some(3),
+            "cursor stays on erased cell"
+        );
         assert_ne!(
             before_backspace.rows[0].text, after_backspace.rows[0].text,
-            "退格按键前后两帧文本不得逐字节相同"
+            "frames before and after backspace must differ"
         );
     }
 
-    /// IO-2：「保留空白至光标列」的双向精确性——光标落在尾随空白区中间
-    /// 时，光标列之前（含）的空白保留，光标之后的空白仍裁剪；多保留或
-    /// 少保留都会让空格/退格帧间对比失真。
+    /// When the cursor sits inside trailing blanks, retain the blanks up to its column.
+    /// Continue trimming the rest of the row.
+    /// Both the number of retained blanks and the cursor position affect the visible frame.
     #[test]
     fn cursor_inside_trailing_whitespace_keeps_up_to_cursor_and_trims_beyond() {
         let mut term = create_term();
-        feed(&mut term, b"ab    "); // 设备回显 4 个空格，光标推进到行尾
-        feed(&mut term, b"\x1b[2D"); // 光标左移 2 列，落在空白区中间
+        feed(&mut term, b"ab    "); // Device echoes 4 spaces; cursor advances to end of line.
+        feed(&mut term, b"\x1b[2D"); // Cursor moves left 2 columns into trailing whitespace.
         let snap = snapshot_screen(&term);
         assert_eq!(
             snap.rows[0].text, "ab  ",
-            "保留空白至光标列，光标之后的空白仍裁剪"
+            "keep blanks up to cursor column and trim beyond"
         );
-        assert_eq!(snap.cursor_char, Some(4), "光标停在空白区内");
+        assert_eq!(
+            snap.cursor_char,
+            Some(4),
+            "cursor rests inside trailing blanks"
+        );
     }
 
-    /// IO-2：保留规则按行生效——只有光标所在行保留尾随空白，其余行一律
-    /// 维持裁剪，多行画面下不得放宽整帧。
+    /// Apply cursor-dependent whitespace preservation to the cursor row alone.
+    /// Other rows in the same snapshot continue to trim trailing blanks.
     #[test]
     fn only_cursor_row_keeps_trailing_whitespace() {
         let mut term = create_term();
-        feed(&mut term, b"aa  \r\nbb  "); // 两行都带尾随空白，光标在第二行行尾
+        feed(&mut term, b"aa  \r\nbb  "); // Both rows have trailing blanks; cursor is at end of row 2.
         let snap = snapshot_screen(&term);
-        assert_eq!(snap.rows[0].text, "aa", "无光标行维持裁剪");
-        assert_eq!(snap.rows[1].text, "bb  ", "光标所在行保留空白至光标列");
+        assert_eq!(snap.rows[0].text, "aa", "non-cursor row remains trimmed");
+        assert_eq!(
+            snap.rows[1].text, "bb  ",
+            "cursor row preserves blanks up to cursor column"
+        );
         assert_eq!(snap.cursor_row, Some(1));
         assert_eq!(snap.cursor_char, Some(4));
     }
 
-    /// IO-2：多字节行 + 光标深入空白区——空白边界必须按字符数计。若实现
-    /// 把字节长度（「中文」= 6 字节）与字符偏移混比，光标偏移 4 会被误判
-    /// 为落在非空白区，尾随空白被整体裁掉（坑 #46 的多字节形态）。
+    /// Count characters on a multibyte line where the cursor has advanced into blanks.
+    /// Using the UTF-8 byte length would misclassify the cursor's character offset.
+    /// That would incorrectly trim every trailing blank.
     #[test]
     fn wide_char_row_cursor_deep_in_whitespace_uses_char_offsets() {
         let mut term = create_term();
         feed(&mut term, "中文".as_bytes());
-        feed(&mut term, b"\x1b[2C"); // 光标推进到空白区深处（无回显写入）
+        feed(&mut term, b"\x1b[2C"); // Cursor advances into blanks without echoing spaces.
         let snap = snapshot_screen(&term);
         assert_eq!(
             snap.rows[0].text, "中文  ",
-            "空白边界按字符数计：保留至字符偏移 4（非字节偏移 8）"
+            "whitespace boundary uses char count (offset 4, not byte offset 8)"
         );
-        assert_eq!(snap.cursor_char, Some(4), "宽字符按 1 字符计偏移");
+        assert_eq!(
+            snap.cursor_char,
+            Some(4),
+            "wide chars count as 1 char per offset"
+        );
     }
 }

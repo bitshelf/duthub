@@ -29,27 +29,28 @@ use serde_json::{Value, json};
 
 pub const MAX_STDOUT_LINE: usize = 4 * 1024 * 1024;
 pub const EVENT_QUEUE_CAPACITY: usize = 4096;
-/// duthub 实现的 ACP 协议版本（initialize 必须显式等于该值）。
+/// The ACP protocol version implemented by duthub (initialize must be explicitly set to this
+/// value).
 pub const ACP_PROTOCOL_VERSION: u64 = 1;
-/// 控制事件队列上限。正常低频；若失控的 agent 持续制造关键事件，
-/// 清空队列并以 `CRITICAL_OVERFLOW_PREFIX` 的 `ProtocolError` fail closed。
+/// Cap the control-event queue. If critical events overrun it, clear it and report a
+/// `ProtocolError` with `CRITICAL_OVERFLOW_PREFIX`.
 pub const CRITICAL_QUEUE_CAPACITY: usize = 1024;
-/// 关键事件队列溢出标记（host 见到它无条件终止会话）。
+/// Key event queue overflow flag (The host terminates the session without further hesitation).
 pub const CRITICAL_OVERFLOW_PREFIX: &str = "ACP 关键事件队列溢出";
 const DEFAULT_STDERR_CAP: usize = 64 * 1024;
 const PROTOCOL_BODY_PREVIEW: usize = 200;
 /// A request checks the closed/cancel flags at this cadence even while the
 /// agent is silent, so stop/EOF never waits for the full request timeout.
 const REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// Drop 关闭 Job `句柄后等待主进程退出的上限（KILL_ON_JOB_CLOSE` 是异步终止）；
-/// 超时退回 `kill_process_tree`，避免 Drop 永久阻塞工作线程。
+/// `KILL_ON_JOB_CLOSE` terminates the job asynchronously. After closing its handle, wait a bounded
+/// time before falling back to `kill_process_tree` so `Drop` cannot block the worker indefinitely.
 const JOB_CLOSE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 子进程可继承的系统变量（goose/ACP 运行必需）。
+/// System variables that can be inherited by child processes (required for ACP execution).
 ///
-/// 明确**不**包含用户目录键（`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`HOME`、
-/// `HOMEDRIVE`、`HOMEPATH`）与 `TEMP`/`TMP`：goose 的配置/会话由
-/// `GOOSE_PATH_ROOT` 指定，临时目录由 [`AcpClient::spawn`] 指向会话沙箱。
+/// Exclude user directory variables (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `HOME`, `HOMEDRIVE`,
+/// and `HOMEPATH`) and `TEMP` and `TMP` from inheritance. `GOOSE_PATH_ROOT` controls goose's
+/// configuration and sessions. [`AcpClient::spawn`] directs temporary files to the session sandbox.
 const INHERITED_ENV: &[&str] = &[
     "SystemRoot",
     "SYSTEMROOT",
@@ -73,7 +74,8 @@ const INHERITED_ENV: &[&str] = &[
     "TERM",
 ];
 
-/// 用户目录 / 用户 TEMP 键：**不得**继承（测试据此做负向断言）。
+/// User directory / User TEMP key: **Should not be inherited** (This test makes a negative
+/// assertion based on this principle).
 #[cfg(test)]
 const USER_SCOPE_ENV: &[&str] = &[
     "USERPROFILE",
@@ -144,7 +146,8 @@ pub enum AcpError {
     Spawn(String),
     Io(String),
     Protocol(String),
-    /// JSON-RPC error 响应（保留 code 供 `session/load` 的 -32601 判定）。
+    /// JSON-RPC error response (The `code` parameter is reserved for use in determining the error
+    /// code for `-32601` in `session/load`).
     Rpc {
         code: i64,
         message: String,
@@ -201,8 +204,9 @@ impl StderrState {
 struct AcpInner {
     stdin: Mutex<Option<Box<dyn Write + Send>>>,
     events: Mutex<VecDeque<AcpEvent>>,
-    /// 控制事件独立通道（F15）：PromptDone / Exited / `ProtocolError` 不能被
-    /// 正文事件溢出丢弃；自身有上限，越界即 fail closed。
+    /// Control events through independent channels (F15): PromptDone/Exited/`ProtocolError` cannot
+    /// be handled via event overflow mechanisms. There is a limit to this mechanism; any attempt to
+    /// exceed this limit will result in a failure.
     critical: Mutex<VecDeque<AcpEvent>>,
     critical_overflowed: Mutex<bool>,
     overflowed: Mutex<bool>,
@@ -342,7 +346,9 @@ impl AcpInner {
 
     fn handle_stdout_line(&self, line: &str) {
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
-        let value: Value = if let Ok(value) = serde_json::from_str(line) { value } else {
+        let value: Value = if let Ok(value) = serde_json::from_str(line) {
+            value
+        } else {
             let preview: String = self
                 .redact(line)
                 .chars()
@@ -395,7 +401,8 @@ impl AcpInner {
         let _ = sender.send(outcome);
     }
 
-    /// agent → client 请求的响应（拒绝权限，fs/terminal 与未知方法 `MethodNotFound`）。
+    /// Agent → Response to Client Request (Permission Denied, fs/terminal and Unknown Methods:
+    /// `MethodNotFound`).
     fn agent_request_response(&self, id: &Value, method: &str, value: &Value) -> Value {
         match method {
             "session/request_permission" => {
@@ -477,7 +484,8 @@ impl AcpInner {
     }
 }
 
-/// F16：initialize 的 protocolVersion 必须显式等于 duthub 支持的版本。
+/// F16: The protocolVersion value during initialization must explicitly equal the version supported
+/// by duthub.
 fn check_protocol_version(result: &Value) -> Result<u64, AcpError> {
     let protocol_version = result
         .get("protocolVersion")
@@ -582,17 +590,16 @@ impl std::fmt::Debug for AcpClient {
 }
 
 impl AcpClient {
-    /// 启动 ACP 子进程（stdin/stdout/stderr 全 piped；Windows `CREATE_NO_WINDOW`）。
+    /// Launch the ACP child process (all outputs are piped to stdin/stdout/stderr; Windows mode
+    /// uses `CREATE_NO_WINDOW`).
     ///
-    /// 环境由三部分组成：
-    /// 1. [`INHERITED_ENV`] 的系统变量白名单（**不含**用户目录键）；
-    /// 2. 调用方 `env`（`模型密钥、GOOSE_PATH_ROOT` 等），同名时覆盖白名单；
-    /// 3. `TEMP`/`TMP` 最后写入，固定指向 `cwd/tmp`（先创建并做普通目录校验，
-    ///    调用方 env 不得覆盖）。
+    /// Start with the system-variable allowlist in [`INHERITED_ENV`], which omits user directories.
+    /// Caller `env` entries can override inherited keys. Set `TEMP` and `TMP` last so they always
+    /// point to `cwd/tmp`, after creating and validating that directory.
     ///
-    /// `cwd` 就是该 DUT 的 sandbox 单元：子进程以该单元的 `WRITE_RESTRICTED`
-    /// 受限令牌启动（`duthub_sandbox::spawn_streaming`），令牌/Job/ACL 全部由
-    /// 沙箱 crate 建立并在 resume 前回验；建立失败即返回错误，绝不回退完整令牌。
+    /// Use the DUT sandbox as `cwd`. The sandbox crate starts the child under a restricted token
+    /// through `duthub_sandbox::spawn_streaming` and verifies the token, job, and ACLs before
+    /// resuming it. Abort if setup fails.
     pub fn spawn(
         program: &Path,
         args: &[String],
@@ -803,8 +810,10 @@ impl AcpClient {
         })
     }
 
-    /// 新建 session，并把每会话 MCP listener 作为 `mcpServers` 注入。
-    /// 保留 `_meta.extensionResults`（F3；用于证明内置扩展已关）。
+    /// Create a new session, and inject the MCP listener for each session into the `mcpServers`
+    /// field.
+    /// Keep `_meta.extensionResults` (F3); this field is used to indicate that the built-in
+    /// extension has been disabled.
     pub fn new_session(
         &self,
         cwd: &Path,
@@ -835,7 +844,8 @@ impl AcpClient {
         })
     }
 
-    /// 恢复已有 session；agent 不支持 `session/load` 时返回 `false`。
+    /// Restoring an existing session; returns `false` when the agent does not support
+    /// `session/load`.
     pub fn load_session(
         &self,
         id: &str,
@@ -850,13 +860,15 @@ impl AcpClient {
         );
         match value {
             Ok(_) => Ok(true),
-            // 只有 JSON-RPC MethodNotFound 才表示 agent 不支持 session/load。
+            // The only reason for the JSON-RPC error "MethodNotFound" is that the agent does not
+            // support session/load functionality.
             Err(AcpError::Rpc { code: -32601, .. }) => Ok(false),
             Err(error) => Err(error),
         }
     }
 
-    /// 发送 prompt；完成事件经 [`AcpClient::drain`] 的 `PromptDone` 返回。
+    /// Sent prompt; event completion is returned via [`AcpClient::drain`), with the `PromptDone`
+    /// signal.
     pub fn prompt(&self, session_id: &str, text: &str) -> Result<(), AcpError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner.prompts.lock().unwrap().insert(id);
@@ -885,8 +897,9 @@ impl AcpClient {
     }
 
     pub fn drain(&self) -> Vec<AcpEvent> {
-        // 正文事件先出队，控制事件追加在后（PromptDone/ProtocolError 语义上
-        // 总是晚于本批正文）；控制事件不受正文队列溢出影响。
+        // The main events are processed first, while control-related events are added later (in
+        // terms of semantics, PromptDone/ProtocolError always occurs later than the main events).
+        // Control-related events are not affected by overflow in the main event queue.
         let mut events: Vec<AcpEvent> = {
             let mut queue = self.inner.events.lock().unwrap();
             queue.drain(..).collect()
@@ -943,23 +956,27 @@ impl AcpClient {
         }
     }
 
-    /// 任意 stdout 协议行的最近时间（watchdog 用；包含未映射的 update）。
+    /// The latest time for any stdout protocol line (used by watchdog; includes updates that have
+    /// not been mapped).
     pub fn last_activity_unix_ms(&self) -> u64 {
         self.inner.last_activity_ms.load(Ordering::Relaxed)
     }
 
-    /// stderr 尾部（已脱敏）。
+    /// Stderr tail (has been anonymized).
     pub fn stderr_tail(&self) -> String {
         self.inner.stderr_tail()
     }
 
-    /// 停止进程树（仅工作线程调用）：`TerminateJobObject` 杀掉整棵树后
-    /// 有界等待主进程退出；句柄由 `SandboxedProcess` 的 `Drop` 关闭，
-    /// `KILL_ON_JOB_CLOSE` 对残留进程兜底。
+    /// Stopping the process tree (only called by worker threads): The `TerminateJobObject` function
+    /// is used to terminate the entire tree.
+    /// Bounded waiting is involved in forcing the main process to exit; handles are closed by the
+    /// `Drop` method of `SandboxedProcess`.
+    /// The `KILL_ON_JOB_CLOSE` mechanism is used to handle any remaining processes that may persist
+    /// after termination.
     pub fn kill(&self) {
         let process = self.process.lock().unwrap();
-        // `terminate` 内部在 Job 调用失败时退回 TerminateProcess，因此不需要
-        // 第二条 `taskkill /T /F` 路径。
+        // The `terminate` function internally returns to TerminateProcess when the Job execution
+        // fails. Therefore, there is no need to use the second parameter `taskkill /T /F`.
         let _ = process.terminate();
         let _ = process.wait_timeout(JOB_CLOSE_REAP_TIMEOUT);
     }
@@ -1073,7 +1090,7 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<
     }
 }
 
-/// 脱敏：已知密钥值、`Bearer <token>`、`sk-…`。
+/// Masking: Known key values, such as `Bearer <token>`, `sk-…`.
 pub(crate) fn redact_secrets(text: &str, secrets: &[String]) -> String {
     let mut output = text.to_owned();
     for secret in secrets {
@@ -1153,7 +1170,7 @@ mod tests {
                 INHERITED_ENV
                     .iter()
                     .any(|key| key.eq_ignore_ascii_case(required)),
-                "缺少系统变量 {required}"
+                "Missing system variable {required}."
             );
         }
         for forbidden in USER_SCOPE_ENV {
@@ -1161,7 +1178,7 @@ mod tests {
                 !INHERITED_ENV
                     .iter()
                     .any(|key| key.eq_ignore_ascii_case(forbidden)),
-                "不得继承用户目录/TEMP 键 {forbidden}"
+                "It is not allowed to inherit the User Directory/TEMP key. {forbidden}"
             );
         }
     }
@@ -1191,7 +1208,7 @@ mod tests {
             assert_eq!(events.len(), EVENT_QUEUE_CAPACITY);
             assert!(
                 matches!(events.front(), Some(AcpEvent::AgentChunk(text)) if text == "1"),
-                "只丢最旧的一条：{:?}",
+                "I've only lost the oldest one: {:?}",
                 events.front()
             );
         }
@@ -1272,7 +1289,7 @@ mod tests {
         assert!(inner.closed.load(Ordering::SeqCst));
         assert!(
             matches!(receiver.recv().unwrap(), Err(AcpError::Closed)),
-            "pending request 必须立即收到 Closed"
+            "The pending request must be processed immediately; the request has been closed."
         );
         assert!(inner.pending.lock().unwrap().is_empty());
         // Idempotent: a second EOF/exit must not panic or re-send.

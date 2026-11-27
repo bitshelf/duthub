@@ -1,6 +1,7 @@
-//! DUT/Host 数据状态（连接管理页 + Agent 目标选择共享）。
+//! DUT/Host Data Status (Connection Management Page + Agent Target Selection Sharing).
 //!
-//! 数据源：`.duthub/duts.json`。新工作区没有预置连接。
+//! Data source: `.duthub/duts.json`. No pre-configured connections are available for the new
+//! workspace.
 
 use duthub_core::model::{AlertSettings, DutConfig, DutMediaConfig, FlashConfig, FlashToolPreset};
 use duthub_core::{DutsFile, store};
@@ -96,7 +97,7 @@ pub struct DutsState {
     pub selected: usize,
     pub new_connection: Option<NewConnection>,
     pub editing_new_connection: bool,
-    /// 尚未保存到磁盘
+    /// The data has not been saved to the disk yet.
     pub dirty: bool,
     saved_media: std::collections::HashMap<String, DutMediaConfig>,
     saved_usb: std::collections::HashMap<String, duthub_core::model::AdbConfig>,
@@ -127,7 +128,8 @@ impl NewConnection {
 }
 
 impl DutsState {
-    /// 加载（缺失或损坏时从空列表开始）；返回状态与可选错误提示。
+    /// Loading (starting from an empty list in case of missing or damaged files); returning status
+    /// and optional error messages.
     pub fn load(dir: &std::path::Path) -> (Self, Option<String>) {
         match store::load_duts(dir) {
             Ok(Some(file)) => (Self::from_file(file), None),
@@ -143,7 +145,7 @@ impl DutsState {
     #[cfg(test)]
     pub fn demo() -> Self {
         let file: DutsFile =
-            serde_json::from_str(DEMO_DUTS_JSON).expect("docs/examples/duts.json 有效");
+            serde_json::from_str(DEMO_DUTS_JSON).expect("docs/examples/duts.json is a valid file.");
         Self::from_file(file)
     }
 

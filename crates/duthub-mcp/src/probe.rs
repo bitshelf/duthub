@@ -159,17 +159,17 @@ mod tests {
         let names = list_tool_names(&url, &token, Duration::from_secs(15)).unwrap();
         assert!(
             names.iter().any(|name| name == "dut_list"),
-            "探测必须看到只读工具面: {names:?}"
+            "probe must see the read-only tool surface: {names:?}"
         );
 
         let error = list_tool_names(&url, "dth-wrong-token", Duration::from_secs(10))
-            .expect_err("错误 Bearer 必须失败");
+            .expect_err("wrong Bearer token must fail");
         assert!(matches!(error, ProbeError::Failed(_)), "{error}");
 
         // A closed port may either be refused immediately or burn the whole
         // connect budget; both are failures from the host's point of view.
         let unreachable = list_tool_names("http://127.0.0.1:1/mcp", &token, Duration::from_secs(1))
-            .expect_err("不可达端点必须失败");
+            .expect_err("unreachable endpoint must fail");
         assert!(
             matches!(unreachable, ProbeError::Failed(_) | ProbeError::Timeout(_)),
             "{unreachable}"

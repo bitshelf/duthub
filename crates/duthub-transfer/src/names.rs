@@ -9,6 +9,7 @@
 
 /// Publish-name / board-name validation failures.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PublishError {
     /// Name violates single-component filename rules.
     #[error("invalid name: {0:?}")]

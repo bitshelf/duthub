@@ -12,11 +12,14 @@ use duthub_core::model::CaptureSettings;
 
 use crate::media::Source;
 
-/// Default poll cadence when at least one binding is watched.
-pub const DEVICE_WATCH_INTERVAL_MS: u64 = 5_000;
-/// Repeat reminder interval while a device remains disconnected (slightly above
-/// `AlertCenter::DEDUP_WINDOW` so 50 ms tick jitter never drops a repeat alert).
-pub const DEVICE_WATCH_REMIND_MS: u64 = 31_000;
+/// Default poll cadence when at least one binding is watched (1 minute).
+pub const DEVICE_WATCH_INTERVAL_MS: u64 = 60_000;
+/// Continuous offline duration required before emitting an offline alert
+/// (10 minutes, avoiding false alerts during flashing when USB debug goes
+/// offline and HDMI has no video output).
+pub const DEVICE_WATCH_OFFLINE_THRESHOLD_MS: u64 = 10 * 60_000;
+/// Repeat reminder interval while a device remains continuously offline (10 minutes).
+pub const DEVICE_WATCH_REMIND_MS: u64 = 10 * 60_000;
 
 /// One bound video capture device to watch for disconnect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +133,9 @@ impl DeviceProbe for RealDeviceProbe {
 
 #[derive(Debug, Clone, Default)]
 struct TrackedState {
+    /// Timestamp (unix ms) when the target was first seen offline in the current
+    /// continuous offline streak; `None` while online.
+    offline_since_ms: Option<u64>,
     reported_offline: bool,
     last_emit_ms: u64,
     /// Last resolved friendly display name for media endpoints.
@@ -154,6 +160,7 @@ struct WatchInner {
 pub struct DeviceWatchService {
     probe: Arc<dyn DeviceProbe>,
     interval_ms: u64,
+    offline_threshold_ms: u64,
     remind_interval_ms: u64,
     inner: Mutex<WatchInner>,
 }
@@ -163,6 +170,7 @@ impl DeviceWatchService {
         Self {
             probe,
             interval_ms: DEVICE_WATCH_INTERVAL_MS,
+            offline_threshold_ms: DEVICE_WATCH_OFFLINE_THRESHOLD_MS,
             remind_interval_ms: DEVICE_WATCH_REMIND_MS,
             inner: Mutex::new(WatchInner::default()),
         }
@@ -259,6 +267,7 @@ impl DeviceWatchService {
                 });
                 if let Some(device) = matched {
                     state.display_name = Some(device.name.clone());
+                    state.offline_since_ms = None;
                     if std::mem::replace(&mut state.reported_offline, false) {
                         new_events.push(DeviceWatchEvent::MediaRecovered {
                             dut_id: item.dut_id.clone(),
@@ -267,8 +276,12 @@ impl DeviceWatchService {
                         });
                     }
                 } else {
-                    let due = !state.reported_offline
-                        || now_ms >= state.last_emit_ms.saturating_add(self.remind_interval_ms);
+                    let since = *state.offline_since_ms.get_or_insert(now_ms);
+                    let sustained = now_ms.saturating_sub(since) >= self.offline_threshold_ms;
+                    let due = sustained
+                        && (!state.reported_offline
+                            || now_ms
+                                >= state.last_emit_ms.saturating_add(self.remind_interval_ms));
                     if due {
                         state.reported_offline = true;
                         state.last_emit_ms = now_ms;
@@ -301,6 +314,7 @@ impl DeviceWatchService {
                 .iter()
                 .any(|serial| serial.eq_ignore_ascii_case(item.serial.trim()));
             if present {
+                state.offline_since_ms = None;
                 if std::mem::replace(&mut state.reported_offline, false) {
                     new_events.push(DeviceWatchEvent::UsbRecovered {
                         dut_id: item.dut_id.clone(),
@@ -310,8 +324,11 @@ impl DeviceWatchService {
                     });
                 }
             } else {
-                let due = !state.reported_offline
-                    || now_ms >= state.last_emit_ms.saturating_add(self.remind_interval_ms);
+                let since = *state.offline_since_ms.get_or_insert(now_ms);
+                let sustained = now_ms.saturating_sub(since) >= self.offline_threshold_ms;
+                let due = sustained
+                    && (!state.reported_offline
+                        || now_ms >= state.last_emit_ms.saturating_add(self.remind_interval_ms));
                 if due {
                     state.reported_offline = true;
                     state.last_emit_ms = now_ms;
@@ -393,10 +410,36 @@ mod tests {
         assert!(watch.tick_at(1_000));
         assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
 
-        // Both unplug -> Offline events with resolved friendly device name.
+        // Inside 1-minute poll cadence -> skipped.
+        assert!(!watch.tick_at(30_000));
+
+        // Both unplug at 61s -> starts the 10-minute continuous offline window, still silent.
         *probe.media.lock().unwrap() = Ok(Vec::new());
         *probe.usb.lock().unwrap() = Ok(Vec::new());
-        assert!(watch.tick_at(6_000));
+        assert!(watch.tick_at(61_000));
+        assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
+
+        // 5 minutes offline -> still silent; reconnecting before 10 minutes resets silently.
+        assert!(watch.tick_at(361_000));
+        assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
+        *probe.media.lock().unwrap() = Ok(vec![MediaDeviceSnapshot {
+            name: "UGREEN 35866".into(),
+            endpoint: Some("@device_pnp_ugreen".into()),
+        }]);
+        *probe.usb.lock().unwrap() = Ok(vec!["SER123".into()]);
+        assert!(watch.tick_at(421_000));
+        assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
+
+        // Unplug again at 500s -> silent at 500s and at +9m (1040s).
+        *probe.media.lock().unwrap() = Ok(Vec::new());
+        *probe.usb.lock().unwrap() = Ok(Vec::new());
+        assert!(watch.tick_at(500_000));
+        assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
+        assert!(watch.tick_at(1_040_000));
+        assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
+
+        // Continuous offline reaches 10 minutes at 1100s -> emits Offline events.
+        assert!(watch.tick_at(1_100_000));
         let events = watch.drain_events();
         assert_eq!(
             events,
@@ -416,14 +459,14 @@ mod tests {
             ]
         );
 
-        // Inside remind window -> silent.
-        assert!(watch.tick_at(15_000));
+        // Inside 10-minute remind window -> silent.
+        assert!(watch.tick_at(1_200_000));
         assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
 
         // Probe errors do not trigger false alerts or drop offline state.
         *probe.media.lock().unwrap() = Err("ffmpeg missing".into());
         *probe.usb.lock().unwrap() = Err("adb error".into());
-        assert!(watch.tick_at(80_000));
+        assert!(watch.tick_at(1_800_000));
         assert_eq!(watch.drain_events(), Vec::<DeviceWatchEvent>::new());
 
         // Both reconnect -> Recovered events.
@@ -432,7 +475,7 @@ mod tests {
             endpoint: Some("@device_pnp_ugreen".into()),
         }]);
         *probe.usb.lock().unwrap() = Ok(vec!["SER123".into()]);
-        assert!(watch.tick_at(86_000));
+        assert!(watch.tick_at(1_860_000));
         assert_eq!(
             watch.drain_events(),
             vec![

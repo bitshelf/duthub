@@ -218,6 +218,7 @@ pub struct ExecResult {
 
 /// Fail-closed sandbox error variants (English technical messages per crate policy).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SandboxError {
     /// No supported MXC containment backend is available on this host.
     #[error("sandbox backend unavailable: {0}")]
@@ -509,7 +510,8 @@ impl CellSpec {
             .file_name()
             .map_or_default(|name| name.to_string_lossy().into_owned());
         let work_dir = root
-            .parent().map_or_else(|| root.clone(), Path::to_path_buf);
+            .parent()
+            .map_or_else(|| root.clone(), Path::to_path_buf);
         Ok(Self {
             scope: scope.to_owned(),
             work_dir,
@@ -532,13 +534,14 @@ impl CellSpec {
                 work_dir.display()
             )));
         }
-        let dut_key = dut_id
-            .bytes()
-            .fold(String::with_capacity(dut_id.len() * 2), |mut out, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{byte:02x}");
-                out
-            });
+        let dut_key =
+            dut_id
+                .bytes()
+                .fold(String::with_capacity(dut_id.len() * 2), |mut out, byte| {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "{byte:02x}");
+                    out
+                });
         let scope = if dut_key.len() + "dut-".len() <= SCOPE_MAX_CHARS {
             format!("dut-{dut_key}")
         } else {
@@ -769,14 +772,16 @@ fn quote_arg(arg: &str) -> String {
 pub fn windows_powershell() -> PathBuf {
     std::env::var_os("SystemRoot")
         .map(PathBuf::from)
-        .filter(|root| root.is_absolute()).map_or_else(|| {
-            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-        }, |root| {
-            root.join("System32")
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe")
-        })
+        .filter(|root| root.is_absolute())
+        .map_or_else(
+            || PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            |root| {
+                root.join("System32")
+                    .join("WindowsPowerShell")
+                    .join("v1.0")
+                    .join("powershell.exe")
+            },
+        )
 }
 
 /// UTF-16LE base64 payload for PowerShell `-EncodedCommand`.

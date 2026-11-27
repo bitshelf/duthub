@@ -258,6 +258,7 @@ pub fn normalize_base_path(raw: &str) -> Result<String, TransferConfigError> {
 
 /// Configuration resolution failures.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TransferConfigError {
     /// `base_path` could not be normalized.
     #[error("invalid base path: {0}")]

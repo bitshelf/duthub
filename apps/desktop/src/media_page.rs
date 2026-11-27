@@ -87,18 +87,16 @@ impl MediaField {
             Self::Ffmpeg => &settings.ffmpeg,
             Self::Ffplay => &settings.ffplay,
             Self::Listen => &settings.listen_ip,
-            Self::Name(source) => dut
-                .map_or_default(|dut| binding(dut, source).name.as_str()),
-            Self::Video(source) => dut
-                .map_or_default(|dut| binding(dut, source).video.as_str()),
-            Self::Audio(source) => dut
-                .map_or_default(|dut| binding(dut, source).audio.as_str()),
-            Self::Size(source) => dut
-                .map_or_default(|dut| binding(dut, source).video_size.as_str()),
-            Self::Rate(source) => dut
-                .map_or_default(|dut| binding(dut, source).frame_rate.as_str()),
-            Self::Port(source) => dut
-                .map_or_default(|dut| binding(dut, source).port.as_str()),
+            Self::Name(source) => dut.map_or_default(|dut| binding(dut, source).name.as_str()),
+            Self::Video(source) => dut.map_or_default(|dut| binding(dut, source).video.as_str()),
+            Self::Audio(source) => dut.map_or_default(|dut| binding(dut, source).audio.as_str()),
+            Self::Size(source) => {
+                dut.map_or_default(|dut| binding(dut, source).video_size.as_str())
+            }
+            Self::Rate(source) => {
+                dut.map_or_default(|dut| binding(dut, source).frame_rate.as_str())
+            }
+            Self::Port(source) => dut.map_or_default(|dut| binding(dut, source).port.as_str()),
         }
     }
 
@@ -1016,7 +1014,10 @@ impl MediaView {
 
     /// Validate one snapshot/recordStart request and park it until the capture
     /// is ready (or the start bound expires).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "capture operation dispatch forwards full UI context and bound parameters"
+    )]
     fn begin_capture_op(
         &mut self,
         duts: &DutsState,
@@ -2649,12 +2650,15 @@ fn run_action(
                 capture.screenshot(&w.media.dir, &dut.id, saved_name, w.artifact_quota.clone());
             let sender = w.media.sender.clone();
             std::thread::spawn(move || {
-                let status = screenshot().map_or_else(|e| e, |path| {
+                let status = screenshot().map_or_else(
+                    |e| e,
+                    |path| {
                         crate::i18n::message(
                             "mediaScreenshotSaved",
                             &[("path", &path.display().to_string())],
                         )
-                    });
+                    },
+                );
                 let _ = sender.send(status);
             });
         }

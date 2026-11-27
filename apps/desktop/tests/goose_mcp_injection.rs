@@ -1,8 +1,8 @@
-//! W2 验收：真实 goose 消费 `session/new.mcpServers`，
-//! 且 managed config 关闭 developer / summon / tom / Extension Manager。
+//! W2 acceptance: real goose consumes `session/new.mcpServers`, and managed config disables
+//! developer / summon / tom / Extension Manager.
 //!
-//! 2026-11-24 起 goose 不再内嵌：这些用例需要本机已安装的 goose
-//! （「工具下载」页下载，或 `DUTHUB_TEST_GOOSE` 指向可执行文件），否则带清晰原因跳过。
+//! Goose is no longer embedded: these tests require a locally installed goose
+//! (from Tool Downloads or `DUTHUB_TEST_GOOSE`), otherwise skip with a clear reason.
 #![cfg(windows)]
 
 use std::sync::{Arc, Mutex};
@@ -119,8 +119,8 @@ async fn mcp_handler(
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "fake-mcp", "version": "1.0" },
         }),
-        // rmcp DiscoverResult 的完整形状（缺 resultType/ttlMs/cacheScope 会退化成
-        // CustomResult，goose 会报 "expect initialized result"）。
+        // Full rmcp DiscoverResult shape (omitting resultType/ttlMs/cacheScope degrades to
+        // CustomResult and goose fails with "expect initialized result").
         "server/discover" => json!({
             "resultType": "complete",
             "supportedVersions": ["2026-07-28"],
@@ -149,14 +149,12 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 }
 
 fn extension_names(extension_results: &Value) -> Vec<&str> {
-    extension_results
-        .as_array()
-        .map_or_default(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.get("name").and_then(Value::as_str))
-                .collect()
-        })
+    extension_results.as_array().map_or_default(|entries| {
+        entries
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .collect()
+    })
 }
 
 fn binding() -> GooseBinding {
@@ -172,10 +170,11 @@ fn close(acp: AcpClient) {
     acp.close_stdin();
     let _ = acp.wait_timeout(Duration::from_secs(10));
     acp.kill();
+    drop(acp);
 }
 
 // ---------------------------------------------------------------------------
-// Test goose fixture (2026-11-24: goose is downloaded, no longer embedded)
+// Test goose fixture (goose is downloaded, not embedded)
 // ---------------------------------------------------------------------------
 
 /// `DUTHUB_TEST_GOOSE` (absolute path to a goose executable) wins, otherwise the
@@ -185,7 +184,7 @@ fn test_goose_program() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(raw);
         assert!(
             path.is_absolute() && path.is_file(),
-            "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+            "DUTHUB_TEST_GOOSE must be an absolute path to an existing goose executable: {}",
             path.display()
         );
         return Some(path);
@@ -198,8 +197,8 @@ fn test_goose_program() -> Option<std::path::PathBuf> {
 /// Loud skip: goose is no longer embedded, so ACP tests need an installed one.
 fn skip_without_goose() {
     eprintln!(
-        "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-         或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+        "SKIP: goose is not installed (goose is no longer embedded) — \
+         download goose from Tool Downloads or set DUTHUB_TEST_GOOSE to the goose executable"
     );
 }
 
@@ -217,15 +216,15 @@ fn goose_consumes_injected_mcp_server_with_session_token() {
     let acp = AcpClient::spawn(&exe, &[], &paths.sandbox, &env, 64 * 1024).unwrap();
     let info = acp.initialize(Duration::from_secs(20)).unwrap();
     assert_eq!(info.agent_name, "goose");
-    // 不再内嵌固定构建：断言「goose 报出的版本通过产品版本门槛」，而不是
-    // 与某个内嵌版本逐字相等（下载安装的是上游 latest，版本随上游变化）。
+    // No fixed embedded build: assert that the reported goose version meets the product version
+    // gate rather than matching a hardcoded version string (downloads track upstream latest).
     assert!(
         registry::version_at_least(&info.agent_version, registry::MIN_GOOSE_VERSION),
-        "goose 版本必须 >= {}，实际 {}",
+        "goose version must be >= {}, got {}",
         registry::MIN_GOOSE_VERSION,
         info.agent_version
     );
-    assert!(info.mcp_http, "goose 必须声明 mcpCapabilities.http");
+    assert!(info.mcp_http, "goose must advertise mcpCapabilities.http");
 
     let token = "dth-injection-token-1234567890";
     let url = format!("{}/mcp", mcp.base_url);
@@ -241,20 +240,20 @@ fn goose_consumes_injected_mcp_server_with_session_token() {
         )
         .unwrap();
 
-    // F1：GOOSE_MODE=approve（auto 下权限请求永不发生，工具面无法被审批约束）。
+    // F1: GOOSE_MODE=approve (under auto, permission requests never fire and tools bypass approval).
     assert_eq!(session.current_mode.as_deref(), Some("approve"));
 
-    // 真实 goose + managed config：四个内置扩展一个都不启动，只剩注入的 duthub。
+    // Real goose + managed config: all four built-in extensions stay off, leaving only injected duthub.
     let names = extension_names(&session.extension_results);
     for builtin in ["Extension Manager", "summon", "developer", "tom"] {
         assert!(
             !names.contains(&builtin),
-            "managed config 必须关闭 {builtin}，实际 {names:?}"
+            "managed config must disable {builtin}, got {names:?}"
         );
     }
     assert!(
         names.contains(&"duthub"),
-        "注入的 MCP server 必须出现在 extensionResults：{names:?}"
+        "injected MCP server must appear in extensionResults: {names:?}"
     );
     assert!(
         session
@@ -263,17 +262,17 @@ fn goose_consumes_injected_mcp_server_with_session_token() {
             .unwrap()
             .iter()
             .any(|entry| entry["name"] == "duthub" && entry["success"] == true),
-        "duthub MCP 扩展必须成功：{}",
+        "duthub MCP extension must succeed: {}",
         session.extension_results
     );
-    // 运行时强校验与真实 goose 输出一致（恰好 1 个 duthub success=true）。
+    // Runtime validation matches real goose output (exactly one duthub with success=true).
     duthub_desktop::agent_host::host::validate_extension_results(&session.extension_results)
-        .expect("真实 goose 的工具面必须通过启动强校验");
+        .expect("real goose tool surface must pass startup validation");
 
     let discover = mcp
         .recorder
         .wait_for_method("server/discover", token)
-        .expect("goose 必须连接 session/new 注入的 MCP server 并携带 Bearer token");
+        .expect("goose must connect to the MCP server injected via session/new with Bearer token");
     assert_eq!(
         discover.authorization.as_deref(),
         Some("Bearer dth-injection-token-1234567890")
@@ -321,7 +320,7 @@ fn goose_load_session_restores_persisted_session() {
                 Duration::from_secs(30)
             )
             .unwrap(),
-        "goose 应支持 session/load"
+        "goose must support session/load"
     );
     close(second);
     let _ = std::fs::remove_dir_all(&work);
@@ -333,7 +332,7 @@ fn managed_config_is_what_disables_the_four_builtins() {
     let work = temp_dir("builtins");
     let binding = binding();
 
-    // 对照：不写 managed config → 四个内置扩展都出现在 extensionResults。
+    // Control: without managed config, all four built-in extensions appear in extensionResults.
     let default_paths = sandbox::prepare(&work, "dut-default").unwrap();
     let default_env = model_env::goose_env(&binding, &default_paths.goose_root).unwrap();
     let Some(exe) = test_goose_program() else {
@@ -359,12 +358,12 @@ fn managed_config_is_what_disables_the_four_builtins() {
     for expected in ["Extension Manager", "summon", "developer", "tom"] {
         assert!(
             names.contains(&expected),
-            "未配置 managed config 时应有 {expected}，实际 {names:?}"
+            "without managed config {expected} should be present, got {names:?}"
         );
     }
     close(default_acp);
 
-    // 实验组：managed config 写入后为空。
+    // Experiment: writing managed config disables all four built-in extensions.
     let managed_paths = sandbox::prepare(&work, "dut-managed").unwrap();
     model_env::write_config(&managed_paths.goose_root).unwrap();
     let managed_env = model_env::goose_env(&binding, &managed_paths.goose_root).unwrap();
@@ -386,7 +385,7 @@ fn managed_config_is_what_disables_the_four_builtins() {
     for builtin in ["Extension Manager", "summon", "developer", "tom"] {
         assert!(
             !managed_names.contains(&builtin),
-            "managed config 必须关闭 {builtin}，实际 {managed_names:?}"
+            "managed config must disable {builtin}, got {managed_names:?}"
         );
     }
     close(managed_acp);

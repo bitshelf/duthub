@@ -5,8 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[package.metadata.duthub]
+default-boot-similarity = 90
+
 [lints]
 workspace = true
+
+[build-dependencies]
+toml = "1.2"
 
 [dependencies]
 async-trait.workspace = true

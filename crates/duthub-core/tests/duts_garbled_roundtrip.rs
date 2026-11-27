@@ -63,7 +63,7 @@ fn save_load_keeps_per_dut_switch() {
 
     let loaded = duthub_core::store::load_duts(dir.path())
         .unwrap()
-        .expect("duts.json 应存在");
+        .expect("duts.json should exist");
     assert_eq!(loaded, file);
     assert!(loaded.garbled_by_dut["dut-1"].enabled);
     assert!(!loaded.garbled_by_dut.contains_key("dut-2"));

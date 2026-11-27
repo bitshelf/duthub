@@ -1,5 +1,5 @@
-# 定位窗口内坐标并注入标准滚轮事件（±120/格）
-# 用法: powershell -File scripts/ui-wheel.ps1 [-X 700] [-Y 600] [-Down 3] [-Up 3] [-SleepMs 800]
+# Move to window-relative coordinates and send wheel events of 120 units per notch.
+# Usage: powershell -File scripts/ui-wheel.ps1 [-X 700] [-Y 600] [-Down 3] [-Up 3] [-SleepMs 800]
 param(
     [int]$X = 700, [int]$Y = 600,
     [int]$Down = 0, [int]$Up = 0,

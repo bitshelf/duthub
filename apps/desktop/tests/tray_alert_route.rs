@@ -39,7 +39,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn options() -> TrayOptions {
@@ -75,7 +75,7 @@ impl TestWindow {
                 lpszMenuName: PCWSTR::null(),
                 lpszClassName: class_name,
             };
-            RegisterClassW(&wnd_class);
+            RegisterClassW(&raw const wnd_class);
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 class_name,
@@ -94,7 +94,7 @@ impl TestWindow {
             let _ = ShowWindow(hwnd, SW_SHOW);
             Self { hwnd }
         };
-        window.pump(Duration::from_millis(50));
+        TestWindow::pump(Duration::from_millis(50));
         window
     }
 
@@ -102,15 +102,15 @@ impl TestWindow {
         self.hwnd.0 as isize
     }
 
-    fn pump(&self, duration: Duration) {
+    fn pump(duration: Duration) {
         let deadline = Instant::now() + duration;
         loop {
             let mut msg = MSG::default();
             // SAFETY: Pumps queued Win32 messages for windows owned by the current thread.
             unsafe {
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                while PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&raw const msg);
+                    DispatchMessageW(&raw const msg);
                 }
             }
             if Instant::now() >= deadline {
@@ -144,7 +144,8 @@ unsafe extern "system" fn test_wndproc(
 ) -> windows::Win32::Foundation::LRESULT {
     match msg {
         WM_DESTROY => windows::Win32::Foundation::LRESULT(0),
-        // SAFETY: Forwards unhandled messages to Win32's default window procedure.
+        // SAFETY: The window manager supplied the handle and message parameters.
+        // Forward them unchanged to the default procedure on this thread.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
@@ -167,7 +168,7 @@ fn router_present_decision_reaches_the_tray() {
     let window = TestWindow::create();
     let handle = tray::install_with_hwnd(window.raw(), options()).expect("tray install");
     assert!(handle.hide_main(), "a desktop session must accept NIM_ADD");
-    window.pump(Duration::from_millis(200));
+    TestWindow::pump(Duration::from_millis(200));
 
     let mut router = HiddenAlertRouter::new();
     let action = router.step(1, hidden_env(3), 0);
@@ -192,7 +193,7 @@ fn router_present_decision_reaches_the_tray() {
         tray::TrayNotifyLevel::Error,
     );
     handle.set_alert(true);
-    window.pump(Duration::from_millis(400));
+    TestWindow::pump(Duration::from_millis(400));
 
     let probe = handle.test_probe();
     assert!(
@@ -212,7 +213,7 @@ fn router_present_decision_reaches_the_tray() {
     handle.set_alert(false);
     assert!(handle.show_main());
     let _ = handle.set_icon_visible(false);
-    window.pump(Duration::from_millis(200));
+    TestWindow::pump(Duration::from_millis(200));
     assert!(!handle.test_probe().alerting);
     assert!(!handle.test_probe().icon_visible);
     handle.remove();

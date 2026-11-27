@@ -1,4 +1,9 @@
-use super::{Workbench, Palette, Window, Context, IntoElement, FluentBuilder, InteractiveElement, ParentElement, Styled, div, px, StatefulInteractiveElement, SharedString, AppContext, InputState, InputEvent, In, setting_row, Input, icon_btn, Disableable, btn, BtnVariant, subtle, RelayConfig, switch_panel_header, toggle, RelayChannels, collapsible_panel, field, Checkbox, chip};
+use super::{
+    AppContext, BtnVariant, Checkbox, Context, Disableable, FluentBuilder, In, Input, InputEvent,
+    InputState, InteractiveElement, IntoElement, Palette, ParentElement, RelayChannels,
+    RelayConfig, SharedString, StatefulInteractiveElement, Styled, Window, Workbench, btn, chip,
+    collapsible_panel, div, field, icon_btn, px, setting_row, subtle, switch_panel_header, toggle,
+};
 
 pub(crate) fn render_relay_boards(
     w: &mut Workbench,
@@ -204,7 +209,10 @@ pub(crate) fn render_relay_boards(
                         .collect(),
                     Some(usize::from(edit.channel_count)),
                     std::sync::Arc::new(|this, count, _, cx| {
-                        this.set_relay_board_channel_count(count as u8);
+                        this.set_relay_board_channel_count(
+                            u8::try_from(count)
+                                .expect("relay count comes from the supported channel counts"),
+                        );
                         cx.notify();
                     }),
                     p,
@@ -375,7 +383,10 @@ pub(super) fn relay_panel(
         RelayConfig::UsbBoard { board_id, .. } => board_ids.iter().position(|id| id == board_id),
         _ => None,
     };
-    let value = selected.map_or_else(|| crate::i18n::label("controlDeviceUnavailable").into(), |i| options[i].0.clone());
+    let value = selected.map_or_else(
+        || crate::i18n::label("controlDeviceUnavailable").into(),
+        |i| options[i].0.clone(),
+    );
     let available_channels = if let RelayConfig::UsbBoard { board_id, .. } = &dut.relay {
         w.duts
             .file
@@ -444,7 +455,14 @@ pub(super) fn relay_panel(
                 options,
                 channel.map(usize::from),
                 std::sync::Arc::new(move |this, value, _, cx| {
-                    set_relay_channel(this, key, Some(value as u8));
+                    set_relay_channel(
+                        this,
+                        key,
+                        Some(
+                            u8::try_from(value)
+                                .expect("relay channel comes from a u8 channel range"),
+                        ),
+                    );
                     cx.notify();
                 }),
                 p,

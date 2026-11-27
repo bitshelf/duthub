@@ -1,6 +1,7 @@
-//! Agent 接入模型集成测试（方案 N5）：
-//! 旧 settings.json 兼容（无 agentAccess 段 → 默认 auth 关）、camelCase 往返、
-//! 默认值段整段跳过序列化（坑 #19/#24）、认证/授权矩阵（deny by default）。
+//! Agent access model integration tests:
+//! legacy `settings.json` compatibility (missing `agentAccess` section -> default auth off),
+//! `camelCase` round-trip, default-section serialization omission, and deny-by-default
+//! authentication/authorization matrix.
 
 use duthub_core::agent_access::{AgentAccessSettings, DutAction, DutGrant, generate_token};
 use duthub_core::{AgentAccessRuntime, Principal, SettingsFile};
@@ -15,8 +16,8 @@ fn settings_with(agents: Vec<duthub_core::AgentCredential>, enabled: bool) -> Se
     settings
 }
 
-/// 旧 settings.json（无 agentAccess 段）加载 → 默认段（auth 关、无凭据），
-/// 序列化时整段省略（不改变旧文件形状）。
+/// Legacy `settings.json` without `agentAccess` loads as the default section (auth off, no
+/// credentials) and omits the whole section on serialize without changing the legacy file shape.
 #[test]
 fn legacy_settings_file_defaults_to_auth_off_and_omits_section() {
     let legacy = serde_json::json!({
@@ -27,20 +28,21 @@ fn legacy_settings_file_defaults_to_auth_off_and_omits_section() {
     assert_eq!(
         parsed.agent_access,
         AgentAccessSettings::default(),
-        "旧文件缺段必须反序列化为默认"
+        "legacy file missing section must deserialize to default"
     );
-    assert!(!parsed.agent_access.enabled, "auth 默认关");
+    assert!(!parsed.agent_access.enabled, "auth must default to off");
     assert_eq!(parsed.agent_access.http_port, 8797);
     assert_eq!(parsed.agent_access.lease_ttl_secs, 120);
-    // 默认段序列化省略（roundtrip 无损的关键）
+    // Default section is omitted on serialize (required for lossless round-trips).
     let back = serde_json::to_value(&parsed).unwrap();
     assert!(
         back.get("agentAccess").is_none(),
-        "默认 agentAccess 段必须整段跳过序列化: {back}"
+        "default agentAccess section must be skipped during serialization: {back}"
     );
 }
 
-/// 配置了凭据的 settings.json：camelCase 键往返 + 非默认段保留。
+/// Configured `settings.json` with credentials: `camelCase` keys round-trip and non-default
+/// section is preserved.
 #[test]
 fn agent_access_section_roundtrips_camel_case() {
     let token = generate_token();
@@ -65,7 +67,9 @@ fn agent_access_section_roundtrips_camel_case() {
         true,
     );
     let value = serde_json::to_value(&settings).unwrap();
-    let section = value.get("agentAccess").expect("非默认段必须序列化");
+    let section = value
+        .get("agentAccess")
+        .expect("non-default section must be serialized");
     assert_eq!(section["enabled"], serde_json::json!(true));
     assert_eq!(section["httpPort"], serde_json::json!(8797));
     assert_eq!(section["leaseTtlSecs"], serde_json::json!(120));
@@ -81,13 +85,17 @@ fn agent_access_section_roundtrips_camel_case() {
         section["agents"][0]["grants"][0]["actions"],
         serde_json::json!(["read", "serialWrite"])
     );
-    // 类型化 → 再反序列化语义相等（roundtrip.rs 同款判据）
+    // Typed -> serialized -> deserialized must remain equal (same criterion as `roundtrip.rs`).
     let re: SettingsFile = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(re, settings);
-    assert_eq!(re.agent_access.agents[0].token, token, "原文存储");
+    assert_eq!(
+        re.agent_access.agents[0].token, token,
+        "token must be stored verbatim"
+    );
 }
 
-/// 带凭据段写入文件再读回（store 级别）：默认段不落盘、凭据段无损。
+/// Store-level write/read round-trip with credentials: default section stays omitted and
+/// credential section round-trips losslessly.
 #[test]
 fn settings_file_store_roundtrip_with_agent_access() {
     let dir = std::env::temp_dir().join(format!(
@@ -117,7 +125,7 @@ fn settings_file_store_roundtrip_with_agent_access() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 认证/授权矩阵端到端（Runtime）：开关切换语义 + deny by default。
+/// End-to-end runtime authentication/authorization matrix: toggle semantics + deny by default.
 #[test]
 fn runtime_auth_matrix() {
     let token = generate_token();
@@ -136,13 +144,13 @@ fn runtime_auth_matrix() {
         }],
         ..Default::default()
     });
-    // 关：任何 Bearer（含错误 token）都视为本地管理员
+    // Auth off: any Bearer token (including invalid ones) resolves to `LocalAdmin`.
     assert_eq!(rt.authenticate(None).unwrap(), Principal::LocalAdmin);
     assert_eq!(
         rt.authenticate(Some("junk")).unwrap(),
         Principal::LocalAdmin
     );
-    // 开：正确 token → Agent；错误 → Unauthorized
+    // Auth on: valid token -> Agent; invalid token -> Unauthorized.
     rt.update(AgentAccessSettings {
         enabled: true,
         agents: rt.settings().agents.clone(),
@@ -151,14 +159,14 @@ fn runtime_auth_matrix() {
     let p = rt.authenticate(Some(&token)).unwrap();
     assert!(p.audit_identity().is_some());
     assert!(rt.authenticate(Some(&generate_token())).is_err());
-    // 授权：只读授予 → read 过、serialWrite 拒、其他 DUT 拒
+    // Authorization: read-only grant allows `read`, denies `serialWrite` and other DUTs.
     rt.authorize(&p, "dut-1", DutAction::Read).unwrap();
     assert!(rt.authorize(&p, "dut-1", DutAction::SerialWrite).is_err());
     assert!(rt.authorize(&p, "dut-2", DutAction::Read).is_err());
-    // LocalAdmin 全通过
+    // `LocalAdmin` is unrestricted.
     rt.authorize(&Principal::LocalAdmin, "dut-9", DutAction::Flash)
         .unwrap();
-    // 热更新增授权 → 立即生效（AuthSnapshot 替换）
+    // Hot-updating grants takes effect immediately (`AuthSnapshot` swap).
     let mut next = rt.settings();
     next.agents[0].grants.push(DutGrant {
         dut_id: "dut-2".into(),

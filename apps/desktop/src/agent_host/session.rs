@@ -1,11 +1,13 @@
-//! 会话视图与 transcript 上限（W2）。
+//! Maximum number of conversation views and transcripts (W2).
 //!
-//! 两条上限**同时**实现：
-//! - 内存 transcript 最多 [`MEMORY_TRANSCRIPT_LIMIT`] 条，超出丢最旧；
-//! - 文件 transcript 到 [`FILE_TRANSCRIPT_LIMIT`] 后停写，并在内存记一条 System
-//!   注记（只记一次）。
+//! Two upper limits are **both** met:
+//! - The maximum number of memory transcripts is [`MEMORY_TRANSCRIPT_LIMIT`]; any excess will be
+//!   discarded as the oldest data.
+//! - Writing to the file transcript will stop after reaching [`FILE_TRANSCRIPT_LIMIT`]. Instead,
+//!   only one System record will be kept in memory. This annotation is recorded only once.
 //!
-//! [`SessionView`] 用 `Arc` 共享；UI 每帧只 clone `Arc`，不重建/克隆整个 Vec。
+//! [`SessionView`] is shared using `Arc`; the UI clones only `Arc` per frame, without
+//! reconstructing/recloning the entire `Vec`.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
@@ -139,7 +141,9 @@ impl SessionView {
         *self.status.lock().unwrap() = status;
     }
 
-    /// 仅当当前状态等于 `expected` 时替换；UI 与工作线程竞争下的 CAS（F3）。
+    /// Only replace when the current state matches `expected`. This function operates under a CAS
+    /// mechanism, where the UI competes with the worker thread for resources. (Use F3 to trigger
+    /// this operation.)
     pub fn try_transition(&self, expected: &SessionStatus, next: SessionStatus) -> bool {
         let mut status = self.status.lock().unwrap();
         if *status != *expected {
@@ -149,8 +153,9 @@ impl SessionView {
         true
     }
 
-    /// 仅当当前状态满足 `predicate` 时替换。用于「任意非终止态 → 终止态」
-    /// 与「非终止态 → Stopping」；已是终止态时永不覆盖。
+    /// Only performed when the current state satisfies the `predicate`. Used for situations where
+    /// "any non-terminal state → terminal state". It never overwrites states that are already in a
+    /// terminal state.
     pub fn try_transition_if(
         &self,
         predicate: impl FnOnce(&SessionStatus) -> bool,
@@ -164,8 +169,10 @@ impl SessionView {
         true
     }
 
-    /// 工作线程失败兜底：只把非终止态改为 Failed，不覆盖已终止状态。
-    /// 返回是否发生了转换（供事件回调去重）。
+    /// If the worker thread fails, it will be marked as "Failed". No attempt is made to overwrite
+    /// states that have already been terminated.
+    /// It also indicates whether a transition has occurred (for use in event callbacks to prevent
+    /// duplicates).
     pub fn fail(&self, message: impl Into<String>) -> bool {
         let message = message.into();
         self.try_transition_if(
@@ -174,7 +181,8 @@ impl SessionView {
         )
     }
 
-    /// 正常退出：只把非终止态改为 Stopped；已 Failed 的会话保持 Failed。
+    /// Normal exit: Only the non-terminating state is changed to "Stopped"; sessions that have
+    /// already been marked as "Failed" remain in that status.
     pub fn stop_normally(&self) -> bool {
         self.try_transition_if(|status| !status.is_terminal(), SessionStatus::Stopped)
     }
@@ -244,12 +252,14 @@ impl SessionView {
         *self.stderr_tail.lock().unwrap() = text.into();
     }
 
-    /// 内存 transcript 快照（测试/导出；渲染层应直接锁 [`SessionView::transcript`]）。
+    /// Memory transcript snapshot (testing/export; the rendering layer should directly lock
+    /// [`SessionView::transcript`]).
     pub fn transcript_snapshot(&self) -> Vec<TranscriptEntry> {
         self.transcript.lock().unwrap().iter().cloned().collect()
     }
 
-    /// 追加一条内存记录；超出 2000 条时丢最旧。
+    /// One more memory record is added; when the number reaches 2000, the oldest record will be
+    /// removed.
     pub fn push_entry(&self, entry: TranscriptEntry) {
         let mut entries = self.transcript.lock().unwrap();
         if entries.len() >= MEMORY_TRANSCRIPT_LIMIT {
@@ -259,7 +269,8 @@ impl SessionView {
         self.total_entries.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 追加内存 + 文件记录；文件到 8 MiB 后停写并只补一条 System 注记。
+    /// Additional memory and file records; writing stops when the file reaches 8 MiB, and only one
+    /// System annotation is added.
     pub fn push_with_log(&self, entry: TranscriptEntry, log: &mut TranscriptLog) {
         match log.append(&entry) {
             AppendOutcome::Failed(error) if !log.failure_noted => {
@@ -287,7 +298,7 @@ enum AppendOutcome {
     Failed(String),
 }
 
-/// 逐行 JSONL transcript 写入器（仅工作线程使用）。
+/// Line-by-line JSONL transcript writer (used only by working threads).
 #[derive(Debug)]
 pub struct TranscriptLog {
     path: PathBuf,
@@ -300,7 +311,8 @@ pub struct TranscriptLog {
 }
 
 impl TranscriptLog {
-    /// 打开（追加）transcript；I/O 失败降级为只记内存，不阻塞会话。
+    /// Opened (added) the transcript. I/O failures are now handled by storing data in memory,
+    /// without blocking the session.
     #[must_use]
     pub fn open(path: &Path) -> Self {
         let (file, failure_note) = match OpenOptions::new().create(true).append(true).open(path) {
@@ -316,16 +328,19 @@ impl TranscriptLog {
             file,
             written,
             capped: written >= FILE_TRANSCRIPT_LIMIT,
-            // 已到上限的文件在第一次 push 时补一条 System 注记。
+            // For files that have reached the upper limit, a System annotation will be added during
+            // the first push.
             cap_noted: written >= FILE_TRANSCRIPT_LIMIT,
-            // F2：打开成功不代表后续写入不会失败；首次写入失败才置 true，
-            // 否则失败注记永远不会出现、文件副本会静默停止增长。
+            // F2: Successful opening does not mean that subsequent writes will never fail. Only
+            // when the first write fails will it be set to true. Otherwise, failure annotations
+            // will never appear, and the file copy will continue to grow silently.
             failure_noted: false,
             open_error: failure_note,
         }
     }
 
-    /// 测试专用：用任意 `File`（如只读句柄）构造写入器，模拟打开成功后的写失败。
+    /// For testing purposes only: Use any `File` object (e.g., read-only handles) to create
+    /// writers, simulating write operations that fail after successful opening.
     #[cfg(test)]
     fn with_file_for_test(path: PathBuf, file: File, written: u64) -> Self {
         Self {
@@ -435,9 +450,10 @@ mod tests {
             .iter()
             .filter(|entry| entry.text.contains("8 MiB"))
             .count();
-        assert_eq!(notes, 1, "上限注记只能出现一次");
+        assert_eq!(notes, 1, "The upper limit annotation can only appear once.");
 
-        // 重开一个已到上限的文件：第一次 push 也要且只补一条注记。
+        // Reopen a file that has reached its limit: The first push will only include one
+        // annotation.
         drop(log);
         std::fs::OpenOptions::new()
             .write(true)
@@ -488,7 +504,7 @@ mod tests {
         assert_eq!(
             view.total_entries(),
             MEMORY_TRANSCRIPT_LIMIT as u64 + 1,
-            "total_entries 必须统计被内存上限丢弃的记录"
+            "The total_entries field should contain the number of records discarded due to memory limitations."
         );
         assert_eq!(view.transcript_snapshot().len(), MEMORY_TRANSCRIPT_LIMIT);
 
@@ -505,8 +521,14 @@ mod tests {
         assert!(view.try_transition(&SessionStatus::Ready, SessionStatus::Busy));
         assert!(!view.try_transition(&SessionStatus::Ready, SessionStatus::Busy));
         assert!(view.fail("boom"));
-        assert!(!view.fail("again"), "终止态不得被再次覆盖");
-        assert!(!view.stop_normally(), "Failed 不得被 Stopped 覆盖");
+        assert!(
+            !view.fail("again"),
+            "The terminated state cannot be overwritten again."
+        );
+        assert!(
+            !view.stop_normally(),
+            "Failed should not be overwritten by Stopped."
+        );
         assert!(matches!(view.status(), SessionStatus::Failed(message) if message == "boom"));
 
         assert!(!view.try_transition_if(|s| !s.is_terminal(), SessionStatus::Stopping));
@@ -517,15 +539,27 @@ mod tests {
     fn reset_for_restart_only_revives_stopped_sessions() {
         let view = SessionView::new();
         view.set_status(SessionStatus::Ready);
-        assert!(!view.reset_for_restart(), "Ready 不是可重启的终止态");
+        assert!(
+            !view.reset_for_restart(),
+            "Ready is not a restartable state."
+        );
         view.set_status(SessionStatus::Stopped);
         assert!(view.reset_for_restart());
         assert_eq!(view.status(), SessionStatus::Starting);
-        assert!(!view.reset_for_restart(), "Starting 不得重复重置");
+        assert!(
+            !view.reset_for_restart(),
+            "Starting cannot be reset repeatedly."
+        );
         view.set_status(SessionStatus::Failed("boom".into()));
-        assert!(!view.reset_for_restart(), "Failed 必须保持终止");
+        assert!(
+            !view.reset_for_restart(),
+            "Failed: Termination is necessary."
+        );
         view.set_status(SessionStatus::Stopping);
-        assert!(!view.reset_for_restart(), "Stopping 不得被改成 Starting");
+        assert!(
+            !view.reset_for_restart(),
+            "A stopping session must remain in Stopping."
+        );
 
         let status = SandboxStatus {
             backend: duthub_sandbox::SandboxBackendKind::ProcessContainer,
@@ -544,7 +578,8 @@ mod tests {
     fn write_failure_after_successful_open_notes_once() {
         let path = temp_file("write-fail");
         std::fs::write(&path, b"").unwrap();
-        // 只读句柄：open 成功（不触发 F2 的旧 bug），但 write_all 必然失败。
+        // Read-only handle: The `open` operation is successful (no old bug related to F2 key usage
+        // is triggered), but the `write_all` operation will definitely fail.
         let read_only = File::open(&path).unwrap();
         let mut log = TranscriptLog::with_file_for_test(path.clone(), read_only, 0);
         assert!(!log.failure_noted);
@@ -554,13 +589,19 @@ mod tests {
             TranscriptEntry::new(TranscriptKind::Agent, "first"),
             &mut log,
         );
-        assert!(log.failure_noted, "首次写失败必须置位并产生注记");
+        assert!(
+            log.failure_noted,
+            "If the first write attempt fails, it must be set and an annotation should be generated."
+        );
         let notes = view
             .transcript_snapshot()
             .iter()
             .filter(|entry| entry.text.contains("transcript 文件写入失败"))
             .count();
-        assert_eq!(notes, 1, "失败注记只能出现一次");
+        assert_eq!(
+            notes, 1,
+            "Annotations that indicate failures can only appear once."
+        );
 
         view.push_with_log(
             TranscriptEntry::new(TranscriptKind::Agent, "second"),
@@ -571,7 +612,10 @@ mod tests {
             .iter()
             .filter(|entry| entry.text.contains("transcript 文件写入失败"))
             .count();
-        assert_eq!(notes, 1, "后续失败不得重复注记（仅内存记录）");
+        assert_eq!(
+            notes, 1,
+            "Subsequent failures should not be annotated again (only recorded in memory)"
+        );
         assert_eq!(view.transcript_snapshot().len(), 3);
         let _ = std::fs::remove_file(&path);
     }

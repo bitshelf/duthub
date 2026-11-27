@@ -1,16 +1,16 @@
-//! `RelayDriver` trait + CH340 类继电器驱动实现。
+//! The `RelayDriver` interface and CH340-compatible implementation.
 //!
-//! - **单 task 独占串口句柄**：每个继电器串口一个专用 tokio task，所有读写都经由
-//!   命令通道派发（与 duthub-device 会话模型一致，docs/ARCHITECTURE.md 线程边界）；
-//! - 错误统一映射 [`DeviceError`]（NotFound/Busy/PermissionDenied/Timeout/
-//!   Disconnected/Invalid）；
-//! - 实现 [`duthub_core::ControlBackend`]：共用入口
-//!   （`duthub-device::control::ControlService）完成授权/绑定/能力校验后把已解析的`
-//!   目标直接派发到本驱动，驱动不接触审批令牌（审核 P1-3）；
-//! - 按审核建议不做后端选择层：桌面端启动时直接构造本驱动注入入口（当前唯一实现）。
+//! Each serial port has one Tokio task that owns the handle.
+//! Callers submit commands to that task, which performs every read and write.
+//! Map transport and protocol failures to `DeviceError`.
 //!
-//! 串口打开函数（[`Opener`]）可注入：生产为 tokio-serial（`real-hardware` 特性），
-//! 测试注入 `tokio::io::duplex` 模拟板卡。
+//! Implement `duthub_core::ControlBackend` for the shared control service.
+//! The service checks authorization, binding, and capabilities before dispatch.
+//! The driver receives the resolved target and never handles approval tokens.
+//! The desktop injects this driver at startup.
+//!
+//! Use the injected `Opener` to select the serial transport.
+//! Hardware builds use Tokio serial. Tests use `tokio::io::duplex`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,35 +25,35 @@ use duthub_core::error::{DeviceError, DeviceResult};
 
 use crate::ch340::{self, EchoCheck};
 
-/// 命令回读等待：9600 波特下一帧回显约 4ms，300ms 足以覆盖板卡处理延迟；
-/// 静默板卡（不回显）的命令额外付出一次超时等待。
+/// At 9,600 baud an echo takes about 4 ms. Allow 300 ms for board processing.
+/// Boards that do not echo commands incur one timeout per command.
 const ECHO_TIMEOUT: Duration = Duration::from_millis(300);
 /// Maximum time to wait for the port task to start a queued command.
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-/// 脉冲时长上限：防止误用把独占 task 长期占死。
+/// Cap pulse length so an invalid duration cannot monopolize the port task.
 const PULSE_MAX_MS: u64 = 60_000;
 
-/// 继电器串口字节流抽象：生产实现为 tokio-serial 的 `SerialStream`，
-/// 测试注入 `tokio::io::duplex` 的一端。
+/// Asynchronous relay transport. Hardware builds use a serial stream.
+/// Tests inject one end of a duplex stream.
 pub trait RelayStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RelayStream for T {}
 
-/// 装箱的串口字节流。
+/// Boxed serial byte stream.
 pub type BoxStream = Box<dyn RelayStream>;
 
-/// 打开串口句柄的函数（地址 + 波特率 → 独占流）。打开失败映射 [`DeviceError`]。
+/// Open an exclusive stream at the specified port and baud rate.
 pub type Opener = Arc<dyn Fn(&str, u32) -> DeviceResult<BoxStream> + Send + Sync>;
 
-/// 脉冲时长（ms）配置。继电器脉冲 = 吸合 → 保持 → 自动释放。
+/// Pulse durations in milliseconds. A pulse energizes, holds, and releases the relay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PulseTiming {
-    /// `power_key` 短按（默认 300ms）。
+    /// Short `power_key` press, 300 ms by default.
     pub power_key_ms: u64,
-    /// `power_key` 长按（默认 3000ms）。
+    /// Long `power_key` press, 3,000 ms by default.
     pub power_key_long_ms: u64,
-    /// reset 脉冲（默认 3000ms，与 sermcp `DUT_CTRL_MIN_RESET_MS` 缺省一致）。
+    /// Reset pulse, 3,000 ms by default.
     pub reset_ms: u64,
 }
 
@@ -67,58 +67,58 @@ impl Default for PulseTiming {
     }
 }
 
-/// [`RelayDriver::open`] 的枚举结果。
+/// Channel discovery results from `RelayDriver::open`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayInfo {
-    /// 继电器串口节点（COMx）。
+    /// Serial port name, such as COM3.
     pub port: String,
-    /// 协议波特率（固定 9600）。
+    /// Protocol baud rate, fixed at 9,600.
     pub baud: u32,
-    /// 应答 STATUS 的通道（1 起始）。板卡不回答 STATUS 时为空表——
-    /// 此时开关命令仍可用（盲发），但通道枚举不可用。
+    /// One-based channels that answered the status query.
+    /// Boards that do not answer still accept commands without confirmation.
     pub detected: Vec<ChannelInfo>,
 }
 
-/// 单通道枚举结果。
+/// State reported for one channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelInfo {
-    /// 通道号（1 起始）。
+    /// One-based channel number.
     pub channel: u8,
-    /// 当前是否吸合。
+    /// Whether the relay is energized.
     pub on: bool,
 }
 
-/// 仅打开/关闭串口句柄的探测结果（不发任何协议帧）。
+/// Result of opening and closing a port without sending protocol frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortProbe {
     pub port: String,
     pub baud: u32,
 }
 
-/// 继电器板卡驱动（协议层）。地址 = 继电器串口节点（COMx）。
+/// Relay protocol driver addressed by serial port name.
 #[async_trait]
 pub trait RelayDriver: Send + Sync {
-    /// 打开继电器串口并枚举通道：对 1..=8 逐通道发 STATUS 查询（只读，
-    /// 不切换任何通道）。端口打不开时报错；板卡不回答 STATUS 时
-    /// `detected` 为空表但不视为错误。
+    /// Open the port and query channels 1 through 8 without changing their states.
+    /// Report a failed port open as an error.
+    /// A board that does not respond to status queries yields an empty channel list.
     async fn open(&self, port: &str) -> DeviceResult<RelayInfo>;
 
-    /// 通道通断（保持态，不做脉冲）。通道号从 1 开始。
+    /// Set the persistent state of a one-based channel.
     async fn set(&self, port: &str, channel: u8, on: bool) -> DeviceResult<()>;
 
-    /// 脉冲：吸合 `ms` 毫秒后自动释放。脉冲在独占 task 内执行，
-    /// 调用方取消（future 被 drop）不会中断释放——吸合态总能被收回。
-    /// 释放失败时报错并注明通道可能仍处于吸合态。
+    /// Energize a relay for the requested duration, then release it.
+    /// The port task owns the pulse and still releases it if the caller drops its future.
+    /// Report a failed release because the relay may remain energized.
     async fn pulse(&self, port: &str, channel: u8, ms: u64) -> DeviceResult<()>;
 
-    /// 查询通道状态。`Ok(None)` = 板卡不回答 STATUS（状态未知）。
+    /// Query one channel. A board that does not answer yields `Ok(None)`.
     async fn status(&self, port: &str, channel: u8) -> DeviceResult<Option<bool>>;
 
-    /// 关闭串口句柄（下次命令自动重开）。幂等。
+    /// Close the handle if present. The next command opens it again.
     async fn close(&self, port: &str) -> DeviceResult<()>;
 }
 
-/// CH340 类 4 字节协议继电器驱动（参考 bitshelf/sermcp dut-ctrl）。
+/// Four-byte relay protocol used by CH340-compatible boards.
 pub struct Ch340RelayDriver {
     ports: Mutex<HashMap<String, PortHandle>>,
     opener: Opener,
@@ -138,7 +138,7 @@ struct PortHandle {
     cmd_tx: mpsc::Sender<QueuedCommand>,
 }
 
-/// 发往串口独占 task 的命令。应答一律经 oneshot 回传 [`DeviceResult`]。
+/// Commands for the serial port task. Return each result over a oneshot channel.
 struct QueuedCommand {
     started: oneshot::Sender<()>,
     command: PortCommand,
@@ -169,14 +169,14 @@ enum PortCommand {
 }
 
 impl Ch340RelayDriver {
-    /// 生产构造：tokio-serial 直开串口。未启用 `real-hardware` 特性时
-    /// 所有端口打开都报 [`DeviceError::Unsupported`]（demo 模式不接硬件）。
+    /// Open a physical serial port using Tokio serial.
+    /// Without the hardware feature, opening a port returns `DeviceError::Unsupported`.
     #[must_use]
     pub fn new() -> Self {
         Self::with_opener(Self::default_opener())
     }
 
-    /// 测试/特殊传输构造：注入串口打开函数。
+    /// Inject an opener for testing or an alternate transport.
     pub fn with_opener(opener: Opener) -> Self {
         Self {
             ports: Mutex::new(HashMap::new()),
@@ -185,7 +185,7 @@ impl Ch340RelayDriver {
         }
     }
 
-    /// 覆盖脉冲时长（短按/长按/复位）。数值为 0 时回落默认值。
+    /// Override short press, long press, and reset times. Zero selects the default.
     #[must_use]
     pub fn with_timing(mut self, timing: PulseTiming) -> Self {
         self.timing = timing;
@@ -203,8 +203,8 @@ impl Ch340RelayDriver {
         }
     }
 
-    /// 仅打开/关闭串口句柄，不发送任何协议帧——真实端口「在位探测」用。
-    /// 与协议层 `open()`（会发 STATUS 枚举帧）区分开。
+    /// Probe a port by opening and closing its handle without sending protocol frames.
+    /// The protocol-level open operation also sends status queries.
     pub fn probe_port(&self, port: &str, baud: u32) -> DeviceResult<PortProbe> {
         let stream = (self.opener)(port, baud)?;
         drop(stream);
@@ -214,7 +214,7 @@ impl Ch340RelayDriver {
         })
     }
 
-    /// 取（或惰性创建）端口独占 task 的句柄。task 随驱动丢弃（命令通道关闭）自然退出。
+    /// Get or start the port task. Closing the driver's command channel lets the task exit.
     fn ensure_task(&self, port: &str) -> PortHandle {
         let mut ports = duthub_core::util::lock_unpoisoned(&self.ports);
         if let Some(handle) = ports.get(port)
@@ -236,18 +236,18 @@ impl Ch340RelayDriver {
         handle
     }
 
-    /// 校验通道号：1..=255。
+    /// Validate the one-based channel number against the protocol limit of 255.
     fn valid_channel(channel: u8) -> DeviceResult<u8> {
         if channel == 0 {
             return Err(DeviceError::Invalid(
-                "通道号无效（继电器通道从 1 开始）".into(),
+                "Invalid relay channel. Channels start at 1".into(),
             ));
         }
         Ok(channel)
     }
 
-    /// 本驱动只接串口继电器目标；SNMP PDU 由专用后端负责（未来接入时在
-    /// 运行时组装处做选择点），此处拒绝异类目标防止把 PDU 地址当串口打开。
+    /// Reject targets other than serial relays before opening a port.
+    /// A separate backend handles SNMP PDUs.
     fn assert_relay_target(target: &ControlTarget) -> DeviceResult<()> {
         if target.driver == "snmp-pdu" {
             return Err(DeviceError::Unsupported);
@@ -273,7 +273,9 @@ impl Ch340RelayDriver {
             .await
             .map_err(|_| DeviceError::Timeout)?
             .map_err(|_| DeviceError::Disconnected)?;
-        if let Ok(result) = tokio::time::timeout_at(deadline, &mut start).await { result.map_err(|_| DeviceError::Disconnected)? } else {
+        if let Ok(result) = tokio::time::timeout_at(deadline, &mut start).await {
+            result.map_err(|_| DeviceError::Disconnected)?;
+        } else {
             // Close admission before checking whether the actor claimed the command.
             start.close();
             start.try_recv().map_err(|_| DeviceError::Timeout)?;
@@ -292,7 +294,7 @@ impl Default for Ch340RelayDriver {
 impl RelayDriver for Ch340RelayDriver {
     async fn open(&self, port: &str) -> DeviceResult<RelayInfo> {
         let _ = self.ensure_task(port);
-        // 通道枚举：逐通道 STATUS 查询（只读，不切换）。
+        // Query each channel's status without switching it.
         let mut detected = Vec::new();
         for channel in 1..=ch340::MAX_CHANNELS {
             if let Some(on) = self.status(port, channel).await? {
@@ -316,7 +318,7 @@ impl RelayDriver for Ch340RelayDriver {
         let channel = Self::valid_channel(channel)?;
         if ms == 0 || ms > PULSE_MAX_MS {
             return Err(DeviceError::Invalid(format!(
-                "脉冲时长 {ms}ms 超出范围（1..={PULSE_MAX_MS}ms）"
+                "Pulse duration {ms} ms is outside the range 1 through {PULSE_MAX_MS} ms"
             )));
         }
         self.dispatch(port, |reply| PortCommand::Pulse { channel, ms, reply })
@@ -337,31 +339,31 @@ impl RelayDriver for Ch340RelayDriver {
 
 #[async_trait]
 impl ControlBackend for Ch340RelayDriver {
-    /// 电源通断：目标通道保持态 ON/OFF。
+    /// Set the configured power relay to the persistent ON or OFF state.
     async fn power(&self, target: &ControlTarget, on: bool) -> DeviceResult<()> {
         Self::assert_relay_target(target)?;
         let channel = Self::valid_channel(u8::try_from(target.channel).map_err(|_| {
-            DeviceError::Invalid(format!("通道号 {} 超出继电器范围", target.channel))
+            DeviceError::Invalid(format!("Relay channel {} is out of range", target.channel))
         })?)?;
         RelayDriver::set(self, &target.address, channel, on).await
     }
 
-    /// 复位：目标通道脉冲（默认 3000ms，可经 [`PulseTiming`] 调整）。
+    /// Pulse the reset relay using the duration from `PulseTiming`.
     async fn reset(&self, target: &ControlTarget) -> DeviceResult<()> {
         Self::assert_relay_target(target)?;
         let channel = Self::valid_channel(u8::try_from(target.channel).map_err(|_| {
-            DeviceError::Invalid(format!("通道号 {} 超出继电器范围", target.channel))
+            DeviceError::Invalid(format!("Relay channel {} is out of range", target.channel))
         })?)?;
         let ms = self.timing.reset_ms;
         RelayDriver::pulse(self, &target.address, channel, ms).await
     }
 
-    /// 电源按键：短按 = `power_key` 通道短脉冲（默认 300ms），
-    /// 长按（强制断电）= 更长脉冲（默认 3000ms）。
+    /// A short press pulses the power key for 300 ms by default.
+    /// A long press normally holds it for 3,000 ms to force a power-off.
     async fn power_key(&self, target: &ControlTarget, long_press: bool) -> DeviceResult<()> {
         Self::assert_relay_target(target)?;
         let channel = Self::valid_channel(u8::try_from(target.channel).map_err(|_| {
-            DeviceError::Invalid(format!("通道号 {} 超出继电器范围", target.channel))
+            DeviceError::Invalid(format!("Relay channel {} is out of range", target.channel))
         })?)?;
         let ms = if long_press {
             self.timing.power_key_long_ms
@@ -371,8 +373,8 @@ impl ControlBackend for Ch340RelayDriver {
         RelayDriver::pulse(self, &target.address, channel, ms).await
     }
 
-    /// 逐通道状态查询（只读）：1..=8 逐通道发 STATUS，返回应答的 `(通道, 吸合)`。
-    /// 板卡不回答 STATUS 的通道跳过（`open()` 枚举同语义）。
+    /// Read status for channels 1 through 8.
+    /// The result includes only channels that answer the query.
     async fn channel_status(&self, address: &str) -> DeviceResult<Vec<(u8, bool)>> {
         let mut states = Vec::new();
         for channel in 1..=ch340::MAX_CHANNELS {
@@ -400,7 +402,7 @@ impl ControlBackend for Ch340RelayDriver {
     }
 }
 
-/// 串口独占 task 主循环：读写都在本 task 内完成（命令经 mpsc 派发）。
+/// The port task owns all serial reads and writes and receives commands over its channel.
 async fn run_port_task(
     port: String,
     baud: u32,
@@ -422,8 +424,8 @@ async fn run_port_task(
                 let _ = reply.send(result);
             }
             PortCommand::Pulse { channel, ms, reply } => {
-                // 吸合 → 保持 → 自动释放。释放失败时错误消息必须注明
-                // 通道可能仍处于吸合态（如电源通道保持吸合会让 DUT 持续断电）。
+                // Energize, hold, and release the relay.
+                // Report release failures because the channel may remain energized.
                 let result = pulse_channel(&mut stream, &opener, &port, baud, channel, ms).await;
                 let _ = reply.send(result);
             }
@@ -444,13 +446,13 @@ async fn run_port_task(
             }
         }
     }
-    // task 结束（驱动被丢弃）：兜底关闭句柄。
+    // Close the serial handle on task exit.
     if let Some(mut s) = stream.take() {
         let _ = s.shutdown().await;
     }
 }
 
-/// 脉冲：吸合 → 保持 ms → 自动释放。释放失败报 Invalid 并注明通道可能仍吸合。
+/// Pulse the relay and report a release failure if its final state is uncertain.
 async fn pulse_channel(
     stream: &mut Option<BoxStream>,
     opener: &Opener,
@@ -463,13 +465,13 @@ async fn pulse_channel(
     tokio::time::sleep(Duration::from_millis(ms)).await;
     if let Err(err) = set_channel(stream, opener, port, baud, channel, false).await {
         return Err(DeviceError::Invalid(format!(
-            "脉冲释放失败（通道 {channel} 可能仍处于吸合状态，请检查继电器并手动恢复）：{err}"
+            "Pulse release failed. Channel {channel} may still be energized and requires manual inspection: {err}"
         )));
     }
     Ok(())
 }
 
-/// 确保串口已打开（惰性；错误映射见 [`open_serial`]）。
+/// Open the serial handle if needed.
 fn ensure_open(
     stream: &mut Option<BoxStream>,
     opener: &Opener,
@@ -482,7 +484,7 @@ fn ensure_open(
     Ok(())
 }
 
-/// 发送 ON/OFF 命令并读回校验。
+/// Send an ON or OFF command and check its echo.
 async fn set_channel(
     stream: &mut Option<BoxStream>,
     opener: &Opener,
@@ -509,11 +511,11 @@ async fn set_channel(
     result
 }
 
-/// 写帧 → 冲刷 → 读回。
+/// Write and flush a frame, then read its echo.
 ///
-/// 多数板卡原样回显命令帧（Verified = 已接受）；静默板卡（无回显）与
-/// 读回超时视为已接受。EOF 表示句柄失效；回显校验和
-/// 错误 = 通信内容不可信，报 Disconnected 并附帧十六进制。
+/// A valid echo confirms acceptance. Silent boards and echo timeouts are accepted without verification.
+/// EOF indicates that the serial handle is no longer usable.
+/// A bad echo checksum returns a disconnection error with the raw frame in hex.
 async fn send_and_verify(stream: &mut BoxStream, channel: u8, opcode: u8) -> DeviceResult<()> {
     let frame = ch340::frame(channel, opcode);
     stream.write_all(&frame).await.map_err(io_err)?;
@@ -554,7 +556,7 @@ async fn read_echo(stream: &mut BoxStream, channel: u8, opcode: u8) -> DeviceRes
     }
 }
 
-/// 发送 STATUS 查询并扫描应答。
+/// Send a channel status query and scan for its reply.
 async fn query_status(
     stream: &mut Option<BoxStream>,
     opener: &Opener,
@@ -606,7 +608,11 @@ async fn test_channel(
     // A failed write or verification can leave the channel energized.
     set_channel(stream, opener, port, baud, channel, false)
         .await
-        .map_err(|error| DeviceError::Invalid(format!("通道 {channel} 测试释放失败：{error}")))?;
+        .map_err(|error| {
+            DeviceError::Invalid(format!(
+                "Failed to release channel {channel} after the test: {error}"
+            ))
+        })?;
     let after = query_status_with_retry(stream, opener, port, baud, channel).await?;
     Ok(ChannelTestReport {
         before,
@@ -627,7 +633,7 @@ async fn read_status(stream: &mut BoxStream, channel: u8) -> DeviceResult<Option
     loop {
         let remaining = ECHO_TIMEOUT.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return Ok(None); // 板卡不回答 STATUS
+            return Ok(None); // The board did not answer the query.
         }
         match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
             Err(_elapsed) => return Ok(None),
@@ -648,14 +654,14 @@ async fn read_status(stream: &mut BoxStream, channel: u8) -> DeviceResult<Option
     }
 }
 
-/// 会话内 IO 错误（写/冲刷/读失败）→ Disconnected：串口通信中断
-/// （USB 拔出、驱动复位、端口被抢占）。
+/// Map read, write, and flush failures to a disconnected transport.
+/// USB removal, driver resets, and port loss can cause these failures.
 fn io_err(_err: std::io::Error) -> DeviceError {
     DeviceError::Disconnected
 }
 
 #[cfg(feature = "real-hardware")]
-/// tokio-serial 打开真实串口，错误按类别映射 `DeviceError`。
+/// Open a physical serial port and map the transport error.
 fn open_serial(port: &str, baud: u32) -> DeviceResult<BoxStream> {
     let stream =
         tokio_serial::SerialStream::open(&tokio_serial::new(port, baud)).map_err(map_open_error)?;
@@ -667,9 +673,9 @@ fn map_open_error(err: serialport::Error) -> DeviceError {
     use serialport::ErrorKind;
     match err.kind {
         ErrorKind::NoDevice => {
-            // serialport 4.10 Windows 端（src/windows/error.rs）把
-            // ERROR_FILE_NOT_FOUND / ERROR_ACCESS_DENIED 一律归为 NoDevice：
-            // 端口不存在与被其他进程占用同源，按 OS 描述细分。
+            // On Windows, serialport maps both file-not-found and access-denied errors
+            // to the same NoDevice category.
+            // Use the operating-system message to distinguish a missing port from denied access.
             let description = err.description.to_ascii_lowercase();
             if description.contains("denied") || description.contains("拒绝访问") {
                 DeviceError::PermissionDenied
@@ -694,9 +700,10 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use duthub_core::ApprovalError;
+    use duthub_core::HeartbeatConfig;
     use duthub_core::model::{
-        AdbConfig, DutA2aConfig, DutConfig, DutMediaConfig, FlashConfig, HeartbeatConfig,
-        McpConfig, RelayChannels, RelayConfig, SerialConfig,
+        AdbConfig, DutA2aConfig, DutConfig, DutMediaConfig, FlashConfig, McpConfig, RelayChannels,
+        RelayConfig, SerialConfig,
     };
     use duthub_device::control::{ControlAction, ControlEntryError, ControlService};
 
@@ -707,17 +714,17 @@ mod tests {
         reason = "test mock fault-injection switches"
     )]
     struct MockBehavior {
-        /// ON/OFF 命令原样回显。
+        /// Echo ON and OFF commands unchanged.
         echo: bool,
-        /// 回显时故意写坏校验字节（帧内容不可信 → 驱动必须报错）。
+        /// Corrupt the echo checksum to verify the driver rejects it.
         corrupt_echo: bool,
-        /// 只对 OFF 帧写坏校验字节（脉冲释放失败 → 驱动必须报告通道可能仍吸合）。
+        /// Corrupt only the OFF echo to simulate a failed release.
         corrupt_off: bool,
-        /// 是否应答 STATUS。
+        /// Whether the board answers status queries.
         answer_status: bool,
-        /// 只对 1..=n 的通道应答 STATUS（其余静默）；与 `answer_status` 组合使用。
+        /// When status replies are enabled, answer only for channels 1 through n.
         status_channels: u8,
-        /// 继电器触点粘连：命令回显正常但 STATUS 恒报释放（ON 断言必须失败）。
+        /// Simulate a stuck contact by echoing commands while reporting the relay as released.
         status_stuck_off: bool,
     }
 
@@ -734,16 +741,16 @@ mod tests {
         }
     }
 
-    /// 模拟板卡收发记录。
+    /// Traffic recorded by the simulated relay board.
     #[derive(Default)]
     struct MockLog {
-        /// 收到的 (channel, opcode, checksum 是否正确) 序列。
+        /// Received channel and opcode pairs with their checksum validity.
         frames: Vec<(u8, u8, bool)>,
-        /// 每次 OFF 的 (channel, 吸合毫秒数)。
+        /// Channel and energization duration in milliseconds for each OFF command.
         pulse_ms: Vec<(u8, u128)>,
     }
 
-    /// 模拟板卡服务循环：解析 4 字节帧，按 behavior 决定回显/STATUS 应答。
+    /// Parse four-byte frames and respond according to the configured board behavior.
     async fn serve_mock_relay(
         stream: tokio::io::DuplexStream,
         log: Arc<StdMutex<MockLog>>,
@@ -760,39 +767,44 @@ mod tests {
             let (ch, op) = (frame[1], frame[2]);
             let ck_ok = frame[3] == ch340::checksum(ch, op);
             log.lock().unwrap().frames.push((ch, op, ck_ok));
-            if op == ch340::OP_STATUS {
-                // 只对 1..=status_channels 的通道应答，其余静默（模拟不支持的
-                // 通道）。应答帧：[A0, ch, state, A0+ch+state]。
-                if behavior.answer_status && ck_ok && ch >= 1 && ch <= behavior.status_channels {
-                    let actual = state.get(&ch).copied().unwrap_or(false);
-                    let st = u8::from(!behavior.status_stuck_off && actual);
-                    let resp = [ch340::HEADER, ch, st, ch340::checksum(ch, st)];
-                    let _ = wr.write_all(&resp).await;
-                }
-            } else if op == ch340::OP_ON || op == ch340::OP_OFF {
-                state.insert(ch, op == ch340::OP_ON);
-                if behavior.echo && ck_ok {
-                    let mut echo = ch340::frame(ch, op);
-                    if (behavior.corrupt_echo && op == ch340::OP_ON)
-                        || (behavior.corrupt_off && op == ch340::OP_OFF)
+            match op {
+                ch340::OP_STATUS => {
+                    // Answer only for supported channels. Unsupported channels stay silent.
+                    // Build the response from the header, channel, state, and their checksum.
+                    if behavior.answer_status && ck_ok && ch >= 1 && ch <= behavior.status_channels
                     {
-                        echo[3] ^= 0xFF;
+                        let actual = state.get(&ch).copied().unwrap_or(false);
+                        let st = u8::from(!behavior.status_stuck_off && actual);
+                        let resp = [ch340::HEADER, ch, st, ch340::checksum(ch, st)];
+                        let _ = wr.write_all(&resp).await;
                     }
-                    let _ = wr.write_all(&echo).await;
                 }
-                if op == ch340::OP_ON {
-                    on_at.insert(ch, Instant::now());
-                } else if let Some(t) = on_at.remove(&ch) {
-                    log.lock()
-                        .unwrap()
-                        .pulse_ms
-                        .push((ch, t.elapsed().as_millis()));
+                ch340::OP_ON | ch340::OP_OFF => {
+                    state.insert(ch, op == ch340::OP_ON);
+                    if behavior.echo && ck_ok {
+                        let mut echo = ch340::frame(ch, op);
+                        if (behavior.corrupt_echo && op == ch340::OP_ON)
+                            || (behavior.corrupt_off && op == ch340::OP_OFF)
+                        {
+                            echo[3] ^= 0xFF;
+                        }
+                        let _ = wr.write_all(&echo).await;
+                    }
+                    if op == ch340::OP_ON {
+                        on_at.insert(ch, Instant::now());
+                    } else if let Some(t) = on_at.remove(&ch) {
+                        log.lock()
+                            .unwrap()
+                            .pulse_ms
+                            .push((ch, t.elapsed().as_millis()));
+                    }
                 }
+                _ => {}
             }
         }
     }
 
-    /// 构造注入 duplex 的 opener：每次 open 生成一对新管道 + 一个模拟板卡 task。
+    /// Create a fresh duplex pair and simulated board task whenever the port opens.
     fn mock_opener(behavior: MockBehavior) -> (Opener, Arc<StdMutex<MockLog>>) {
         let log = Arc::new(StdMutex::new(MockLog::default()));
         let log_for_opener = log.clone();
@@ -884,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn control_backend_maps_power_reset_power_key() {
         let (driver, log) = test_driver(MockBehavior::default());
-        // 缩短脉冲便于测试；断言短按不继承长按时长
+        // Shorten test pulses and verify a short press does not use the long-press duration.
         let driver = Arc::new(driver.with_timing(PulseTiming {
             power_key_ms: 40,
             power_key_long_ms: 120,
@@ -906,7 +918,7 @@ mod tests {
             .unwrap();
 
         let guard = log.lock().unwrap();
-        // power 是保持态（只 ON 不 OFF）；reset/power_key 是脉冲（ON+OFF）
+        // Power stays latched. Reset and the power key send an ON followed by an OFF.
         assert_eq!(
             guard.frames,
             &[
@@ -919,34 +931,37 @@ mod tests {
                 (2, ch340::OP_OFF, true),
             ]
         );
-        // 脉冲时长按通道断言：reset≥60ms，短按≥40ms，长按≥120ms，短按 < 长按
+        // Verify the reset, short-press, and long-press durations by channel.
         let pulses = &guard.pulse_ms;
         assert_eq!(pulses.len(), 3);
         assert_eq!(pulses[0].0, 1);
         assert!(
             pulses[0].1 >= 60,
-            "reset 脉冲应 ≥60ms，实际 {}ms",
+            "Reset pulse must last at least 60 ms, got {} ms",
             pulses[0].1
         );
         assert_eq!(pulses[1].0, 2);
         assert!(
             pulses[1].1 >= 40,
-            "短按脉冲应 ≥40ms，实际 {}ms",
+            "Short press must last at least 40 ms, got {} ms",
             pulses[1].1
         );
         assert_eq!(pulses[2].0, 2);
         assert!(
             pulses[2].1 >= 120,
-            "长按脉冲应 ≥120ms，实际 {}ms",
+            "Long press must last at least 120 ms, got {} ms",
             pulses[2].1
         );
-        assert!(pulses[1].1 < pulses[2].1, "短按不得继承长按时长");
+        assert!(
+            pulses[1].1 < pulses[2].1,
+            "Short presses must not use the long-press duration"
+        );
     }
 
     #[tokio::test]
     async fn unconfigured_and_out_of_range_channels_rejected_without_frames() {
         let (driver, log) = test_driver(MockBehavior::default());
-        // 通道 0 = 未配置
+        // Channel zero means no channel is configured.
         assert!(matches!(
             driver.set("MOCK0", 0, true).await,
             Err(DeviceError::Invalid(_))
@@ -955,7 +970,7 @@ mod tests {
             driver.status("MOCK0", 0).await,
             Err(DeviceError::Invalid(_))
         ));
-        // 通道 0 / 超范围经 ControlBackend 入口同样拒绝
+        // The shared backend also rejects zero and out-of-range channel numbers.
         let backend: Arc<dyn ControlBackend> = Arc::new(driver);
         assert!(matches!(
             backend.power(&control_target("MOCK0", 0), true).await,
@@ -965,7 +980,7 @@ mod tests {
             backend.power(&control_target("MOCK0", 300), true).await,
             Err(DeviceError::Invalid(_))
         ));
-        // PDU 目标不得被串口驱动执行
+        // Reject a PDU target before it reaches the serial relay.
         let pdu = ControlTarget {
             address: "192.168.1.100".into(),
             driver: "snmp-pdu".into(),
@@ -977,7 +992,7 @@ mod tests {
         ));
         assert!(
             log.lock().unwrap().frames.is_empty(),
-            "被拒绝的动作不得发出任何协议帧"
+            "Rejected actions must not send protocol frames"
         );
     }
 
@@ -1052,11 +1067,11 @@ mod tests {
         match &err {
             DeviceError::Invalid(msg) => {
                 assert!(
-                    msg.contains("仍处于吸合状态"),
-                    "错误须提示通道可能仍吸合: {msg}"
+                    msg.contains("still be energized"),
+                    "The error must warn that the channel may still be energized: {msg}"
                 );
             }
-            other => panic!("期望 Invalid(释放失败)，得到 {other:?}"),
+            other => panic!("Expected Invalid for release failure, got {other:?}"),
         }
     }
 
@@ -1088,7 +1103,7 @@ mod tests {
         );
     }
 
-    // ── 继电器测试（channel_status / channel_test，经 ControlBackend 入口） ────
+    // Relay status and test calls through the shared control backend.
 
     #[tokio::test]
     async fn backend_channel_status_enumerates_answered_channels() {
@@ -1102,14 +1117,14 @@ mod tests {
             backend.channel_status("MOCK0").await.unwrap(),
             vec![(1, false), (2, false), (3, false)]
         );
-        // 全程只读：不得出现任何 ON/OFF 帧
+        // The status check must send no ON or OFF frames.
         assert!(
             log.lock()
                 .unwrap()
                 .frames
                 .iter()
                 .all(|&(_, op, _)| op == ch340::OP_STATUS),
-            "channel_status 只允许发 STATUS 帧"
+            "channel_status may send status frames only"
         );
     }
 
@@ -1130,7 +1145,7 @@ mod tests {
                 off_ok: true,
                 after: Some(false),
             },
-            "往返报告：OFF → ON 确认 → OFF 确认恢复"
+            "The report must confirm the ON and OFF transitions"
         );
         assert_eq!(
             log.lock().unwrap().frames,
@@ -1141,14 +1156,14 @@ mod tests {
                 (1, ch340::OP_OFF, true),
                 (1, ch340::OP_STATUS, true),
             ],
-            "帧序：STATUS(before) → ON → STATUS(on 断言) → OFF → STATUS(off 断言)"
+            "Frame sequence must be status, ON, status, OFF, status"
         );
     }
 
     #[tokio::test]
     async fn backend_channel_test_reports_failed_on_but_still_releases() {
-        // 触点粘连：命令回显正常，但 STATUS 恒报释放 → on_ok 必须为 false，
-        // 且 OFF 恢复帧仍然发出（恢复优先于断言）。
+        // The mocked board echoes commands but keeps reporting a released relay.
+        // The ON check fails, and the driver must still send OFF to restore the relay.
         let (driver, log) = test_driver(MockBehavior {
             answer_status: true,
             status_channels: 1,
@@ -1169,7 +1184,7 @@ mod tests {
         let frames = log.lock().unwrap().frames.clone();
         assert!(
             frames.contains(&(1, ch340::OP_OFF, true)),
-            "on_ok 失败后仍必须发 OFF 恢复"
+            "A failed ON verification must still send OFF"
         );
     }
 
@@ -1221,7 +1236,7 @@ mod tests {
         ));
         assert!(
             log.lock().unwrap().frames.is_empty(),
-            "通道 0 不得发出任何协议帧"
+            "Channel zero must not send protocol frames"
         );
     }
 
@@ -1252,7 +1267,7 @@ mod tests {
         );
         assert!(
             log.lock().unwrap().frames.is_empty(),
-            "open/close 探测不得发送任何协议帧"
+            "The port probe must not send protocol frames"
         );
     }
 
@@ -1263,12 +1278,12 @@ mod tests {
         driver.close("MOCK0").await.unwrap();
         driver.set("MOCK0", 1, false).await.unwrap();
         assert_eq!(log.lock().unwrap().frames.len(), 2);
-        // 重复 close 幂等
+        // Closing a closed port is harmless.
         driver.close("MOCK0").await.unwrap();
     }
 
-    // ── 授权拒绝路径（经共用设备操作入口 duthub-device::control::ControlService，
-    //    审核报告 P1-3：授权在入口统一完成，驱动只收已解析目标） ────────────────
+    // Exercise denied operations through the shared control service.
+    // The driver sees only authorized operations on resolved targets.
 
     fn dut_with_relay(id: &str) -> DutConfig {
         DutConfig {
@@ -1317,10 +1332,10 @@ mod tests {
         )
     }
 
-    /// 授权路径测试夹具：`ControlService` 是同步门面（内部 `block_on`，见
-    /// `duthub-device::control`），这些测试必须用普通 `#[test]` 而非
-    /// `#[tokio::test]`——驱动的 task 都在 `ControlService` 的 runtime 上派生。
-    /// 脉冲缩短避免测试拖慢。
+    /// The control service is synchronous and runs its own Tokio runtime.
+    /// Use a regular test so the driver tasks run on that runtime.
+    /// A Tokio test would add a nested runtime.
+    /// Shorten pulses to keep the tests fast.
     fn auth_driver() -> (Ch340RelayDriver, Arc<StdMutex<MockLog>>) {
         let (driver, log) = test_driver(MockBehavior::default());
         let driver = driver.with_timing(PulseTiming {
@@ -1346,7 +1361,7 @@ mod tests {
         ));
         assert!(
             log.lock().unwrap().frames.is_empty(),
-            "无令牌不得触达继电器"
+            "A missing token must block relay dispatch"
         );
     }
 
@@ -1356,7 +1371,7 @@ mod tests {
         let (svc, approval) = control_service_with_driver(driver);
         svc.register_dut(dut_with_relay("dut-a"));
 
-        // 令牌签给 dut-b / power=false，与本次操作（dut-a / power=true）不匹配
+        // The token authorizes power-off for dut-b while the request powers on dut-a.
         let token = approval.issue("dut-b", "control.power", r#"{"on":false}"#);
         let err = svc
             .execute_by_id("dut-a", ControlAction::Power { on: true }, &token.token)
@@ -1374,15 +1389,15 @@ mod tests {
         let (svc, approval) = control_service_with_driver(driver);
         svc.register_dut(dut_with_relay("dut-a"));
 
-        // power → power 通道 4
+        // Power maps to channel 4.
         let token = approval.issue("dut-a", "control.power", r#"{"on":true}"#);
         svc.execute_by_id("dut-a", ControlAction::Power { on: true }, &token.token)
             .unwrap();
-        // reset → reset 通道 1（脉冲）
+        // Reset pulses channel 1.
         let token = approval.issue("dut-a", "control.reset", "{}");
         svc.execute_by_id("dut-a", ControlAction::Reset, &token.token)
             .unwrap();
-        // power_key 长按 → power_key 通道 2（脉冲）
+        // A long power-key press pulses channel 2.
         let token = approval.issue("dut-a", "control.power_key", r#"{"long_press":true}"#);
         svc.execute_by_id(
             "dut-a",
@@ -1395,15 +1410,27 @@ mod tests {
         {
             let guard = log.lock().unwrap();
             let frames = &guard.frames;
-            assert_eq!(frames[0], (4, ch340::OP_ON, true), "power → 通道 4");
-            assert_eq!(frames[1], (1, ch340::OP_ON, true), "reset → 通道 1 脉冲");
+            assert_eq!(
+                frames[0],
+                (4, ch340::OP_ON, true),
+                "Power must use channel 4"
+            );
+            assert_eq!(
+                frames[1],
+                (1, ch340::OP_ON, true),
+                "Reset must pulse channel 1"
+            );
             assert_eq!(frames[2], (1, ch340::OP_OFF, true));
-            assert_eq!(frames[3], (2, ch340::OP_ON, true), "power_key → 通道 2");
+            assert_eq!(
+                frames[3],
+                (2, ch340::OP_ON, true),
+                "Power key must use channel 2"
+            );
             assert_eq!(frames[4], (2, ch340::OP_OFF, true));
             frames_before = guard.frames.len();
         }
 
-        // 单次消费：令牌重放必须拒绝且不再触达继电器
+        // A consumed token cannot trigger the relay again.
         let token = approval.issue("dut-a", "control.power", r#"{"on":true}"#);
         svc.execute_by_id("dut-a", ControlAction::Power { on: true }, &token.token)
             .unwrap();
@@ -1430,7 +1457,7 @@ mod tests {
             err,
             ControlEntryError::Device(DeviceError::Invalid(_))
         ));
-        // 绑定缺失：令牌不消费、继电器不触达，修正配置后可重试
+        // A missing binding preserves the token so the request can be retried after configuration.
         assert!(
             approval
                 .validate(&token.token, "dut-b", "control.power", r#"{"on":true}"#)
@@ -1445,7 +1472,7 @@ mod tests {
         let (svc, approval) = control_service_with_driver(driver);
         let mut dut = dut_with_relay("dut-c");
         if let RelayConfig::UsbSerial { channels, .. } = &mut dut.relay {
-            channels.power = None; // 未配置电源通道
+            channels.power = None; // No power channel configured.
         }
         svc.register_dut(dut);
 

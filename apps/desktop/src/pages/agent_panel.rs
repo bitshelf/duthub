@@ -1,4 +1,9 @@
-use super::{Workbench, Palette, Window, Context, Div, div, InteractiveElement, switch_panel_header, StatefulInteractiveElement, toggle, collapsible_panel, Styled, px, ParentElement, subtle, FluentBuilder, SessionStatus, SharedString, bundle, AppContext, btn, BtnVariant, IntoElement, Input, Disableable, TranscriptEntry, TranscriptKind, Stateful, panel_shell, In, field};
+use super::{
+    BtnVariant, Context, Disableable, Div, In, Input, InteractiveElement, IntoElement, Palette,
+    ParentElement, SessionStatus, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    TranscriptEntry, TranscriptKind, Window, Workbench, btn, bundle, collapsible_panel, div, field,
+    panel_shell, px, subtle, switch_panel_header, toggle,
+};
 
 pub(super) fn connection_agent_panel(
     w: &mut Workbench,
@@ -26,9 +31,9 @@ pub(super) fn connection_agent_panel(
     collapsible_panel(header, body, p)
 }
 
-/// 「Agent 会话」面板（每 DUT）：goose 进程状态、启动/停止/取消、流式 transcript、
-/// 每 DUT 独立草稿输入。真实会话在 `agent_host` 工作线程；本面板只读 `SessionView`
-/// 并下发命令（停止只发请求，等待/杀进程树在工作线程，F12）。
+/// Per-DUT Agent session controls, process state, and streamed transcript.
+/// Each DUT keeps its own prompt draft. The panel reads `SessionView` and submits commands
+/// to the Agent host, which waits for the process and terminates its tree off the UI thread.
 pub(super) fn agent_session_panel(
     w: &mut Workbench,
     p: &'static Palette,
@@ -48,7 +53,7 @@ pub(super) fn agent_session_panel(
         body = body.child(subtle(reason, p).text_color(p.warn));
         return body;
     }
-    // 发送成功后清空草稿（`set_value` 需要 Window，延到渲染帧执行）。
+    // Clear the draft after successful submission. Defer the input update until a window is available.
     w.clear_agent_prompt_if_requested(&dut.id, window, cx);
 
     let view = w.agent_host.as_ref().and_then(|host| host.view(&dut.id));
@@ -60,11 +65,11 @@ pub(super) fn agent_session_panel(
     let busy = status == SessionStatus::Busy;
     let ready = status == SessionStatus::Ready;
     let (status_text, status_color) = session_status_text(&status, has_view, p);
-    // W4c：徽标/标签需要的当前选择提前取好（badge 行在 meta 组装时消费）。
+    // Read the selected Agent before building the metadata row and its badge.
     let selected_agent = w.agent_id_for_dut(&dut.id);
     let actual_launch = w.agent_host.as_ref().and_then(|host| host.launch(&dut.id));
 
-    // 状态行：点 + 文案 +（已启动时）本地端口/会话 id 前缀。
+    // Show the status dot and label, plus the local port and session ID prefix once running.
     let mut meta = div()
         .flex()
         .items_center()
@@ -90,12 +95,14 @@ pub(super) fn agent_session_panel(
                 .text_size(px(10.)),
         );
     }
-    // W4c：Authenticode 徽标按实际程序来源展示——内嵌 goose 显示 manifest
-    // 记录状态；外部程序（或选中的外部条目）一律「未验证」，绝不谎称已签名。
-    let (badge_source, badge_signature) = if let Some(spec) = &actual_launch { (
-        duthub_desktop::agent_ui::program_source(Some(spec), false),
-        spec.signature.clone(),
-    ) } else {
+    // Choose the Authenticode badge using the actual program source.
+    // External programs remain unverified even when the registry entry is selected.
+    let (badge_source, badge_signature) = if let Some(spec) = &actual_launch {
+        (
+            duthub_desktop::agent_ui::program_source(Some(spec), false),
+            spec.signature.clone(),
+        )
+    } else {
         let selected_external = w
             .agents
             .agent(&selected_agent)
@@ -121,7 +128,8 @@ pub(super) fn agent_session_panel(
         .agents
         .agents
         .iter()
-        .find(|entry| entry.id == w.agent_id_for_dut(&dut.id)).map_or_else(|| "mcp_only".into(), |entry| entry.trust_level.clone());
+        .find(|entry| entry.id == w.agent_id_for_dut(&dut.id))
+        .map_or_else(|| "mcp_only".into(), |entry| entry.trust_level.clone());
     let trust_label = localized_trust_label(&trust_level, proof);
     let isolation_text = format_sandbox_status(&sandbox_status);
     body = body.child(
@@ -135,9 +143,9 @@ pub(super) fn agent_session_panel(
         .text_size(px(10.5)),
     );
 
-    // 每 DUT 可选 Agent（默认 goose；外部 Agent 来自 <work_dir>/agents.json）。
-    // W4b：会话运行中（非终止态）锁定下拉，显示实际 launch 的 agent id 与
-    // 「下一次启动生效」——运行中的进程不会因改选而变化。
+    // Each DUT can select an Agent from its registry. Goose is the default.
+    // An active session shows the launched Agent and locks the selector.
+    // Selection changes apply to the next launch.
     let choices = w.acp_agent_choices();
     let selector_locked = duthub_desktop::agent_ui::running_agent_selector_disabled(&status);
     let mut ids: Vec<String> = Vec::new();
@@ -223,7 +231,7 @@ pub(super) fn agent_session_panel(
         );
     }
 
-    // 动作：启动（未运行/已结束）、停止（运行中）、取消本轮（Busy）。
+    // Start an idle or finished session, stop a running one, or cancel the current turn.
     let dut_start = dut.id.clone();
     let dut_stop = dut.id.clone();
     let dut_cancel = dut.id.clone();
@@ -270,20 +278,18 @@ pub(super) fn agent_session_panel(
     }
     body = body.child(actions);
 
-    // 流式 transcript：uniform_list 只构建可见行（AGENTS #49 同口径）。
-    // 贴底跟随（距底 65px 内）与终端同一语义：用户上滚阅读历史时新条目不得拽回底部。
-    // W4c：跟随判定改用 `SessionView::total_entries()` 单调序号——内存上限
-    // 2000 条截断后 `transcript.len()` 停涨，只有它能在 2000 条后继续贴底。
-    let item_count = view
-        .as_ref()
-        .map_or(0, |view| {
-            // A poisoned transcript lock only means some worker panicked while
-            // holding it; the render path must degrade, not panic the UI thread.
-            view.transcript
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len()
-        });
+    // Render only the visible transcript rows.
+    // Follow new entries within 65 pixels of the bottom. Preserve the user's position while reading history.
+    // Use the monotonic entry count from `SessionView::total_entries`.
+    // The retained transcript size stops increasing once it reaches 2,000 entries.
+    let item_count = view.as_ref().map_or(0, |view| {
+        // A poisoned transcript lock only means some worker panicked while
+        // holding it; the render path must degrade, not panic the UI thread.
+        view.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    });
     let scroll = w
         .agent_transcript_scroll
         .entry(dut.id.clone())
@@ -296,7 +302,7 @@ pub(super) fn agent_session_panel(
             let state = scroll.0.borrow();
             let offset = state.base_handle.offset().y;
             let max = state.base_handle.max_offset().y;
-            // offset 向下滚动为负，到底时 offset.y ≈ -max；距底部距离 = max + offset
+            // GPUI uses a negative offset when scrolling down. The distance from the bottom is max + offset.
             max <= px(0.) || (max + offset) < px(65.)
         };
         if near_bottom {
@@ -346,7 +352,7 @@ pub(super) fn agent_session_panel(
         );
     }
 
-    // 每 DUT 独立草稿（F13）：实体按 DUT id 常驻，切换 DUT 换输入框而非清文本。
+    // Keep one input entity per DUT so switching DUTs preserves each draft.
     let prompt_state = w.agent_prompt_state(&dut.id, window, cx);
     let dut_send = dut.id.clone();
     body = body.child(
@@ -377,9 +383,9 @@ pub(super) fn agent_session_panel(
     body
 }
 
-/// Transcript 单行（固定行高供 `uniform_list` 统一度量）。
-/// W4c：Agent 行的说话者标签用当前 Agent 名（host.launch 或注册表定义名），
-/// 不再硬编码 "GOOSE"。
+/// Render one transcript row at the fixed height required by `uniform_list`.
+/// Use the launched Agent's name for its speaker label, falling back to the registry name
+/// before a program has started.
 pub(super) fn agent_transcript_row(
     entry: &TranscriptEntry,
     agent_tag: &str,
@@ -421,9 +427,9 @@ pub(super) fn agent_transcript_row(
         )
 }
 
-/// Authenticode 徽标（W4c）：内嵌 goose 只展示 manifest 记录；外部程序一律
-/// 「未验证」（`agent_ui::authenticode_badge` 决定变体，文案在 bin 层翻译），
-/// 不宣称已验证。
+/// Render the Authenticode badge for the selected program source.
+/// The Agent UI helper selects the badge state, and the desktop translates its label.
+/// External programs are displayed as unverified.
 pub(super) fn authenticode_badge(
     id: &'static str,
     source: duthub_desktop::agent_ui::ProgramSource,
@@ -461,10 +467,10 @@ pub(super) fn authenticode_badge(
         .child(SharedString::from(text))
 }
 
-/// W4c 右栏 Agent Inspector：读取真实 `SessionView`（launch/本地端口/session
-/// id/stderr/OS 隔离/permission-denied 系统条目）与审计最近 200 条中本会话
-/// 凭据的 `tool.call`。无会话数据时只显示空态——演示工具卡（roles/policy）
-/// 已随演示面板一并卸载，绝不再展示。
+/// Show the session's program, port, ACP session ID, stderr, and isolation state.
+/// The inspector also shows permission denials and recent audit entries
+/// for this session's credential. With no session data, show the empty state.
+/// The retired demo panel's roles and policy cards are excluded.
 pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> gpui_kit::Div {
     let Some(dut) = w.panel_dut().cloned() else {
         return div();
@@ -475,12 +481,14 @@ pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> g
         body = body.child(subtle(crate::i18n::label("agentInspectorEmpty"), p));
         return panel_shell("spark", crate::i18n::label("agentInspectorTitle"), body, p);
     };
-    // 进程事实：实际 launch 的程序（含版本/来源）、本地端口、ACP session id。
+    // Show the actual launched program, including its version, source, port, and ACP session ID.
     let launch = w.agent_host.as_ref().and_then(|host| host.launch(&dut.id));
     body = body.child(inspector_row(
         crate::i18n::label("agentInspectorLaunch"),
-        &launch
-            .as_ref().map_or_else(|| crate::i18n::label("agentInspectorNotRecorded").to_owned(), duthub_desktop::agent_host::AgentLaunchSpec::display),
+        &launch.as_ref().map_or_else(
+            || crate::i18n::label("agentInspectorNotRecorded").to_owned(),
+            duthub_desktop::agent_host::AgentLaunchSpec::display,
+        ),
         p,
     ));
     if let Some(port) = view.port() {
@@ -507,7 +515,7 @@ pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> g
         &isolation,
         p,
     ));
-    // stderr 尾部（进程启动失败的排障线索；非空才显示）。
+    // Show the stderr tail when it contains useful diagnostics.
     let stderr = view.stderr_tail();
     if !stderr.trim().is_empty() {
         body = body.child(
@@ -542,7 +550,7 @@ pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> g
                 ),
         );
     }
-    // permission-denied 系统条目（AcpEvent::PermissionDenied 写入的记录）。
+    // Show permission denials recorded by the ACP client.
     let denials = duthub_desktop::agent_ui::permission_denial_entries(&view.transcript_snapshot());
     body = body.child(
         div()
@@ -567,17 +575,14 @@ pub(crate) fn agent_inspector_panel(w: &mut Workbench, p: &'static Palette) -> g
                 }))
             }),
     );
-    // 工具调用审计：最近 200 条中 credential_id == 本会话凭据的 tool.call。
-    // 无凭据的会话不继承无归属事件（空列表就是诚实的空态）。
-    let audit_rows = w
-        .device
-        .audit_sink()
-        .map_or_default(|sink| {
-            duthub_desktop::agent_ui::inspector_audit_events(
-                &sink.recent(200),
-                view.credential_id().as_deref(),
-            )
-        });
+    // From the latest 200 audit entries, show tool.call events for this session's credential.
+    // A session without a credential gets an empty list. Unattributed entries are excluded.
+    let audit_rows = w.device.audit_sink().map_or_default(|sink| {
+        duthub_desktop::agent_ui::inspector_audit_events(
+            &sink.recent(200),
+            view.credential_id().as_deref(),
+        )
+    });
     body = body.child(
         div()
             .flex()
@@ -676,7 +681,7 @@ fn format_sandbox_status(status: &duthub_sandbox::SandboxStatus) -> String {
     }
 }
 
-/// Inspector 的一行「label: value」。
+/// Render one inspector label and value.
 pub(super) fn inspector_row(label: &'static str, value: &str, p: &'static Palette) -> Div {
     div()
         .flex()
@@ -889,10 +894,10 @@ pub(crate) fn agent_runtime_panel(
     panel_shell("spark", label("agentRuntimeTitle"), body, p)
 }
 
-/// Agent 注册表（`agents.json`）：添加/编辑/删除 ACP Agent。
+/// Edit the ACP Agent registry stored in `agents.json`.
 ///
-/// 外部程序只允许从原生文件选择器显式添加；保存时计算并固定 SHA-256，goose
-/// 还要求 `--version >= 1.60.2`。`envKeys` 只写键名，值在系统凭据库。
+/// Select external programs through the native picker. Saving records the SHA-256 hash.
+/// Goose requires version 1.60.2 or newer. Store environment values in the system credential store.
 pub(super) fn agent_registry_section(
     w: &mut Workbench,
     p: &'static Palette,
@@ -1001,8 +1006,8 @@ pub(super) fn agent_registry_section(
                 None,
                 p,
             ));
-        // W4b：args 必须是 JSON 数组——解析错误即时显示；保存时会再次校验，
-        // 非法草稿不落盘。
+        // Parse argument drafts as JSON arrays and show parse errors immediately.
+        // Validate again on save before writing the registry.
         if let Err(error) = duthub_desktop::agent_ui::parse_args_json(&args_value) {
             editor = editor.child(subtle(&error, p).text_color(p.warn));
         }
@@ -1012,7 +1017,7 @@ pub(super) fn agent_registry_section(
             None,
             p,
         ));
-        // W4b：env 键名解析错误即时显示（保留键/重复键在保存前就被拒绝）。
+        // Report reserved or duplicate environment key names before saving.
         if let Err(error) = duthub_desktop::agent_ui::parse_env_keys_draft(&env_value) {
             editor = editor.child(subtle(&error, p).text_color(p.warn));
         }
@@ -1062,9 +1067,10 @@ pub(super) fn agent_registry_section(
             || crate::i18n::label("agentRegistryEmbedded").to_owned(),
             std::borrow::ToOwned::to_owned,
         );
-        let hash = agent
-            .expected_sha256
-            .as_deref().map_or_else(|| crate::i18n::label("agentRegistryHashUnpinned").to_owned(), |hash| format!("{}…", hash.get(..12).unwrap_or(hash)));
+        let hash = agent.expected_sha256.as_deref().map_or_else(
+            || crate::i18n::label("agentRegistryHashUnpinned").to_owned(),
+            |hash| format!("{}…", hash.get(..12).unwrap_or(hash)),
+        );
         let state = if agent.enabled {
             crate::i18n::label("agentRegistryEnabled")
         } else {
@@ -1164,11 +1170,11 @@ pub(super) fn agent_registry_section(
     section
 }
 
-/// W4b env 值编辑器：选中键 + 掩码输入（keyring 写入/删除）。
+/// Choose a key and edit its masked value in the system credential store.
 ///
-/// 只在编辑**既有**条目时可用——新增条目的 id 在保存时才生成，先写值会留下
-/// 孤儿凭据。掩码输入的原始值只进 keyring（`acp/<id>/env/<KEY>`），永不写进
-/// agents.json；状态行只显示「已保存/未保存/读取失败」，不回显明文。
+/// The editor requires a saved Agent ID so credentials cannot be orphaned.
+/// The original value goes only to the credential store under `acp/<id>/env/<KEY>`.
+/// The status shows whether a value is saved or readable without displaying it.
 pub(super) fn agent_env_value_editor(
     w: &mut Workbench,
     p: &'static Palette,
@@ -1196,7 +1202,7 @@ pub(super) fn agent_env_value_editor(
     if keys.is_empty() {
         return block.child(subtle(crate::i18n::label("agentEnvKeysFirst"), p));
     }
-    // 键选择下拉（跟随当前键名草稿；选中键被移出草稿时自动取消选中）。
+    // Clear the selected key when it is removed from the current key list.
     let selected = w
         .agent_env_selected
         .clone()
@@ -1244,7 +1250,7 @@ pub(super) fn agent_env_value_editor(
         window,
         cx,
     );
-    // 读取状态机：已保存 / 未保存 / 读取失败 / 读取中（W4c 后台 keyring 读）。
+    // Show the result of the background credential lookup without displaying the value.
     let status_line = match &w.agent_env_value_state {
         Some(duthub_desktop::agent_ui::EnvValueState::Stored) => {
             subtle(crate::i18n::label("agentEnvStateStored"), p)

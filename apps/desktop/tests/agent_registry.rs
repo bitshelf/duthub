@@ -1,12 +1,13 @@
-//! 通用 ACP Agent 注册表 + 外部 goose 启动链回归。
+//! Generic ACP Agent registry and external goose launch chain regressions.
 //!
-//! - 外部 goose 路径真正被 Host 采用（程序/哈希记录进 `SessionView`）；
-//! - 两个 ACP 条目可按 DUT 选择（默认 goose 解析 + 外部 ACP 条目）；
-//! - 外部程序哈希不匹配 fail closed；CLI profile 明确拒绝；
-//! - `agents.json` 不存 token；版本门槛接受 >= 1.60.2。
+//! - External goose path is adopted by the host (program/hash recorded in `SessionView`);
+//! - Two ACP entries can be selected per DUT (default goose resolution + external ACP entry);
+//! - External program hash mismatch fails closed; CLI profiles are explicitly rejected;
+//! - `agents.json` stores no tokens; version gate accepts >= 1.60.2.
 //!
-//! 2026-11-24 起 goose 不再内嵌：需要真实 goose 的用例用本机已安装的 goose
-//! （「工具下载」页下载，或 `DUTHUB_TEST_GOOSE` 指向可执行文件），否则带清晰原因跳过。
+//! Goose is no longer embedded: tests requiring a real goose use a locally
+//! installed goose (from Tool Downloads or `DUTHUB_TEST_GOOSE`), otherwise skip with a clear
+//! reason.
 
 #![cfg(windows)]
 
@@ -41,7 +42,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Test goose fixture (2026-11-24: goose is downloaded, no longer embedded)
+// Test goose fixture (goose is downloaded, not embedded)
 // ---------------------------------------------------------------------------
 
 /// `DUTHUB_TEST_GOOSE` (absolute path to a goose executable) wins, otherwise the
@@ -51,7 +52,7 @@ fn test_goose_program() -> Option<PathBuf> {
         let path = PathBuf::from(raw);
         assert!(
             path.is_absolute() && path.is_file(),
-            "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+            "DUTHUB_TEST_GOOSE must be an absolute path to an existing goose executable: {}",
             path.display()
         );
         return Some(path);
@@ -64,15 +65,15 @@ fn test_goose_program() -> Option<PathBuf> {
 /// Loud skip: goose is no longer embedded, so ACP tests need an installed one.
 fn skip_without_goose() {
     eprintln!(
-        "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-         或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+        "SKIP: goose is not installed (goose is no longer embedded) — \
+         download goose from Tool Downloads or set DUTHUB_TEST_GOOSE to the goose executable"
     );
 }
 
 /// Built-in goose definition pointed at the installed test goose through the
 /// external-program path (absolute path + the real pinned SHA-256).
 fn goose_with_program(program: &std::path::Path) -> AgentDefinition {
-    let sha256 = duthub_core::store::sha256_file(program).expect("读取测试 goose 哈希");
+    let sha256 = duthub_core::store::sha256_file(program).expect("read test goose SHA-256");
     let mut agent = AgentDefinition::goose();
     agent.program = Some(program.display().to_string());
     agent.expected_sha256 = Some(sha256);
@@ -141,7 +142,8 @@ fn host_uses_external_goose_override_not_embedded_copy() {
         return;
     };
     let work = temp_dir("external");
-    let expected_sha256 = duthub_core::store::sha256_file(&program).expect("测试 goose 哈希");
+    let expected_sha256 =
+        duthub_core::store::sha256_file(&program).expect("read test goose SHA-256");
     let mut file = default_agents();
     *file.goose_mut().expect("default goose") = goose_with_program(&program);
     save_agents_atomic(&work, &file).unwrap();
@@ -152,20 +154,22 @@ fn host_uses_external_goose_override_not_embedded_copy() {
         access_context(),
         None,
     );
-    // 走默认 start：Host 自己读取 <work_dir>/agents.json 的 goose 条目。
+    // Use default start: Host reads the goose entry from <work_dir>/agents.json.
     host.start("dut-ext", binding()).unwrap();
     assert!(
         wait_ready(&mut host, "dut-ext"),
-        "外部 goose 未就绪：{:?} stderr={}",
+        "external goose did not become ready: {:?} stderr={}",
         host.view("dut-ext").map(|view| view.status()),
         host.view("dut-ext")
             .map_or_default(|view| view.stderr_tail())
     );
-    let launch = host.launch("dut-ext").expect("必须记录实际启动规格");
+    let launch = host
+        .launch("dut-ext")
+        .expect("actual launch spec must be recorded");
     assert_eq!(launch.agent_id, "goose");
     assert!(
         !launch.embedded,
-        "不再有内嵌副本：解析必须落到外部/已下载路径"
+        "no embedded copy remains: resolution must land on external/downloaded path"
     );
     assert_eq!(launch.program, program);
     assert_eq!(launch.sha256, expected_sha256);
@@ -196,15 +200,15 @@ fn two_acp_entries_are_selected_per_dut() {
         access_context(),
         None,
     );
-    // DUT A：默认 goose 条目（不再内嵌，外部路径指向测试 goose）；DUT B：独立
-    // ACP 条目（同一份可执行文件，但不同的程序路径记录与 agent id）。选择来自
-    // 持久化的 agent-bindings.json。
+    // DUT A: default goose entry (no longer embedded; external path points to test goose); DUT B:
+    // standalone ACP entry (same executable, different program path record and agent id).
+    // Selection comes from persisted agent-bindings.json.
     let mut file = default_agents();
     *file.goose_mut().expect("default goose") = goose_with_program(&program);
     let mut acme = acme_agent();
     acme.program = Some(program.display().to_string());
     acme.expected_sha256 =
-        Some(duthub_core::store::sha256_file(&program).expect("测试 goose 哈希"));
+        Some(duthub_core::store::sha256_file(&program).expect("read test goose SHA-256"));
     file.agents.push(acme);
     save_agents_atomic(&work, &file).unwrap();
     let file = load_agents(&work).unwrap();
@@ -224,30 +228,32 @@ fn two_acp_entries_are_selected_per_dut() {
         .unwrap();
     assert!(
         wait_ready(&mut host, "dut-a"),
-        "dut-a 未就绪：{:?}",
+        "dut-a did not become ready: {:?}",
         host.view("dut-a").map(|view| view.status())
     );
     assert!(
         wait_ready(&mut host, "dut-b"),
-        "dut-b 未就绪：{:?} stderr={}",
+        "dut-b did not become ready: {:?} stderr={}",
         host.view("dut-b").map(|view| view.status()),
-        host.view("dut-b")
-            .map_or_default(|view| view.stderr_tail())
+        host.view("dut-b").map_or_default(|view| view.stderr_tail())
     );
     let launch_a = host.launch("dut-a").unwrap();
     let launch_b = host.launch("dut-b").unwrap();
     assert_eq!(launch_a.agent_id, "goose");
-    assert!(!launch_a.embedded, "不再有内嵌副本");
+    assert!(!launch_a.embedded, "no embedded copy remains");
     assert_eq!(launch_a.program, program);
     assert_eq!(launch_b.agent_id, "acme");
     assert!(!launch_b.embedded);
     assert_eq!(launch_b.program, program);
-    // goose 的 session id 按日期/进程内计数生成，两个独立进程可能得到同一字符串；
-    // 用每会话独立 loopback listener 端口证明 DUT 之间没有共享会话。
+    // goose generates session IDs from date/per-process counter, so two separate processes may
+    // produce the same string; prove DUTs do not share a session via independent loopback ports.
     let port_a = host.view("dut-a").unwrap().port();
     let port_b = host.view("dut-b").unwrap().port();
     assert!(port_a.is_some() && port_b.is_some());
-    assert_ne!(port_a, port_b, "每 DUT 必须使用独立的 MCP listener");
+    assert_ne!(
+        port_a, port_b,
+        "each DUT must use an independent MCP listener"
+    );
 
     host.stop("dut-a");
     host.stop("dut-b");
@@ -291,7 +297,7 @@ fn hash_mismatch_fails_closed_without_launching_program() {
             message.contains("哈希") || message.contains("Hash"),
             "unexpected failure: {message}"
         ),
-        other => panic!("哈希不匹配必须 Failed，实际 {other:?}"),
+        other => panic!("hash mismatch must enter Failed, got {other:?}"),
     }
     drop(host);
     let _ = std::fs::remove_dir_all(&work);
@@ -319,7 +325,10 @@ fn cli_profile_is_rejected_before_spawning() {
         error.to_string().contains("CLI profile 本轮未实现"),
         "{error}"
     );
-    assert!(host.view("dut-cli").is_none(), "CLI 不得创建会话记录");
+    assert!(
+        host.view("dut-cli").is_none(),
+        "CLI profile must not create a session entry"
+    );
     let _ = std::fs::remove_dir_all(&work);
 }
 
@@ -348,7 +357,7 @@ fn agents_file_roundtrip_has_no_token_values_and_versions_accept_newer() {
     let loaded: AgentsFile = load_agents(&work).unwrap();
     assert_eq!(loaded, file);
 
-    // 版本探测只设下限：1.60.2 与更新版本都接受，旧版本拒绝。
+    // Version probe sets a lower bound only: 1.60.2 and newer are accepted; older versions fail.
     assert!(registry::version_at_least(
         "goose-acp 1.60.2",
         MIN_GOOSE_VERSION
@@ -386,7 +395,7 @@ fn probe_program_accepts_an_installed_goose() {
             .version
             .as_deref()
             .is_some_and(|line| registry::version_at_least(line, MIN_GOOSE_VERSION)),
-        "版本门槛必须接受已安装 goose：{probe:?}"
+        "version gate must accept installed goose: {probe:?}"
     );
     assert_eq!(probe.signature, "NotSigned");
     let _ = std::fs::remove_dir_all(&work);
@@ -404,7 +413,7 @@ fn registry_resolve_rejects_external_program_without_pinned_hash() {
 
 #[test]
 fn external_goose_older_than_minimum_is_rejected_by_version_gate() {
-    // 纯版本门槛（不依赖真实旧二进制）：1.59.x 必须拒绝，1.60.2+ 接受。
+    // Pure version gate (without an older binary): 1.59.x must be rejected, 1.60.2+ accepted.
     for older in ["goose-acp 1.59.9", "goose-acp 1.60.0", "goose-acp 1.60.1"] {
         assert!(registry::ensure_goose_version(older).is_err(), "{older}");
     }

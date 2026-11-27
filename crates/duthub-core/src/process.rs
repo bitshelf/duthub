@@ -1,10 +1,12 @@
-//! 安全的本地进程执行（`docs/SECURITY.md` #1）。
+//! Safe local process execution (`docs/SECURITY.md` #1).
 //!
-//! - 仅 `Command::new(resolved).args(argv)`，绝不拼接 shell 字符串。
-//! - 可执行名先在 PATH 解析为绝对路径（Windows 仅接受 `.exe`/无扩展名，杜绝 `.bat` 隐式 cmd）。
-//! - stdout/stderr 有上限截断；超时按**进程树**终止（子进程可能派生孙进程）。
-//! - 输出收尾有界：若残留孙进程持有继承的输出管道，读取不会无限等待，
-//!   超过 `DRAIN_TIMEOUT` 返回 `DeviceError::Timeout`。
+//! - Uses `Command::new(resolved).args(argv)` only; never concatenates shell command strings.
+//! - Resolves bare executable names on PATH to absolute paths (on Windows, only extensionless or
+//!   `.exe` binaries are accepted; `.bat`/`.cmd` implicit shell execution is forbidden).
+//! - Caps captured stdout/stderr and terminates the full **process tree** on timeout (children
+//!   may spawn grandchildren).
+//! - Bounds output draining: if a lingering grandchild still holds an inherited pipe, reading does
+//!   not block indefinitely and returns `DeviceError::Timeout` after `DRAIN_TIMEOUT`.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -17,15 +19,17 @@ use crate::error::{DeviceError, DeviceResult};
 
 const MAX_OUTPUT: usize = 65_536;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-/// 主进程结束后等待输出管道关闭（EOF）的上限：孙进程继承管道时防止读取线程无限等待。
+/// Upper bound on waiting for output pipes to hit EOF after the main process exits, preventing
+/// reader threads from blocking indefinitely when a grandchild inherits the pipes.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 进程执行抽象：测试用 Mock 注入，生产用 `RealProcessRunner`。
+/// Process execution abstraction: injected with a mock in tests and [`RealProcessRunner`] in
+/// production.
 pub trait ProcessRunner: Send + Sync {
     fn run(&self, exe: &Path, args: &[String], timeout: Duration) -> DeviceResult<ProcessResult>;
 }
 
-/// 真实执行器：argv-only，无 shell；工作目录为可执行文件所在目录。
+/// Real process runner: argv-only without a shell, using the executable's parent directory as cwd.
 #[derive(Debug)]
 pub struct RealProcessRunner;
 
@@ -112,8 +116,9 @@ fn run_capped(
 
     let stdout_pipe = child.stdout.take().expect("stdout piped");
     let stderr_pipe = child.stderr.take().expect("stderr piped");
-    // 读取线程经 channel 回传结果：主线程可以用 recv_timeout 限时收尾，
-    // 不能 join —— 残留孙进程持有继承管道时 join 会无限等待（审核发现 P2）。
+    // Reader threads return results over a channel so the main thread can drain with
+    // `recv_timeout` rather than `join` (a lingering grandchild holding inherited pipes would
+    // cause `join` to hang forever).
     let (tx, rx) = std::sync::mpsc::channel::<(Stream, Captured)>();
     let tx_err = tx.clone();
     let stdout_reader = std::thread::spawn(move || {
@@ -133,8 +138,8 @@ fn run_capped(
             break status;
         }
         if started.elapsed() > timeout {
-            // 超时即取消：终止整个进程树（仅杀主进程时，
-            // 派生的孙进程会继续持有输出管道）
+            // Cancel on timeout by terminating the entire process tree (killing only the direct
+            // child leaves spawned grandchildren holding the output pipes open).
             kill_process_tree(&mut child);
             timed_out = true;
             break child
@@ -150,8 +155,8 @@ fn run_capped(
     if timed_out {
         return Err(DeviceError::Timeout);
     }
-    // 输出收尾（有界）：正常退出后管道写端可能仍被残留子进程持有，
-    // 等不到双路 EOF 就按超时返回，不再阻塞调用方。
+    // Bounded output drain: after a normal exit, pipe write ends may still be held by lingering
+    // descendants; return `Timeout` rather than blocking the caller if both EOFs do not arrive.
     let (stdout, stderr) = collect_outputs(&rx);
     let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
         return Err(DeviceError::Timeout);
@@ -182,7 +187,8 @@ enum Stream {
     Stderr,
 }
 
-/// 在 `DRAIN_TIMEOUT` 内收集双路输出；任一路未在期限内到达返回 `None`。
+/// Collect both output streams within `DRAIN_TIMEOUT`; returns `None` for any stream that does not
+/// finish before the deadline.
 fn collect_outputs(
     rx: &std::sync::mpsc::Receiver<(Stream, Captured)>,
 ) -> (Option<Captured>, Option<Captured>) {
@@ -206,9 +212,9 @@ fn collect_outputs(
     (stdout, stderr)
 }
 
-/// 终止进程树：Windows 用 `taskkill /T /F`（argv-only，非 shell）；
-/// 主进程已退出时枚举不到树，由调用方的输出收尾超时兜底。Unix 仅终止主进程。
-/// 保留 `wait()` 收尸，避免残留僵尸进程。
+/// Terminate the process tree: on Windows uses `taskkill /T /F` (argv-only, no shell); if the main
+/// process has already exited and the tree can no longer be enumerated, the caller's drain timeout
+/// acts as a fallback. On Unix kills the main child process. Always calls `wait()` to reap zombies.
 pub fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
@@ -250,9 +256,11 @@ fn display_output(output: &Captured) -> String {
     text
 }
 
-/// 把 `adb` / `upgrade_tool` 这类名字或绝对路径解析为可执行文件绝对路径。
+/// Resolve a bare executable name (such as `adb` or `upgrade_tool`) or an explicit path into a
+/// concrete executable path.
 ///
-/// 裸名字只搜 PATH；Windows 仅接受无扩展名与 `.exe`（`.bat/.cmd` 需要 shell 解释，禁止）。
+/// Bare names search PATH only. On Windows, only extensionless binaries and `.exe` are accepted;
+/// `.bat`/`.cmd` scripts require a shell interpreter and are rejected.
 pub fn resolve_executable(spec: &str) -> DeviceResult<PathBuf> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
@@ -261,7 +269,7 @@ pub fn resolve_executable(spec: &str) -> DeviceResult<PathBuf> {
     if trimmed.len() > 2048 || trimmed.contains(['\r', '\n', '\0']) {
         return Err(DeviceError::Invalid("可执行文件路径非法".into()));
     }
-    // .bat/.cmd/.com 需要 shell 解释器，隐式 shell 违反 argv-only 边界
+    // `.bat`/`.cmd`/`.com` require a shell interpreter, which violates the argv-only boundary.
     let ext = PathBuf::from(trimmed)
         .extension()
         .map(|e| e.to_ascii_lowercase().to_string_lossy().to_string());
@@ -312,7 +320,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resolve_rejects_shell_interpreted_scripts() {
-        // 绝对路径形式的 .bat/.cmd 也必须拒绝（Windows 会隐式经 cmd 解释）
+        // Absolute `.bat`/`.cmd` paths must also be rejected (Windows runs them via cmd implicitly).
         let dir = std::env::temp_dir().join(format!("duthub-resolve-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bat = dir.join("tool.bat");

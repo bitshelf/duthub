@@ -1,9 +1,11 @@
-//! MCP HTTP 认证/授权/租约端到端（方案 N8；docs/SECURITY.md）：
-//! 401 统一拒绝 / 无授权 DUT 写拒绝（UNAUTHORIZED）/ 无租约写拒绝（LeaseRequired/Missing）/
-//! `过期租约写拒绝（LeaseRequired/LEASE_EXPIRED`）/ 有效租约流放行（归属 + generation）。
+//! MCP HTTP authentication, authorization, and lease end-to-end tests (N8; `docs/SECURITY.md`):
+//! uniform 401 rejection, unauthorized DUT write rejection (`UNAUTHORIZED`), missing lease
+//! rejection (`LeaseRequired/Missing`), expired lease rejection (`LeaseRequired/LEASE_EXPIRED`),
+//! and valid lease admission (holder ownership + generation fencing).
 //!
-//! 全内存构造（不落盘，坑 #25 e2e 红线）：AuthSvc 走真实 axum Router + 随机回环端口；
-//! 工具层直接调 `#[tool]` 方法（rmcp 提取器直接构造）。
+//! Constructed entirely in memory without disk writes: `AuthSvc` runs behind a real `axum`
+//! `Router` on an ephemeral loopback port, while tool-layer tests invoke `#[tool]` methods
+//! directly with `rmcp` extractors.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +24,8 @@ use duthub_mcp::state::{
     LeaseGrantDto, LogReadResult, McpState, ProcessResultDto, SerialBindInfo,
 };
 
-/// 记录型测试状态源：写工具记录收到的写身份；控制权四件套直连真实租约管理器
-/// （与 `RuntimeMcpState` 同逻辑）。
+/// Recording test state source: write tools record the received write identity, and
+/// the control-lease methods delegate to a real lease manager (matching `RuntimeMcpState`).
 struct RecordingState {
     lease: Arc<ControlLeaseManager>,
     approval: duthub_core::ApprovalManager,
@@ -65,6 +67,8 @@ fn map_grant(g: duthub_core::lease::LeaseGrant) -> LeaseGrantDto {
         generation: g.generation,
         expires_at_unix_ms: g.expires_at_unix_ms,
         holder: g.holder,
+        session_name: g.session_name,
+        acquired_at_unix_ms: g.acquired_at_unix_ms,
     }
 }
 
@@ -204,6 +208,24 @@ impl McpState for RecordingState {
             .map_err(|e| format!("LeaseRequired/DUT_BUSY: {}", e.message()))
     }
 
+    fn dut_acquire_control_with_session(
+        &self,
+        dut_id: &str,
+        holder: LeaseHolder,
+        session_name: &str,
+        wait_ms: u64,
+    ) -> Result<LeaseGrantDto, String> {
+        let wait = if wait_ms > 0 {
+            Some(Duration::from_millis(wait_ms))
+        } else {
+            None
+        };
+        self.lease
+            .acquire_with_session(dut_id, &holder, session_name, wait)
+            .map(map_grant)
+            .map_err(|e| format!("LeaseRequired/DUT_BUSY: {}", e.message()))
+    }
+
     fn dut_renew_control(&self, dut_id: &str, lease_id: &str) -> Result<LeaseGrantDto, String> {
         self.lease
             .renew(dut_id, lease_id)
@@ -229,6 +251,9 @@ impl McpState for RecordingState {
             dut_id: s.dut_id,
             state: state.into(),
             holder: s.holder,
+            session_name: s.session_name,
+            acquired_at_unix_ms: s.acquired_at_unix_ms,
+            occupied_secs: s.occupied_secs,
             remaining_secs: s.remaining_secs,
             generation: s.generation,
             queue_len: s.queue_len,
@@ -263,8 +288,9 @@ impl McpState for RecordingState {
     }
 }
 
-/// auth 开启 + dut-1 read/serialWrite 的运行时：cred-a（正常流）+ cred-x（同样
-/// 授权但非租约持有者——用于 [C] 归属复核测试）。返回 (ctx, cred-a token)。
+/// Runtime with auth enabled and `dut-1` `read`/`serialWrite` grants: `cred-a` (normal
+/// flow) plus `cred-x` (same grants, non-holder, for ownership verification). Returns
+/// `(ctx, cred-a token)`.
 fn access_ctx(auth_enabled: bool, ttl: Duration) -> (AccessContext, String) {
     let token = duthub_core::agent_access::generate_token();
     let intruder_token = duthub_core::agent_access::generate_token();
@@ -361,8 +387,8 @@ fn serial_write_retry_reuses_the_enqueue_receipt() {
     assert_eq!(state.writes.lock().unwrap().len(), 1);
 }
 
-/// 无授权 DUT 写拒绝：auth ON，凭据只授予 dut-1 → 写 dut-2 必须 UNAUTHORIZED，
-/// 且状态源不得收到写请求（[B] 闸门在前）。
+/// Unauthorized DUT write rejection: with auth ON and grants limited to `dut-1`, writing
+/// `dut-2` must return `UNAUTHORIZED` and must never reach the state source.
 #[test]
 fn unauthorized_dut_write_rejected() {
     let (ctx, _token) = access_ctx(true, Duration::from_secs(120));
@@ -383,11 +409,12 @@ fn unauthorized_dut_write_rejected() {
     );
     assert!(
         state.writes.lock().unwrap().is_empty(),
-        "未授权写不得到达状态源"
+        "unauthorized write must not reach the state source"
     );
 }
 
-/// 无租约写拒绝：auth ON + 已授权 DUT，但未携带 leaseId → LeaseRequired/Missing。
+/// Missing lease write rejection: with auth ON and an authorized DUT, omitting `leaseId`
+/// returns `LeaseRequired/Missing`.
 #[test]
 fn no_lease_write_rejected() {
     let (ctx, _token) = access_ctx(true, Duration::from_secs(120));
@@ -408,7 +435,8 @@ fn no_lease_write_rejected() {
     assert!(state.writes.lock().unwrap().is_empty());
 }
 
-/// 过期租约写拒绝：租约 TTL 到期后旧句柄 → LeaseRequired/LEASE_EXPIRED（INV-04 链）。
+/// Expired lease write rejection: using an old handle after TTL expiry returns
+/// `LeaseRequired/LEASE_EXPIRED` or `LeaseRequired/LEASE_UNKNOWN` (INV-04 chain).
 #[test]
 fn expired_lease_write_rejected() {
     let (ctx, _token) = access_ctx(true, Duration::from_millis(60));
@@ -429,8 +457,8 @@ fn expired_lease_write_rejected() {
         )
         .map(|_| ())
         .unwrap_err();
-    // TTL 到期后惰性回收 → 句柄已不存在（LEASE_UNKNOWN 与 renew 的 Expired 区分：
-    // 过期瞬间先 renew 得到明确的 Expired；此处句柄在复核前已被惰性清理）
+    // Lazy reclamation after TTL expiry removes the handle (unlike renew right at expiry,
+    // which returns Expired directly, verification sees LEASE_UNKNOWN after lazy cleanup).
     assert!(
         err.message.starts_with("LeaseRequired/LEASE_UNKNOWN"),
         "{}",
@@ -439,8 +467,8 @@ fn expired_lease_write_rejected() {
     assert!(state.writes.lock().unwrap().is_empty());
 }
 
-/// 有效租约流放行：acquire → 写（归属当前凭据 + generation 复核）→ release；
-/// 期间 GUI `侧（本地管理员）的另一个凭据不能使用该租约（NOT_HOLDER`）。
+/// Valid lease flow: acquire -> write (holder + generation check) -> release; another
+/// authorized credential cannot use the same lease (`NOT_HOLDER`).
 #[test]
 fn valid_lease_flow_admits_and_fences() {
     let (ctx, _token) = access_ctx(true, Duration::from_secs(120));
@@ -457,9 +485,9 @@ fn valid_lease_flow_admits_and_fences() {
         Parameters(write_args("dut-1", Some(&grant.lease_id))),
         CurrentPrincipal(agent_principal()),
     )
-    .expect("有效租约写必须放行");
+    .expect("valid lease write must succeed");
     let writes = state.writes.lock().unwrap();
-    let (dut, identity) = writes.last().expect("写已记录");
+    let (dut, identity) = writes.last().expect("write should be recorded");
     assert_eq!(dut, "dut-1");
     match identity {
         WriteIdentity::Agent {
@@ -469,13 +497,13 @@ fn valid_lease_flow_admits_and_fences() {
             assert_eq!(lease_id, &grant.lease_id);
             assert_eq!(
                 *expected_gen, grant.generation,
-                "generation 必须来自归属复核"
+                "generation must come from holder verification"
             );
         }
-        other => panic!("必须携带租约身份：{other:?}"),
+        other => panic!("Expected a lease identity: {other:?}"),
     }
     drop(writes);
-    // 他凭据（已授权但非租约持有者）持同一句柄 → NOT_HOLDER（租约归属当前凭据）
+    // Another credential (authorized but not the lease holder) using the same handle -> NOT_HOLDER.
     let other = Principal::Agent {
         agent_name: "intruder".into(),
         credential_id: "cred-x".into(),
@@ -494,8 +522,8 @@ fn valid_lease_flow_admits_and_fences() {
     );
 }
 
-/// auth 关闭（默认）兼容路径：无 leaseId + 有效 approvalToken → 状态源收到无租约写身份
-/// （device 层 GUI 优先复核仍生效，偏差 7 过渡语义）。
+/// Auth-off (default) compatibility path: no `leaseId` + valid `approvalToken` passes
+/// a lease-less write identity to the state source (GUI priority checks remain active).
 #[test]
 fn auth_off_transition_write_passes_without_lease() {
     let (ctx, _token) = access_ctx(false, Duration::from_secs(120));
@@ -511,7 +539,7 @@ fn auth_off_transition_write_passes_without_lease() {
         lease_id: None,
     };
     core.serial_write(Parameters(args), CurrentPrincipal(Principal::LocalAdmin))
-        .expect("auth 关：LocalAdmin 无租约写放行（过渡）");
+        .expect("auth off: LocalAdmin lease-less transition write should succeed");
     let writes = state.writes.lock().unwrap();
     assert!(matches!(
         writes.last().map(|(_, w)| w),
@@ -522,7 +550,8 @@ fn auth_off_transition_write_passes_without_lease() {
     ));
 }
 
-/// HTTP 层 401：auth ON 时无 Bearer / 错 Bearer 统一 401；auth 关闭放行到 rmcp。
+/// HTTP 401 handling: with auth ON, missing or wrong Bearer tokens return a uniform 401
+/// while a valid Bearer token passes through to `rmcp`.
 #[tokio::test]
 async fn http_bearer_401_and_pass_through() {
     let (ctx_on, good_token) = access_ctx(true, Duration::from_secs(120));
@@ -532,7 +561,7 @@ async fn http_bearer_401_and_pass_through() {
     );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    // tokio from_std 要求非阻塞（阻塞模式会卡死 current_thread runtime）
+    // tokio::net::TcpListener::from_std requires non-blocking mode to avoid stalling the runtime.
     listener.set_nonblocking(true).unwrap();
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -549,23 +578,23 @@ async fn http_bearer_401_and_pass_through() {
         }
     })
     .to_string();
-    // 无 Bearer → 统一 401（rmcp 未被触达）
+    // Missing Bearer -> uniform 401 (rmcp is not reached).
     let status = post_json(addr, None, &initialize_body).await;
-    assert_eq!(status, 401, "无 Bearer 必须 401");
-    // 错 Bearer → 统一 401，响应体固定 unauthorized
+    assert_eq!(status, 401, "missing Bearer must return 401");
+    // Wrong Bearer -> uniform 401 with fixed unauthorized body.
     let (status, body) = post_json_with_body(addr, Some("dth-wrong"), &initialize_body).await;
     assert_eq!(status, 401);
     assert!(body.contains("{\"error\":\"unauthorized\"}"), "{body}");
-    // 正确 Bearer → 放行（rmcp 处理 initialize，非 401 即认证层通过）
+    // Valid Bearer -> passes through to rmcp initialize (non-401 confirms auth succeeded).
     let (status, _) = post_json_with_body(addr, Some(&good_token), &initialize_body).await;
-    assert_ne!(status, 401, "有效 Bearer 必须放行（实际 {status}）");
+    assert_ne!(status, 401, "valid Bearer must pass through (got {status})");
     assert!(
         status == 200 || status == 202,
-        "initialize 应被 rmcp 接受（实际 {status}）"
+        "initialize should be accepted by rmcp (got {status})"
     );
 }
 
-/// 关闭远程接入时，回环 HTTP 也不得回退为本机管理员。
+/// With remote access disabled, loopback HTTP must not fall back to local admin.
 #[tokio::test]
 async fn http_auth_off_rejects_without_bearer() {
     let (ctx, _token) = access_ctx(false, Duration::from_secs(120));
@@ -575,7 +604,7 @@ async fn http_auth_off_rejects_without_bearer() {
     );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    // tokio from_std 要求非阻塞（阻塞模式会卡死 current_thread runtime）
+    // tokio::net::TcpListener::from_std requires non-blocking mode to avoid stalling the runtime.
     listener.set_nonblocking(true).unwrap();
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -593,7 +622,10 @@ async fn http_auth_off_rejects_without_bearer() {
     })
     .to_string();
     let (status, _) = post_json_with_body(addr, None, &initialize_body).await;
-    assert_eq!(status, 401, "关闭接入后 HTTP 必须拒绝");
+    assert_eq!(
+        status, 401,
+        "HTTP must reject requests when access is disabled"
+    );
 }
 
 #[tokio::test]
@@ -937,7 +969,8 @@ fn shared_token_cannot_reacquire_an_active_lease() {
     assert!(ctx.lease.acquire("dut-1", &other, None).is_ok());
 }
 
-/// 最小 HTTP/1.1 JSON-RPC 客户端（std `TcpStream` + tokio），返回状态码（与可选 body）。
+/// Minimal HTTP/1.1 JSON-RPC client (`std::net::TcpStream` + `tokio`), returning the
+/// status code (and optional body).
 async fn post_json(addr: std::net::SocketAddr, auth: Option<&str>, body: &str) -> u16 {
     post_json_with_body(addr, auth, body).await.0
 }
@@ -951,7 +984,7 @@ async fn post_json_with_body(
     let mut stream =
         tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
             .await
-            .expect("连接超时")
+            .expect("connect timeout")
             .unwrap();
     let auth_line = match auth {
         Some(t) => format!("Authorization: Bearer {t}\r\n"),
@@ -962,7 +995,7 @@ async fn post_json_with_body(
         body.len()
     );
     stream.write_all(req.as_bytes()).await.unwrap();
-    // 带超时读取：读到状态行即判（rmcp 会话端点可能不主动关流）
+    // Timed read: the status line is sufficient (rmcp session endpoints may keep the stream open).
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
     let raw = String::from_utf8_lossy(&buf).to_string();
@@ -977,7 +1010,7 @@ async fn post_json_with_body(
 
 #[test]
 fn json_helper_import_silence() {
-    // Json 构造器仅用于类型引用（避免未使用导入告警的占位断言）
+    // Reference the Json wrapper to silence unused-import warnings.
     let _ = Json(serde_json::json!({}));
 }
 
@@ -1106,8 +1139,9 @@ async fn dut_bound_listener_http_scope_and_default_dut() {
     task.abort();
 }
 
-/// `skill_export` 授权（W1 / T17）：零 grant 的 HTTP 凭据被拒绝，有任意 DUT
-/// read 授权的凭据可读；stdio `LocalAdmin` 的放行由 server 单测覆盖。
+/// `skill_export` authorization (W1 / T17): an HTTP credential with zero grants is
+/// rejected, a credential with any DUT read grant is allowed, and stdio `LocalAdmin`
+/// access is covered by `server` unit tests.
 #[tokio::test]
 async fn skill_export_requires_a_read_grant_over_http() {
     use rmcp::model::{CallToolRequestParams, ClientConfig};
@@ -1169,7 +1203,7 @@ async fn skill_export_requires_a_read_grant_over_http() {
     let error = denied
         .call_tool_once(CallToolRequestParams::new("skill_export"))
         .await
-        .expect_err("零 grant 必须拒绝 skill_export");
+        .expect_err("zero-grant credential must be rejected for skill_export");
     assert!(error.to_string().contains("UNAUTHORIZED"), "{error}");
     denied.cancel().await.ok();
 
@@ -1179,7 +1213,7 @@ async fn skill_export_requires_a_read_grant_over_http() {
     let response = allowed
         .call_tool_once(CallToolRequestParams::new("skill_export"))
         .await
-        .expect("read grant 可读 SKILL.md");
+        .expect("read grant can read SKILL.md");
     let rmcp::model::CallToolResponse::Complete(result) = response else {
         panic!("expected complete result");
     };

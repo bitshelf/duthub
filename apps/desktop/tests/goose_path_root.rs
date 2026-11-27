@@ -1,5 +1,5 @@
-//! W2 验收：`GOOSE_PATH_ROOT` 生效 —— 真实 goose 的 config/sessions 落在
-//! duthub 的每 DUT 目录，而不是用户主目录。
+//! W2 acceptance: `GOOSE_PATH_ROOT` takes effect — real goose config/sessions land inside
+//! duthub's per-DUT directory rather than the user's home directory.
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
@@ -164,7 +164,7 @@ fn fake_binding() -> GooseBinding {
 }
 
 // ---------------------------------------------------------------------------
-// Test goose fixture (2026-11-24: goose is downloaded, no longer embedded)
+// Test goose fixture (goose is downloaded, not embedded)
 // ---------------------------------------------------------------------------
 
 /// External-program definition that runs an installed goose through the same
@@ -178,7 +178,7 @@ fn test_goose_agent() -> Option<AgentDefinition> {
             let path = PathBuf::from(raw);
             assert!(
                 path.is_absolute() && path.is_file(),
-                "DUTHUB_TEST_GOOSE 必须是存在的 goose 可执行文件绝对路径: {}",
+                "DUTHUB_TEST_GOOSE must be an absolute path to an existing goose executable: {}",
                 path.display()
             );
             path
@@ -195,8 +195,8 @@ fn test_goose_agent() -> Option<AgentDefinition> {
 /// Loud skip: goose is no longer embedded, so ACP tests need an installed one.
 fn skip_without_goose() {
     eprintln!(
-        "SKIP: 未安装 goose（内嵌资产已于 2026-11-24 移除）——先在「工具下载」页下载 goose，\
-         或设置 DUTHUB_TEST_GOOSE 指向 goose 可执行文件"
+        "SKIP: goose is not installed (goose is no longer embedded) — \
+         download goose from Tool Downloads or set DUTHUB_TEST_GOOSE to the goose executable"
     );
 }
 
@@ -211,12 +211,12 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// `%APPDATA%\Block\goose` 的内容快照（只读；路径、长度、mtime）。
+/// Read-only snapshot of `%APPDATA%\Block\goose` (paths, lengths, mtimes).
 ///
-/// 用于「零写入对照」：同一份文件集合在同一时刻必须完全一致（含 mtime）。
+/// Used as a zero-write control: the exact same file set and mtimes must remain unchanged.
 #[derive(Debug, PartialEq, Eq)]
 struct AppDataSnapshot {
-    /// 目录本身是否存在（goose 即使只创建空目录也算写入）。
+    /// Whether the directory exists at all (even creating an empty directory counts as a write).
     present: bool,
     files: Vec<FileStamp>,
 }
@@ -231,7 +231,7 @@ struct FileStamp {
 fn appdata_goose_dir() -> PathBuf {
     PathBuf::from(
         std::env::var_os("APPDATA")
-            .expect("Windows 测试环境必须设置 APPDATA，否则无法做零写入对照"),
+            .expect("Windows test environment must define APPDATA for zero-write verification"),
     )
     .join("Block")
     .join("goose")
@@ -277,7 +277,7 @@ fn host_keeps_goose_state_under_goose_path_root() {
     };
     let work = temp_dir("root");
     let paths = sandbox::prepare(&work, "dut-root").unwrap();
-    // §5.2 gap 补齐：测试前后比较用户 goose 目录的文件集合/mtime。
+    // Section 5.2 gap check: compare user goose directory file set and mtimes before/after.
     let appdata_before = appdata_goose_snapshot();
     let events = Arc::new(Events::default());
     let mut host = HostManager::new(
@@ -298,13 +298,13 @@ fn host_keeps_goose_state_under_goose_path_root() {
     let view = host.view("dut-root").expect("view");
     assert!(
         ready,
-        "Host 未就绪：status={:?} stderr={} failed={:?}",
+        "Host did not become ready: status={:?} stderr={} failed={:?}",
         view.status(),
         view.stderr_tail(),
         events.failed.lock().unwrap()
     );
 
-    // GOOSE_PATH_ROOT 生效：config 与 sessions 都在 duthub 的每 DUT 目录下。
+    // GOOSE_PATH_ROOT takes effect: config and sessions stay under duthub's per-DUT directory.
     let managed = paths.goose_root.join("config").join("config.yaml");
     let config = std::fs::read_to_string(&managed).unwrap();
     assert!(config.contains("extensionmanager"));
@@ -317,17 +317,17 @@ fn host_keeps_goose_state_under_goose_path_root() {
         .join("sessions.db");
     assert!(
         wait_until(Duration::from_secs(20), || sessions_db.is_file()),
-        "goose 未在 GOOSE_PATH_ROOT 下创建 sessions.db: {}",
+        "goose did not create sessions.db under GOOSE_PATH_ROOT: {}",
         sessions_db.display()
     );
 
-    // session-id / transcript / sandbox 也都在该 DUT 目录下。
+    // session-id / transcript / sandbox also reside under this DUT's directory.
     let session_id_file = std::fs::read_to_string(&paths.session_id).unwrap();
     let session_id = view.session_id().expect("session id");
     assert_eq!(session_id_file.trim(), session_id);
     assert!(
         wait_until(Duration::from_secs(5), || paths.transcript.is_file()),
-        "transcript 未创建"
+        "transcript was not created"
     );
     assert!(paths.sandbox.is_dir());
     assert!(view.port().is_some_and(|port| port > 0));
@@ -347,7 +347,7 @@ fn host_keeps_goose_state_under_goose_path_root() {
     });
     assert!(
         stopped,
-        "stop 后未进入终止态：{:?} stderr={}",
+        "session did not reach terminal state after stop: {:?} stderr={}",
         host.view("dut-root").map(|view| view.status()),
         view.stderr_tail()
     );
@@ -355,15 +355,15 @@ fn host_keeps_goose_state_under_goose_path_root() {
         wait_until(Duration::from_secs(5), || {
             !events.exited.lock().unwrap().is_empty()
         }),
-        "on_exited 未回调"
+        "on_exited callback did not fire"
     );
     drop(host);
-    // 给收尾线程一个落盘窗口，再比较用户目录是否被写过。
+    // Give the cleanup thread a brief window to flush before comparing user AppData.
     std::thread::sleep(Duration::from_millis(500));
     let appdata_after = appdata_goose_snapshot();
     assert_eq!(
         appdata_after, appdata_before,
-        "goose 在 %APPDATA%\\Block\\goose 产生了写入（GOOSE_PATH_ROOT 未完全收敛）：before={appdata_before:?} after={appdata_after:?}"
+        "goose wrote to %APPDATA%\\Block\\goose (GOOSE_PATH_ROOT did not fully converge): before={appdata_before:?} after={appdata_after:?}"
     );
     let _ = std::fs::remove_dir_all(&work);
 }

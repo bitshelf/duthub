@@ -1,10 +1,9 @@
-//! 每会话 loopback MCP listener（W2）。
+//! For each session, configure the MCP listener to function as a loopback mechanism (W2).
 //!
-//! - `127.0.0.1:0` 临时端口，ID `session-<uuid>`，`listener_dut = Some(dut)`；
-//! - 注册到 [`AgentAccessRuntime`] 的 runtime overlay（不写 settings.json），
-//!   凭据只读该 DUT（`DutGrant { actions: [Read] }`）；
-//! - `AuthSvc` 按 listener id 是否属于 runtime overlay 选择 `authenticate_internal`；
-//! - 吊销只做内存删除 + 非阻塞 shutdown 信号（不 join UI 线程）。
+//! Bind an ephemeral port on `127.0.0.1:0`, derive ID `session-<uuid>`, and set `listener_dut =
+//! Some(dut)`. Keep the listener in the [`AgentAccessRuntime`] overlay and scope its credential to
+//! read access for that DUT. `AuthSvc` uses `authenticate_internal` for an overlay listener ID.
+//! Revocation removes the overlay entry and signals shutdown without joining on the UI thread.
 
 use std::fmt;
 use std::sync::Arc;
@@ -59,7 +58,7 @@ impl fmt::Display for ListenerError {
 
 impl std::error::Error for ListenerError {}
 
-/// 签发每会话 listener + 只读 Token。
+/// Issuing a token for each session listener and for read-only purposes.
 pub fn issue(
     state: Arc<dyn McpState>,
     access: Arc<AccessContext>,
@@ -127,7 +126,8 @@ pub fn issue(
     })
 }
 
-/// 吊销：先删 runtime overlay（立即 401），再丢弃句柄（发 shutdown 信号，不阻塞）。
+/// Revocation: First, remove the runtime overlay (trigger a 401 response immediately), then discard
+/// the handles (send a shutdown signal without causing any blocking situations).
 pub fn revoke(listener: SessionListener, auth: &AgentAccessRuntime) {
     let _ = auth.remove_runtime_listener(&listener.id);
     drop(listener);
@@ -135,7 +135,8 @@ pub fn revoke(listener: SessionListener, auth: &AgentAccessRuntime) {
 
 impl Drop for SessionListener {
     fn drop(&mut self) {
-        // 防止忘记 revoke 时 token 永久留在 overlay。
+        // To prevent forgetting, ensure that the token remains permanently stored in the overlay
+        // after revocation.
         let _ = self.auth.remove_runtime_listener(&self.id);
         if let Some(handle) = self.handle.take() {
             drop(handle);

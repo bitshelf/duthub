@@ -1,16 +1,17 @@
-//! 审计事件与 JSONL 落盘（`docs/SECURITY.md`）。
+//! Audit events and writing to disk in JSONL (`docs/SECURITY.md`).
 //!
-//! - 事件命名空间：`auth.ok/auth.fail`、`grant.deny`、`lease.acquire/renew/release/
-//!   expire/takeover/queue/cancel/protected.enter/protected.exit`、
-//!   `write.admit/write.deny`、`control.execute/control.deny`、`approval.issue/consume`。
-//! - 双通道：内存环（容量 1000，GUI 面板读取）+ 按日轮换 JSONL 文件
-//!   `<工作目录>/audit/agent-access-YYYYMMDD.jsonl`（权威落盘）。
-//! - **脱敏红线**：token/approval token/authorization 一律不落审计（含 detail
-//!   自由文本，写入前经 [`redact_detail`] `强制擦除）；lease_id` 是高熵句柄
-//!   （SPEC §6.3：句柄 ≠ 权限）允许记录。
-//! - **磁盘红线**：单日文件超过 [`MAX_AUDIT_FILE_BYTES`] 时轮转为新文件；
-//!   轮转到 [`MAX_AUDIT_ROTATIONS`] 后停止当日落盘（内存环照常工作），
-//!   避免长期运行的进程把审计目录写到磁盘耗尽。
+//! - Event namespace: `auth.ok`/`auth.fail`, `grant.deny`,
+//!   `lease.acquire`/`renew`/`release`/`expire`/`takeover`/`queue`/`cancel`/`protected.enter`/`protected.exit`,
+//!   `write.admit`/`write.deny`, `control.execute`/`control.deny`, `approval.issue`/`consume`.
+//! - Dual channel: in-memory ring buffer (capacity 1000, read by the GUI panel) plus daily rotated
+//!   JSONL files at `<workdir>/audit/agent-access-YYYYMMDD.jsonl` (authoritative on-disk record).
+//! - **Redaction boundary**: raw tokens, approval tokens, and `Authorization` values are never
+//!   written to audit logs (including free-text `detail`, which is scrubbed via [`redact_detail`]
+//!   before writing). `lease_id` is a high-entropy handle (SPEC §6.3: handle != permission) and is
+//!   permitted.
+//! - **Disk quota**: once a daily file exceeds [`MAX_AUDIT_FILE_BYTES`], it rotates to a new shard.
+//!   After [`MAX_AUDIT_ROTATIONS`] rotations, on-disk persistence pauses for the rest of the day
+//!   (while the in-memory ring keeps recording) so long-running processes cannot exhaust disk space.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -20,16 +21,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// 内存环容量（GUI 面板展示最近 200 条，环留余量）。
+/// Memory ring capacity (The GUI panel displays the last 200 items; there is also a buffer reserved
+/// for the ring).
 const RING_CAP: usize = 1000;
 
-/// 单个审计 JSONL 文件的字节上限（约 8 MiB）。
+/// The maximum size of a single audit JSONL file is 8 MiB.
 pub const MAX_AUDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// 单日最多轮转次数；达到上限后停止当日落盘（内存环不受影响）。
+/// The maximum number of rotations per day; writing to disk stops after reaching the limit (the
+/// memory ring is not affected).
 pub const MAX_AUDIT_ROTATIONS: u32 = 4;
 
-/// 审计结果类别。
+/// Categories of audit results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
@@ -49,29 +52,31 @@ impl AuditOutcome {
     }
 }
 
-/// 单条审计事件（JSONL 行形状，camelCase 与 settings 家族一致）。
+/// Individual audit events (in JSONL format, with camelCase naming conventions, consistent with the
+/// settings family).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEvent {
-    /// unix 毫秒时间戳
+    /// Unix milliseconds timestamp
     pub ts_unix_ms: u64,
-    /// 事件名（见模块注释命名空间）
+    /// Event name (see the module annotation namespace for details)
     pub action: String,
-    /// Agent 展示名（stdio 本地管理员为 `stdio-admin`，GUI 为 None）
+    /// Agent display name (for stdio clients, it is set to `stdio-admin`; for GUI clients, it is
+    /// set to `None`).
     pub agent: Option<String>,
-    /// 凭据稳定 id（非 token）
+    /// Stable credential ID (not a token)
     pub credential_id: Option<String>,
-    /// 目标 DUT（认证类事件为 None）
+    /// Target DUT (For authentication-related events, the value is "`None`").
     pub dut: Option<String>,
     pub result: AuditOutcome,
-    /// 自由文本摘要（写入前经脱敏）
+    /// Free text summary (sanitized before writing)
     pub detail: Option<String>,
 }
 
 impl AuditEvent {
     #[must_use]
     pub fn to_jsonl(&self) -> String {
-        // 单行压缩：jsonl 每行一个对象
+        // Single-line compression: jsonl allows one object per line.
         serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
     }
 }
@@ -83,12 +88,13 @@ pub fn unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// 脱敏自由文本：擦除敏感键后跟的值部分（大小写不敏感）。
+/// Masked Free Text: The value portion is erased after the sensitive keys are removed
+/// (case-insensitive).
 ///
-/// 键名先做归一化（小写、去掉 `_`/`-`），再看是否精确等于
-/// `authorization`/`bearer`，或以 `token`/`key`/`secret`/`password` 结尾。
-/// 这样 `access_token`、`api-key`、`clientSecret`、`approvalToken` 等变体
-/// 都会命中；`lease_id`、`credential_id` 等非敏感键保持原样（句柄 ≠ 权限）。
+/// Normalize keys by lowercasing them and removing underscores and hyphens. Redact exact
+/// authorization and bearer keys and keys ending in token, key, secret, or password. This catches
+/// `access_token`, api-key, clientSecret, and approvalToken while preserving `lease_id` and
+/// `credential_id`.
 #[must_use]
 pub fn redact_detail(text: &str) -> String {
     let mut cut_ranges: Vec<(usize, usize)> = Vec::new();
@@ -107,7 +113,7 @@ pub fn redact_detail(text: &str) -> String {
     let mut cursor = 0;
     for (s, e) in cut_ranges {
         if s < cursor {
-            continue; // 与上一段重叠（同值多键命中）
+            continue; // Overlaps with the previous section (multiple keys with the same value were hit)
         }
         out.push_str(&text[cursor..s]);
         out.push_str("[REDACTED]");
@@ -117,7 +123,8 @@ pub fn redact_detail(text: &str) -> String {
     out
 }
 
-/// 扫描文本中的键候选：连续的 ASCII 字母数字、`_`、`-`。
+/// Scanning for key candidates in the text: consecutive ASCII letters and numbers, underscores,
+/// hyphens.
 fn key_candidates(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut candidates = Vec::new();
@@ -140,7 +147,8 @@ fn key_candidates(text: &str) -> Vec<(usize, usize)> {
     candidates
 }
 
-/// 键名归一化后判定是否敏感（`Authorization`/`Bearer` 或后缀匹配）。
+/// Determine whether the key names are sensitive after normalization (based on matching
+/// `Authorization`/`Bearer` or suffix).
 fn is_sensitive_key(key: &str) -> bool {
     let normalized: String = key
         .chars()
@@ -153,9 +161,11 @@ fn is_sensitive_key(key: &str) -> bool {
             .any(|suffix| normalized.ends_with(suffix))
 }
 
-/// 给定键结束位置，定位"分隔符 + 引号 + 值"的值区段（字节索引，按 UTF-8 边界）。
-/// 分隔符形态：`key=value` / `key: value` / JSON `"key":"value"`（闭引号在分隔符前）/
-/// `key value`（Bearer 头风格，空格即分隔）。
+/// Locate the value segment consisting of "separator + quotation marks + value", based on the given
+/// key end position (byte index, according to UTF-8 boundaries).
+/// Separator formats: `key=value`, `key:value`, or JSON format `"key":"value""` (closed quotation
+/// marks precede the separator).
+/// Format: `key value` (Bearer header style; spaces indicate separation).
 fn value_range(text: &str, key_end: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut i = key_end;
@@ -164,26 +174,29 @@ fn value_range(text: &str, key_end: usize) -> Option<(usize, usize)> {
         saw_space = true;
         i += 1;
     }
-    if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-        // JSON 键的闭引号：其后必须是 = 或 :
-        i += 1;
-        while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+    match bytes.get(i).copied() {
+        Some(b'"' | b'\'') => {
+            // JSON keys end with a closing quote followed by `=` or `:`.
             i += 1;
-        }
-        if i >= bytes.len() || (bytes[i] != b'=' && bytes[i] != b':') {
-            return None;
-        }
-        i += 1;
-        while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if !matches!(bytes.get(i), Some(b'=' | b':')) {
+                return None;
+            }
             i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
         }
-    } else if i < bytes.len() && (bytes[i] == b'=' || bytes[i] == b':') {
-        i += 1;
-        while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+        Some(b'=' | b':') => {
             i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
         }
-    } else if !saw_space {
-        return None;
+        _ if saw_space => {}
+        _ => return None,
     }
     let mut value_start = i;
     let quoted = i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'');
@@ -210,11 +223,13 @@ fn value_range(text: &str, key_end: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// 审计接收端：内存环 + 按日 JSONL 文件（`dir` 为 None 时仅内存环，测试用）。
+/// Audit receiving endpoint: Memory ring + daily JSONL files. When `dir` is `None`, only a memory
+/// ring is used; this is for testing purposes.
 pub struct AuditSink {
     ring: Mutex<VecDeque<AuditEvent>>,
     dir: Option<PathBuf>,
-    /// 已打开的当日文件句柄缓存（键 = YYYYMMDD）；跨日或超限时轮换重开。
+    /// The cache of current day's file handles is already open (key = YYYYMMDD). If the cache needs
+    /// to be recreated across days or beyond the allowed limit, it will be done accordingly.
     day_file: Mutex<Option<DayFile>>,
 }
 
@@ -226,24 +241,27 @@ impl std::fmt::Debug for AuditSink {
     }
 }
 
-/// 当日审计文件状态（字节计数驱动轮转，句柄为 `None` 表示已停写）。
+/// Audit file status on that day (Byte count-driven rotation; handles marked as `None` indicate
+/// that writing has stopped).
 struct DayFile {
     day: String,
     file: Option<std::fs::File>,
     bytes: u64,
     rotations: u32,
-    /// 达到轮转上限或写失败后停止当日落盘，避免无限增长。
+    /// Stop writing to disk when the maximum number of rotations is reached or the write operation
+    /// fails, to prevent unlimited growth.
     stopped: bool,
 }
 
 impl DayFile {
-    /// 关闭当前句柄，把当日文件改名为 `agent-access-YYYYMMDD.rN.jsonl`，
-    /// 再新建空文件继续写。失败时停止当日落盘（不越过体积上限）。
+    /// Close the current handle, rename the file for that day to `agent-access-YYYYMMDD.rN.jsonl`,
+    /// and create a new empty file to continue writing. If there is a failure, stop writing the
+    /// file for that day (without exceeding the volume limit).
     fn rotate(&mut self, dir: &Path) -> Result<(), String> {
         if self.rotations >= MAX_AUDIT_ROTATIONS {
             self.stopped = true;
             return Err(format!(
-                "审计文件达到轮转上限 {MAX_AUDIT_ROTATIONS}，停止当日落盘"
+                "Audit file reached rotation limit ({MAX_AUDIT_ROTATIONS}); stopping disk persistence for today"
             ));
         }
         let base = dir.join(format!("agent-access-{}.jsonl", self.day));
@@ -255,11 +273,11 @@ impl DayFile {
         if let Some(file) = self.file.take() {
             let _ = file.sync_all();
         }
-        // Windows 要求先关闭句柄再改名。
+        // Windows requires that the handle be closed before the name is changed.
         if let Err(err) = std::fs::rename(&base, &rotated) {
             self.stopped = true;
             return Err(format!(
-                "审计文件轮转失败 {} -> {}: {err}",
+                "Failed to rotate audit file {} -> {}: {err}",
                 base.display(),
                 rotated.display()
             ));
@@ -277,21 +295,26 @@ impl DayFile {
             }
             Err(err) => {
                 self.stopped = true;
-                Err(format!("轮转后审计文件打开失败 {}: {err}", base.display()))
+                Err(format!(
+                    "Failed to open rotated audit file {}: {err}",
+                    base.display()
+                ))
             }
         }
     }
 }
 
-/// 打开当日文件并统计已存在的轮转分片数（进程重启后仍能延续上限）。
+/// Open the files for that day and count the number of existing round-robin slices available (the
+/// limit can be maintained even after the process is restarted).
 fn open_day_file(dir: &Path, day: &str) -> Result<DayFile, String> {
-    std::fs::create_dir_all(dir).map_err(|err| format!("审计目录创建失败: {err}"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|err| format!("Failed to create audit directory: {err}"))?;
     let path = dir.join(format!("agent-access-{day}.jsonl"));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .map_err(|err| format!("审计文件打开失败 {}: {err}", path.display()))?;
+        .map_err(|err| format!("Failed to open audit file {}: {err}", path.display()))?;
     let bytes = file.metadata().map_or(0, |meta| meta.len());
     Ok(DayFile {
         day: day.to_string(),
@@ -302,25 +325,24 @@ fn open_day_file(dir: &Path, day: &str) -> Result<DayFile, String> {
     })
 }
 
-/// 统计 `agent-access-YYYYMMDD.rN.jsonl` 分片数量。
+/// Count the number of shards in the `agent-access-YYYYMMDD.rN.jsonl` file.
 fn count_rotations(dir: &Path, day: &str) -> u32 {
     let prefix = format!("agent-access-{day}.r");
-    std::fs::read_dir(dir)
-        .map_or(0, |entries| {
-            let count = entries
-                .flatten()
-                .filter(|entry| {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    name.starts_with(&prefix) && name.ends_with(".jsonl")
-                })
-                .count();
-            u32::try_from(count).unwrap_or(u32::MAX)
-        })
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        let count = entries
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".jsonl")
+            })
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    })
 }
 
 impl AuditSink {
-    /// 内存环模式（测试 / 无工作目录场景）。
+    /// Memory ring mode (testing / scenario without a working directory).
     #[must_use]
     pub fn memory() -> Arc<Self> {
         Arc::new(Self {
@@ -330,7 +352,8 @@ impl AuditSink {
         })
     }
 
-    /// 落盘模式：`<dir>/agent-access-YYYYMMDD.jsonl` 按日轮换（目录即工作目录 `audit/`）。
+    /// Write to Disk Mode: `<dir>/agent-access-YYYYMMDD.jsonl` rotates daily (the directory is the
+    /// working directory `audit/`).
     #[must_use]
     pub fn at_dir(dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
@@ -340,8 +363,9 @@ impl AuditSink {
         })
     }
 
-    /// 记录一条审计事件（脱敏 → 内存环 → tracing → 文件）。全程 best-effort：
-    /// 审计失败不阻断业务操作，仅 `tracing::warn`。
+    /// Record an audit event (masking → memory ring → tracing → file). All operations are performed
+    /// in best-effort mode. Audit failures do not interrupt normal operations; only `tracing::warn`
+    /// messages are generated.
     pub fn record(
         &self,
         action: &str,
@@ -408,19 +432,20 @@ impl AuditSink {
         if state.bytes.saturating_add(line_bytes) > MAX_AUDIT_FILE_BYTES {
             // A single event larger than the cap would defeat the limit.
             state.stopped = true;
-            tracing::warn!(target: "audit", "单条审计事件超过文件上限，停止当日落盘");
+            tracing::warn!(target: "audit", "Audit entry exceeds the file limit. Stopping audit persistence for today");
             return;
         }
         if let Some(file) = state.file.as_mut() {
             if let Err(err) = file.write_all(line.as_bytes()) {
-                tracing::warn!(target: "audit", "审计写入失败: {err}");
+                tracing::warn!(target: "audit", "Failed to write audit record: {err}");
                 return;
             }
             state.bytes += line_bytes;
         }
     }
 
-    /// 内存环最近 `limit` 条（时间升序，GUI 面板数据源）。
+    /// The memory ring has recently processed `limit` items (sorted in ascending order, based on
+    /// the data source from the GUI panel).
     pub fn recent(&self, limit: usize) -> Vec<AuditEvent> {
         let ring = crate::util::lock_unpoisoned(&self.ring);
         ring.iter().rev().take(limit).rev().cloned().collect()
@@ -428,7 +453,7 @@ impl AuditSink {
 }
 
 fn day_key(ts_unix_ms: u64) -> String {
-    // 天数 → YYYYMMDD（civil from days 算法，无 chrono 依赖）
+    // Number of Days → YYYYMMDD (Based on the "from days" algorithm; no dependency on chrono)
     let days = i64::try_from(ts_unix_ms / 86_400_000).unwrap_or(i64::MAX);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -451,29 +476,31 @@ mod tests {
     fn redact_plain_and_json_and_bearer_forms() {
         assert_eq!(redact_detail("token=abc123"), "token=[REDACTED]");
         assert_eq!(redact_detail("token: abc123"), "token: [REDACTED]");
-        // JSON 形态：键的闭引号在分隔符之前；值引号保留，内容替换
+        // JSON format: Quoted keys should be placed before the separator; quoted values remain
+        // unchanged, and the content is replaced accordingly.
         assert_eq!(
             redact_detail(r#"{"approvalToken":"apr-xyz","dut":"d1"}"#),
             r#"{"approvalToken":"[REDACTED]","dut":"d1"}"#
         );
-        // authorization 与 bearer 双重命中（纵深防御）
+        // Dual hits in authorization and bearer fields (deep defense mechanism)
         assert_eq!(
             redact_detail("Authorization: Bearer sk-live-999"),
             "Authorization: [REDACTED] [REDACTED]"
         );
-        // 大小写不敏感
+        // Case-insensitivity
         assert_eq!(redact_detail("TOKEN = leak"), "TOKEN = [REDACTED]");
-        // lease_id 允许保留（句柄 ≠ 权限）
+        // lease_id allows retention (handle ≠ permissions)
         assert_eq!(
             redact_detail("lease=lease-abc token=zzz"),
             "lease=lease-abc token=[REDACTED]"
         );
-        // 词边界：非该键的组合不应误伤
+        // Word boundaries: Combinations that do not involve this key should not be mistakenly
+        // damaged.
         assert_eq!(
             redact_detail("credential_id=cred-1"),
             "credential_id=cred-1"
         );
-        // 末尾无分隔符
+        // There is no separator at the end.
         assert_eq!(redact_detail("use token p0"), "use token [REDACTED]");
     }
 
@@ -500,19 +527,26 @@ mod tests {
         );
         let day = day_key(unix_ms());
         let path = dir.join(format!("agent-access-{day}.jsonl"));
-        let raw = std::fs::read_to_string(&path).expect("jsonl 应落盘");
-        assert!(!raw.contains("super-secret"), "token 绝不能落盘: {raw}");
-        assert!(raw.contains("lease-1"), "lease_id 允许记录");
+        let raw = std::fs::read_to_string(&path).expect("The jsonl should be written to disk.");
+        assert!(
+            !raw.contains("super-secret"),
+            "The token must never be written to disk: {raw}"
+        );
+        assert!(
+            raw.contains("lease-1"),
+            "lease_id allows recording of records"
+        );
         let mut lines = raw.lines();
-        let first: AuditEvent =
-            serde_json::from_str(lines.next().unwrap()).expect("首行应为合法 JSONL");
+        let first: AuditEvent = serde_json::from_str(lines.next().unwrap())
+            .expect("The first line should contain valid JSONL format data.");
         assert_eq!(first.action, "auth.fail");
         assert_eq!(first.result, AuditOutcome::Denied);
-        // bearer + token 双重命中：值整体被擦（第一个命中吞掉后续，重叠跳过）——
-        // 判定标准是「super-secret 不出现在任何落盘字节里」
+        // Double hit of bearer + token: The entire value is erased (the first hit erases the
+        // subsequent ones, with overlapping skipped)—The criterion for determination is that
+        // "super-secret does not appear in any bytes written to disk."
         assert_eq!(first.detail.as_deref(), Some("bearer [REDACTED]"));
-        let second: AuditEvent =
-            serde_json::from_str(lines.next().unwrap()).expect("次行应为合法 JSONL");
+        let second: AuditEvent = serde_json::from_str(lines.next().unwrap())
+            .expect("The next line should contain valid JSONL data.");
         assert_eq!(second.agent.as_deref(), Some("claude"));
         assert_eq!(second.credential_id.as_deref(), Some("cred-claude"));
         std::fs::remove_dir_all(&dir).ok();
@@ -533,7 +567,7 @@ mod tests {
         }
         let recent = sink.recent(3);
         assert_eq!(recent.len(), 3);
-        // 最近三条：dut-RING_CAP+47/48/49（时间升序）
+        // Recent three items: dut-RING_CAP+47/48/49 (sorted in ascending order by time)
         assert_eq!(
             recent[2].dut.as_deref(),
             Some(format!("dut-{}", RING_CAP + 49).as_str())
@@ -542,7 +576,7 @@ mod tests {
             recent[0].dut.as_deref(),
             Some(format!("dut-{}", RING_CAP + 47).as_str())
         );
-        // 环封顶不无限增长
+        // The number of rings cannot grow indefinitely.
         assert_eq!(sink.recent(usize::MAX).len(), RING_CAP);
     }
 

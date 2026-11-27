@@ -77,8 +77,14 @@ fn every_presentation_has_one_route() {
 
 #[test]
 fn dialog_and_queue_never_emit_tray_actions() {
-    assert_eq!(alert_actions(AlertPresentation::InAppDialog, 3), [] as [duthub_desktop::tray_lifecycle::LifecycleAction; 0]);
-    assert_eq!(alert_actions(AlertPresentation::QueueOnly, 3), [] as [duthub_desktop::tray_lifecycle::LifecycleAction; 0]);
+    assert_eq!(
+        alert_actions(AlertPresentation::InAppDialog, 3),
+        [] as [duthub_desktop::tray_lifecycle::LifecycleAction; 0]
+    );
+    assert_eq!(
+        alert_actions(AlertPresentation::QueueOnly, 3),
+        [] as [duthub_desktop::tray_lifecycle::LifecycleAction; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------

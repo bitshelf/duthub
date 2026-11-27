@@ -1,28 +1,28 @@
-﻿# duthub 发布门（本地 / CI 可复跑）
+# Run the duthub release gate locally or in CI.
 #
-# goose 自 2026-11-25 起改为下载分发（ADR-3 §9），本脚本的断言随之改写：
-#   1. goose 不得再内嵌：apps/desktop/assets/goose/ 不存在、bundle.rs 不编译资产、
-#      dist/ 不携带 goose 可执行文件、不再旁附内嵌口径的 LICENSE/NOTICE/manifest；
-#   2. 下载分发契约仍在：duthub-tooldown 的 TOOL_GOOSE spec（https URL + sha256 口径）、
-#      安装内核的 pin 强制与 checksumVerified 记录、registry 的启动前复算；
-#   3. 许可与来源说明仍在：根 NOTICE 的 goose 段、goose-distribution.md、ADR-3 §9；
-#   4. duthub.exe 必须已通过 Authenticode 验证（未签名/证书无效即失败）；
-#      非发布构建（-AllowUnsigned，main push 没有签名证书）降为 warning，并由
-#      发布说明如实记录 Authenticode 状态；tag 发布不传该开关，仍 fail-closed；
-#   5. 发布物旁附 dist/licenses/goose/PROVENANCE.md（与仓库源文件逐字节一致），
-#      duthub 的 LICENSE/NOTICE 同样逐字节一致，旧口径的 goose 声明不得残留；
-#   6. SBOM（CycloneDX 1.7）与 duthub 的 cargo-audit JSON 存在且无漏洞，且 cargo-audit
-#      退出码为 0（workflow 把 $LASTEXITCODE 写入 audit-exit 文件；退出码非 0 说明审计
-#      失败或发现漏洞，与 JSON 内容独立判定）；goose 运行时依赖审计 = 显式 UNVERIFIED
-#      占位：duthub 不再分发 goose，无法审计其依赖树；workflow 必须写
-#      dist/sbom/goose-audit-status.txt（以 UNVERIFIED 开头），本脚本断言该文件存在
-#      （防止检查被静默删除）。若 owner 另行提供上游 Cargo.lock 的审计结果，则必须
-#      干净且退出码 0；
-#   7. 生成 dist/SHA256SUMS；
-#   8. 生成 dist/RELEASE_NOTES.md。
+# ADR-3 §9 moved goose to download-only distribution on 2026-11-25.
+#   Require no bundled assets in apps/desktop/assets/goose or bundle.rs.
+#      Require no goose executable or legacy bundled-license files under dist.
+#   Preserve the duthub-tooldown TOOL_GOOSE definition, HTTPS URL, and SHA-256 policy.
+#      Check installation pin enforcement, checksumVerified, and launch-time hashing.
+#   Preserve the goose section of NOTICE, goose-distribution.md, and ADR-3 §9.
+#   Require valid Authenticode on duthub.exe unless unsigned builds are explicitly allowed.
+#      Push builds without a signing certificate can pass -AllowUnsigned and report a warning.
+#      Release notes report the actual status. Tagged builds require successful verification.
+#   Ship dist/licenses/goose/PROVENANCE.md byte-for-byte from the repository.
+#      Also verify LICENSE and NOTICE and reject obsolete bundled-goose notices.
+#   Require a CycloneDX 1.7 SBOM and a clean duthub cargo-audit JSON report.
+#      Check cargo-audit's exit code separately. The workflow records it in the exit file.
+#      A nonzero exit means findings or an audit error. Downloaded goose is marked UNVERIFIED.
+#      The repository does not distribute goose or maintain its runtime dependency tree.
+#      Require the workflow's dist/sbom/goose-audit-status.txt with the UNVERIFIED prefix.
+#      When an audit of the upstream Cargo.lock is provided, check its report and exit code.
+#      A supplied upstream audit must be clean and return zero.
+#   Generate dist/SHA256SUMS.
+#   Generate dist/RELEASE_NOTES.md.
 #
-# 失败一律 exit 1；脚本只打印文件路径、哈希与签名状态，不读取或打印任何 Token。
-# 依赖社区工具：cargo-cyclonedx / cargo-audit / PowerShell Get-AuthenticodeSignature。
+# Fail with exit code 1. Output is limited to artifact paths, hashes, and signature state.
+# Use cargo-cyclonedx, cargo-audit, and PowerShell Get-AuthenticodeSignature.
 
 [CmdletBinding()]
 param(
@@ -197,10 +197,10 @@ if ($null -eq $notes) { $notes = Join-Path $dist 'RELEASE_NOTES.md' }
 
 Write-Host "release gate: repo=$repo dist=$dist forbidden-goose=$embeddedGoose spec=$specFile"
 
-# --- 1. goose 不再内嵌：目录/源文件/发布物三处都不得出现 goose 字节 -----------
-# 防的是：内嵌资产被悄悄加回仓库或构建——那会绕过「下载安装 + 安装 manifest 记录实测
-# sha256 + 启动前复算」的链路，并让 ADR-3 §9 的许可/来源口径失效。Rust 侧有契约测试
-# apps/desktop/tests/agent_host.rs::embedded_goose_assets_are_gone；这里是发布门的独立复验。
+# 1. Reject bundled goose artifacts in the repository, source, and release output.
+# Reintroducing a bundled binary would bypass the download and install manifest.
+# It would also skip launch-time hashing and invalidate the distribution policy.
+# The agent_host embedded_goose_assets_are_gone test checks the same rule independently.
 if (Test-Path -LiteralPath $embeddedGoose) {
     Stop-Gate "apps/desktop/assets/goose 仍存在：goose 已改为下载分发（ADR-3 §9），不得再随仓库/构建内嵌 goose 二进制或声明文件。若确需恢复内嵌，必须先改 ADR-3、补回上游 Cargo.lock 审计并重新签字。"
 }
@@ -224,8 +224,8 @@ foreach ($name in @('goose-acp.exe', 'goose.exe', 'goose-x86_64-pc-windows-msvc.
     }
 }
 
-# 防的是：bundle.rs 重新 include_bytes!/include_str! 一个资产（目录检查被绕过），
-# 或应用内许可页重新宣称「已内嵌」而仓库实际没有内嵌。
+# Catch include_bytes! or include_str! embedding even if the asset directory check passes.
+# Check that the in-app licenses page describes the actual distribution.
 $bundlePath = Join-Path $repo 'apps\desktop\src\agent_host\bundle.rs'
 Assert-NonEmptyFile $bundlePath 'goose 兼容面 bundle.rs'
 $bundleText = Get-Content -LiteralPath $bundlePath -Raw -Encoding UTF8
@@ -240,9 +240,9 @@ if (-not $versionMatch.Success) {
 }
 $gooseVersion = $versionMatch.Groups['version'].Value
 
-# --- 2. duthub-tooldown 的 goose spec 与安装契约 -------------------------------
-# 防的是：下载分发契约被删/被改坏——spec 消失 = 工具下载页装不到 goose；
-# URL 换了未知主机 = 安装来源漂移；sha256 口径被抹掉 = 无人能说明下载的字节是什么。
+# 2. Check the duthub-tooldown definition and installation contract.
+# The tool download page requires the goose definition.
+# Verify the download host and retain the SHA-256 policy for the artifact.
 Assert-NonEmptyFile $specFile 'duthub-tooldown spec.rs'
 $specText = Get-Content -LiteralPath $specFile -Raw -Encoding UTF8
 $specMatch = [regex]::Match($specText, '(?ms)(?<block>(?:///[^\r\n]*\r?\n)+pub const TOOL_GOOSE: ToolSpec = ToolSpec \{.*?\r?\n\};)')
@@ -265,9 +265,9 @@ if ($specText -notmatch '(?ms)pub fn builtin_specs\(\).*?&TOOL_GOOSE') {
     Stop-Gate "TOOL_GOOSE 未登记进 builtin_specs()：spec 存在但工具下载页不会安装它"
 }
 
-# sha256 口径：pinned_sha256 必须显式写 Some("<64 hex>") 或 None。None（滚动 latest
-# 资产不固定）是当前选择，但此时 spec 注释必须记录一次实测 sha256（64 位 hex）并说明
-# 不固定 pin 的理由——否则「未验证下载」连可复核的基准都没有。
+# pinned_sha256 must explicitly be Some("<64 hex>") or None.
+# With rolling latest assets, None requires a recorded 64-digit SHA-256 reference
+# and a reason the moving download is unpinned.
 $pinMatch = [regex]::Match($gooseSpec, 'pinned_sha256:\s*(?<value>Some\("(?<hex>[0-9a-fA-F]{64})"\)|None)')
 if (-not $pinMatch.Success) {
     Stop-Gate 'TOOL_GOOSE 必须显式声明 pinned_sha256: Some("<64 hex>") 或 None'
@@ -284,8 +284,8 @@ if ($pinMatch.Groups['value'].Value -eq 'None') {
     Write-Host "goose spec: pinned_sha256 = $($pinMatch.Groups['hex'].Value)"
 }
 
-# 防的是：安装内核丢掉 pin 强制或把未固定下载伪装成已验证。前者让未来重新 pin 时
-# 不再拦截篡改，后者会让安装 manifest 谎称 checksumVerified。
+# Check that the installer enforces configured pins and reports verification accurately.
+# An unpinned download must report checksumVerified as false.
 $installPath = Join-Path $repo 'crates\duthub-tooldown\src\install.rs'
 Assert-NonEmptyFile $installPath 'tooldown 安装内核 install.rs'
 $installText = Get-Content -LiteralPath $installPath -Raw -Encoding UTF8
@@ -293,7 +293,7 @@ Assert-Contains $installPath $installText 'ChecksumMismatch' '安装内核必须
 Assert-Contains $installPath $installText 'if let Some(pin) = spec.pinned_sha256' '安装内核必须执行 spec 的 pin'
 Assert-Contains $installPath $installText 'checksum_verified: spec.pinned_sha256.is_some()' '安装 manifest 必须把未固定下载记为未验证'
 
-# 防的是：桌面启动链不再复算已下载 bytes，或「未安装」不再是可展示状态。
+# Check that desktop startup hashes the installed bytes and reports a missing install.
 $registryPath = Join-Path $repo 'apps\desktop\src\agent_host\registry.rs'
 Assert-NonEmptyFile $registryPath 'goose 解析链 registry.rs'
 $registryText = Get-Content -LiteralPath $registryPath -Raw -Encoding UTF8
@@ -301,9 +301,9 @@ Assert-Contains $registryPath $registryText 'verify_downloaded_goose' '解析链
 Assert-Contains $registryPath $registryText 'goose_install_state' '解析链必须上报 NotInstalled 供 UI 引导下载'
 Assert-Contains $registryPath $registryText 'pub const MIN_GOOSE_VERSION: &str = bundle::GOOSE_VERSION;' '版本门槛必须复用 bundle::GOOSE_VERSION（防止 UI 与启动门漂移）'
 
-# --- 3. 许可与来源说明仍在 ------------------------------------------------------
-# 防的是：goose 不再内嵌后，许可/来源说明被「顺手删掉」——发行包里没有任何一句说明
-# goose 从哪来、什么许可、校验到什么程度。三条文案必须与代码里的 spec/版本门槛一致。
+# 3. Verify licensing and provenance.
+# Keep the download source, license, and verification policy documented after unbundling.
+# The three disclosures must agree with the tool definition and version requirement.
 $noticePath = Join-Path $repo 'NOTICE'
 Assert-NonEmptyFile $noticePath 'duthub NOTICE'
 $noticeText = Get-Content -LiteralPath $noticePath -Raw -Encoding UTF8
@@ -312,8 +312,8 @@ Assert-Contains $noticePath $noticeText 'https://github.com/aaif-goose/goose' 'N
 Assert-Contains $noticePath $noticeText 'Apache' 'NOTICE 必须写明 goose 的 Apache 许可'
 Assert-Contains $noticePath $noticeText 'does not bundle' 'NOTICE 必须明确 duthub 不捆绑 goose'
 Assert-Contains $noticePath $noticeText 'checksumVerified: false' 'NOTICE 必须说明未固定校验的语义'
-# 防的是：NOTICE 回退成「duthub embeds/redistributes goose」的旧陈述——新发布物里没有
-# goose 字节，这种声明属于虚假陈述。
+# Reject obsolete NOTICE text claiming that duthub embeds or redistributes goose.
+# The release excludes goose executables.
 Assert-NotContains $noticePath $noticeText 'duthub embeds' 'NOTICE 不得再宣称内嵌/再分发 goose'
 Assert-NotContains $noticePath $noticeText 'Bundled third-party component' 'NOTICE 不得再宣称捆绑 goose'
 
@@ -332,7 +332,7 @@ $adrText = Get-Content -LiteralPath $adrPath -Raw -Encoding UTF8
 Assert-Contains $adrPath $adrText '2026-11-25 改为下载分发' 'ADR-3 必须保留下载分发章节（取代内嵌资产口径）'
 Write-Host "goose distribution contract ok: url=$gooseUrl version>=$gooseVersion"
 
-# --- 4. Authenticode（社区工具，不自写签名链解析） ------------------------------
+# 4. Verify Authenticode with the system tooling.
 if (-not (Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue)) {
     Stop-Gate "Get-AuthenticodeSignature 不可用；请在 Windows PowerShell/pwsh 上运行发布门"
 }
@@ -356,14 +356,14 @@ if ($null -ne $duthubSignature.SignerCertificate) {
     Write-Host "duthub.exe signer: $($duthubSignature.SignerCertificate.Subject)"
 }
 
-# goose 不再随发布物分发，因此这里没有「goose 签名状态」可断言。发布说明与来源说明
-# 不得对未验证的程序宣称 NotSigned（那是伪造结论）；bundle.rs 的
-# authenticode_status() 返回「未内置（随上游发行包）」由该文件的断言与 Rust 单测覆盖。
+# The release excludes goose, so its signing status is unverified here.
+# Use an upstream distribution statement instead of reporting NotSigned.
+# bundle.rs and its Rust tests verify the upstream distribution status wording.
 
-# --- 5. 发布物旁附声明 ----------------------------------------------------------
-# 防的是：发布包只带 exe、不带任何许可/来源说明；或旁附的 PROVENANCE 与仓库源不一致
-# （发布物里说一套、仓库里写一套）。旧口径的 goose LICENSE/NOTICE/manifest 不得残留，
-# 否则等于继续宣称「随包分发 goose」。
+# 5. Verify notices delivered with the release.
+# Require the release package to include the notices and provenance.
+# The bundled provenance must match the repository source byte for byte.
+# Reject obsolete files that claim goose is part of the package.
 $duthubLicenseOut = Join-Path $dist 'licenses\duthub\LICENSE'
 $duthubNoticeOut = Join-Path $dist 'licenses\duthub\NOTICE'
 $gooseProvenanceOut = Join-Path $dist 'licenses\goose\PROVENANCE.md'
@@ -377,7 +377,7 @@ Assert-SameFile (Join-Path $repo 'LICENSE') $duthubLicenseOut 'duthub LICENSE'
 Assert-SameFile (Join-Path $repo 'NOTICE') $duthubNoticeOut 'duthub NOTICE'
 Assert-SameFile $provenanceFile $gooseProvenanceOut 'goose 来源说明'
 
-# --- 6. SBOM 与 audit -----------------------------------------------------------
+# 6. Verify the SBOM and audit reports.
 $sbomJson = Read-JsonFile $sbom 'CycloneDX SBOM'
 if ((Get-JsonValue $sbomJson 'bomFormat') -ne 'CycloneDX') {
     Stop-Gate "SBOM bomFormat 必须是 CycloneDX：$sbom"
@@ -401,11 +401,11 @@ $auditJson = Read-JsonFile $audit 'duthub cargo-audit JSON'
 Assert-AuditClean $auditJson 'duthub cargo-audit'
 Assert-AuditExit $auditExit $audit 'duthub cargo-audit'
 
-# goose 运行时依赖审计（占位，显式未验证）：duthub 不再分发 goose，发布物里没有
-# goose 的 Cargo.lock，无法也不该由本仓库生成它的 SBOM/审计。workflow 必须写一份以
-# UNVERIFIED 开头的状态文件，本脚本断言它存在——这条检查不允许被静默删除；如果
-# owner 以后补了上游 Cargo.lock 的审计结果（dist/sbom/audit-goose.json + exit 文件），
-# 那它必须干净且退出码 0，不能拿一份有漏洞的审计来充数。
+# Record the runtime dependency audit for downloaded goose as explicitly unverified.
+# The release has no upstream Cargo.lock to use for a goose SBOM or audit.
+# The workflow writes a status file beginning with UNVERIFIED, which this gate requires.
+# An optional upstream audit supplies dist/sbom/audit-goose.json and its exit file.
+# When supplied, require a clean report and exit code zero.
 Assert-NonEmptyFile $gooseAuditStatus 'goose 运行时依赖审计状态占位（workflow 写入）'
 $gooseAuditStatusText = (Get-Content -LiteralPath $gooseAuditStatus -Raw -Encoding UTF8).Trim()
 if ($gooseAuditStatusText -notmatch '^UNVERIFIED') {
@@ -422,9 +422,9 @@ if (Test-Path -LiteralPath $gooseAudit -PathType Leaf) {
 }
 
 # --- 7. SHA256SUMS --------------------------------------------------------------
-# 覆盖发布物实际携带的文件：exe、duthub 许可/声明、goose 来源说明、duthub SBOM/audit
-# 与 goose 审计状态占位。已删除的 goose LICENSE/NOTICE/manifest 不再列入（它们不存在
-# 于新发布物，列进去只会让门禁永久红）。
+# Hash delivered executables, notices, provenance, SBOM, and audit artifacts.
+# Include the downloaded-goose audit status file.
+# The retired bundled-goose license, notice, and manifest are absent from the release.
 $checksumTargets = @(
     'duthub.exe',
     'licenses/duthub/LICENSE',
@@ -449,10 +449,10 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($checksums, (($checksumLines -join "`n") + "`n"), $utf8NoBom)
 Write-Host "checksums written: $checksums"
 
-# --- 8. Release notes（版本/哈希/goose 下载分发事实） --------------------------
-# 防的是：发布说明继续写「goose-acp.exe <hash> / NotSigned」——发布物里根本没有这个
-# 文件，那是伪造可核对性。goose 段只允许陈述事实：未捆绑、来源 URL、许可、版本门槛、
-# 未固定校验（checksumVerified: false）与运行时复算。
+# 8. Write version, hash, and goose distribution facts into the release notes.
+# The package contains no goose executable to hash or inspect for a signature.
+# Record the download source, license, and version requirement.
+# Describe the unpinned checksum policy and the launch-time hash check.
 $workspaceManifest = Get-Content -LiteralPath (Join-Path $repo 'Cargo.toml') -Raw -Encoding UTF8
 $workspaceVersion = 'unknown'
 if ($workspaceManifest -match '(?ms)\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {

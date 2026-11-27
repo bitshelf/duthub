@@ -1,5 +1,5 @@
-# 抓取 duthub 窗口位图到 PNG（检查 UI 用）
-# 用法: powershell -File scripts/capture-window.ps1 [输出路径]
+# Capture the duthub window as a PNG for UI inspection.
+# Usage: powershell -File scripts/capture-window.ps1 [output path]
 param([string]$OutPath = "target\ui-check.png")
 
 Add-Type -AssemblyName System.Drawing
@@ -27,7 +27,7 @@ $cb = {
         $sb = New-Object System.Text.StringBuilder 256
         [WinDrv]::GetWindowText($hWnd, $sb, 256) | Out-Null
         if ($sb.ToString() -eq "duthub" -or $sb.ToString() -eq "") {
-            # 空标题窗口可能是我们的（按进程过滤）
+            # An untitled window can still match the process filter.
             $procId = 0
             [WinDrv]::GetWindowThreadProcessId($hWnd, [ref]$procId) | Out-Null
             $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
@@ -40,7 +40,7 @@ $cb = {
 [WinDrv]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
 if ($target -eq [IntPtr]::Zero) { Write-Output "WINDOW NOT FOUND"; exit 1 }
 
-# 还原 + 前置（若最小化）
+# Restore the window if minimized and bring it to the foreground.
 [WinDrv]::ShowWindow($target, 9) | Out-Null   # SW_RESTORE
 Start-Sleep -Milliseconds 400
 [WinDrv]::SetForegroundWindow($target) | Out-Null
@@ -54,7 +54,7 @@ if ($w -le 0 -or $h -le 0) { Write-Output "BAD SIZE"; exit 1 }
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $hdc = $g.GetHdc()
-# PW_RENDERFULLCONTENT=2 （GPUI/GPU 合成窗口需要）
+# GPUI and GPU-composited windows require PW_RENDERFULLCONTENT=2.
 [WinDrv]::PrintWindow($target, $hdc, 2) | Out-Null
 $g.ReleaseHdc($hdc)
 $g.Dispose()

@@ -49,7 +49,7 @@ fn default_tools_settings_serialize_without_download_section() {
     assert_eq!(
         value,
         serde_json::json!({ "adbExecutable": "adb" }),
-        "默认 ToolsSettings 不得多序列化任何 download/hdc/capture 键"
+        "default ToolsSettings must not serialize any download, hdc, or capture keys"
     );
 }
 
@@ -64,14 +64,17 @@ fn custom_proxy_roundtrips_losslessly() {
         DownloadProxyMode::Custom
     );
     assert_eq!(settings.tools.download.proxy.url, "socks5://127.0.0.1:1080");
-    // Typed → re-serialized → semantically equal. Pre-existing sections
+    // Typed -> re-serialized -> semantically equal. Pre-existing sections
     // (agent/commands/flashTools/terminal) have no section-level skip and are
     // always emitted (roundtrip.rs compares whole documents built from
     // examples/settings.json), so this file scopes its check to the tools
     // subtree owned by this feature.
     let re = serde_json::to_value(&settings).unwrap();
     let original: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(original["tools"], re["tools"], "custom 代理段往返必须无损");
+    assert_eq!(
+        original["tools"], re["tools"],
+        "custom proxy section must round-trip losslessly"
+    );
 }
 
 #[test]
@@ -86,7 +89,7 @@ fn off_mode_roundtrips_losslessly() {
     let original: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(
         original["tools"], re["tools"],
-        "mode=off（非默认）往返必须无损，空 url 省略"
+        "non-default mode=off must round-trip losslessly with empty url omitted"
     );
 }
 
@@ -102,12 +105,16 @@ fn partial_proxy_defaults_mode_and_omits_it_on_serialize() {
     assert_eq!(
         re["tools"]["download"],
         serde_json::json!({ "proxy": { "url": "http://10.0.0.2:8080" } }),
-        "默认 mode=env 必须省略，只留 url"
+        "default mode=env must be omitted, leaving only url"
     );
 }
 
 #[test]
 fn default_proxy_settings_are_fully_skipped() {
     let value = serde_json::to_value(DownloadProxySettings::default()).unwrap();
-    assert_eq!(value, serde_json::json!({}), "默认代理段整体省略");
+    assert_eq!(
+        value,
+        serde_json::json!({}),
+        "default proxy section must be omitted completely"
+    );
 }

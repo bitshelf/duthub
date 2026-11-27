@@ -112,8 +112,7 @@ fn initialize_status(endpoint: SocketAddr, bearer: Option<&str>) -> u16 {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let auth_line = bearer
-        .map_or_default(|token| format!("Authorization: Bearer {token}\r\n"));
+    let auth_line = bearer.map_or_default(|token| format!("Authorization: Bearer {token}\r\n"));
     let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: {endpoint}\r\n{auth_line}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()

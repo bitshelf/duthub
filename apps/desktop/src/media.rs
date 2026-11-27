@@ -638,6 +638,14 @@ fn command(path: &Path) -> Command {
 }
 
 fn executable(spec: &str, default: &str) -> Result<PathBuf, String> {
+    executable_with_env(spec, default, |name| std::env::var(name).ok())
+}
+
+fn executable_with_env(
+    spec: &str,
+    default: &str,
+    lookup_env: impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf, String> {
     static VAR: OnceLock<regex::Regex> = OnceLock::new();
     let spec = spec.trim();
     let spec = if spec.is_empty() { default } else { spec };
@@ -652,8 +660,8 @@ fn executable(spec: &str, default: &str) -> Result<PathBuf, String> {
     let mut missing = None;
     let expanded = VAR.get_or_init(|| regex::Regex::new(r"%([A-Za-z_][A-Za-z0-9_]*)%|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)").unwrap())
         .replace_all(spec, |caps: &regex::Captures<'_>| {
-            let name = [1, 2, 3].into_iter().find_map(|i| caps.get(i)).unwrap().as_str();
-            std::env::var(name).unwrap_or_else(|_| { missing = Some(name.to_string()); String::new() })
+            let name = [1, 2, 3].into_iter().find_map(|i| caps.get(i)).expect("each variable syntax captures the name").as_str();
+            lookup_env(name).unwrap_or_else(|| { missing = Some(name.to_string()); String::new() })
         });
     if let Some(name) = missing {
         return Err(crate::i18n::message("mediaEnvVarUnset", &[("name", &name)]));
@@ -1020,46 +1028,45 @@ mod tests {
     #[test]
     #[ignore = "requires FFmpeg on PATH (sibling ffplay and env-var lookup share the binary)"]
     fn executable_resolves_via_path_absolute_and_env_var() {
-        // ① PATH：裸名走 PATH 搜索。
+        // Resolve the unqualified executable through PATH.
         let via_path = executable("", "ffmpeg").unwrap();
         assert!(via_path.is_file(), "{via_path:?}");
-        // ② 绝对路径：直接命中。canonicalize 会带 \\?\ 前缀，还原成常规写法再喂回去。
+        // Try the absolute path after removing the Windows extended-path prefix.
         let plain = via_path
             .to_string_lossy()
             .trim_start_matches(r"\\?\")
             .to_string();
         let absolute = executable(&plain, "ffmpeg").unwrap();
         assert!(absolute.is_file(), "{absolute:?}");
-        // ③ 环境变量：%VAR%/ffmpeg.exe 展开到 ffmpeg 所在目录。
-        let dir = Path::new(&plain).parent().unwrap().to_path_buf();
-        // SAFETY: This ignored test uses a dedicated environment variable name
-        // not read by any other test and removes it before returning; run with
-        // `--test-threads=1` when invoking ignored tests alongside others.
-        unsafe {
-            std::env::set_var("DUTHUB_MEDIA_TEST_HOME", &dir);
-        }
-        let expanded = executable("%DUTHUB_MEDIA_TEST_HOME%/ffmpeg.exe", "ffmpeg").unwrap();
+        // Expand the variable without modifying the test process environment.
+        let directory = Path::new(&plain)
+            .parent()
+            .expect("the resolved executable has a containing directory");
+        let expanded =
+            executable_with_env("%DUTHUB_MEDIA_TEST_HOME%/ffmpeg.exe", "ffmpeg", |name| {
+                (name == "DUTHUB_MEDIA_TEST_HOME").then(|| directory.to_string_lossy().into_owned())
+            })
+            .expect("resolve ffmpeg through a configured directory");
         assert!(expanded.is_file(), "{expanded:?}");
-        // Unset env vars must report the missing variable name, not a generic error.
-        let error = executable("%DUTHUB_NO_SUCH_VAR_XYZ%/ffmpeg.exe", "ffmpeg").unwrap_err();
+        let error = executable_with_env("%DUTHUB_NO_SUCH_VAR_XYZ%/ffmpeg.exe", "ffmpeg", |_| None)
+            .expect_err("report the missing variable");
         assert!(error.contains("DUTHUB_NO_SUCH_VAR_XYZ"), "{error}");
-        // SAFETY: Restores the process environment for the dedicated test variable.
-        unsafe {
-            std::env::remove_var("DUTHUB_MEDIA_TEST_HOME");
-        }
-        // ffplay 兜底：FFmpeg 同目录应能找到 ffplay（preview() 的第一优先级）。
+        // Preview falls back to ffplay next to the selected ffmpeg executable.
         let sibling = Path::new(&plain).with_file_name(if cfg!(windows) {
             "ffplay.exe"
         } else {
             "ffplay"
         });
-        assert!(sibling.is_file(), "FFmpeg 同目录应有 ffplay: {sibling:?}");
+        assert!(
+            sibling.is_file(),
+            "The FFmpeg directory should contain the file `ffplay: {sibling:?}`."
+        );
     }
 
     #[test]
     #[ignore = "requires FFmpeg with lavfi, libx264 and AAC, and localhost TCP"]
     fn capture_honors_requested_port() {
-        // 先借 0 端口探测一个空闲端口，再要求采集固定绑到它。
+        // First, use port 0 to find an available port. Then, request to connect to that port.
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
@@ -1072,7 +1079,7 @@ mod tests {
             Capture::start_with_args(&CaptureSettings::default(), &input, &args, None).unwrap();
         assert!(
             capture.url.contains(&format!(":{port}/")),
-            "拉流地址必须使用请求的固定端口: {}",
+            "The stream address must use the fixed port specified in the request: {}.",
             capture.url
         );
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -1080,7 +1087,8 @@ mod tests {
             assert!(Instant::now() < deadline, "{}", capture.status());
             std::thread::sleep(Duration::from_millis(50));
         }
-        // 固定端口上发起一次 HTTP GET，确认拉流服务应答。
+        // Send an HTTP GET request to the fixed port, and verify the response from the stream
+        // pulling service.
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         let path = capture.url.split_once("live").unwrap();
         let request = format!(

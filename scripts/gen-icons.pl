@@ -1,6 +1,6 @@
 #!/usr/bin/perl
-# 从 duthub.html 的 SVG sprite 生成 apps/desktop/src/icons_gen.rs（1:1 图标移植）。
-# 同时生成 src/i18n_gen.rs（zh/en 93 键）。
+# Port the SVG sprite in duthub.html to apps/desktop/src/icons_gen.rs.
+# Also generate src/i18n_gen.rs with 93 Chinese and English keys.
 use strict;
 use warnings;
 
@@ -13,7 +13,7 @@ my @lines = <$fh>;
 close $fh;
 my $html = join('', @lines);
 
-# ---- 图标 ----
+# Icons
 my @icons;
 while ($html =~ /<symbol id="i-([a-z0-9-]+)" viewBox="0 0 24 24">(.*?)<\/symbol>/gs) {
     my ($name, $inner) = ($1, $2);
