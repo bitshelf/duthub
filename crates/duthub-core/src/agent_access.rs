@@ -57,6 +57,10 @@ pub struct AgentAccessSettings {
     /// simultaneously. Authentication must also be enabled (fail-close during runtime).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lan_access: bool,
+    /// Additional `Host` header entries (`host` or `host:port`) accepted by MCP HTTP listeners
+    /// alongside loopback defaults and auto-detected LAN interface addresses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
     #[serde(default = "default_http_port")]
     pub http_port: u16,
     #[serde(default = "default_lease_ttl")]
@@ -104,6 +108,7 @@ impl Default for AgentAccessSettings {
         Self {
             enabled: false,
             lan_access: false,
+            allowed_hosts: Vec::new(),
             http_port: default_http_port(),
             lease_ttl_secs: default_lease_ttl(),
             agents: Vec::new(),
@@ -1017,6 +1022,36 @@ mod tests {
         assert_eq!(value["lanAccess"], serde_json::json!(true), "{value}");
         let parsed: AgentAccessSettings = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, enabled);
+    }
+
+    #[test]
+    fn allowed_hosts_defaults_empty_and_roundtrips_camel_case() {
+        let legacy: AgentAccessSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "lanAccess": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.allowed_hosts, Vec::<String>::new());
+
+        let default_json = serde_json::to_value(AgentAccessSettings::default()).unwrap();
+        assert!(
+            default_json.get("allowedHosts").is_none(),
+            "Empty allowedHosts must be omitted from default serialization: {default_json}"
+        );
+
+        let configured = AgentAccessSettings {
+            enabled: true,
+            lan_access: true,
+            allowed_hosts: vec!["192.168.1.175:33612".into(), "lab-win.local".into()],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&configured).unwrap();
+        assert_eq!(
+            value["allowedHosts"],
+            serde_json::json!(["192.168.1.175:33612", "lab-win.local"])
+        );
+        let parsed: AgentAccessSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, configured);
     }
 
     #[test]

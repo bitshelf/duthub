@@ -24,7 +24,7 @@
 - **通用接入**（「Agent 页 → Agent 接入」，原设置页面板已迁入）：供 LLM / 外部 Agent 使用，主端口默认 `127.0.0.1:8797`，可追加通用端口；凭据可按 DUT 授权，保持既有全局只读语义。
 - **DUT 专用接入**（「连接管理 → MCP 服务」）：全局认证开启时，为每台已保存 DUT 自动分配独立端口和 Token，端口可手改并在重启后生效；Token 只有该 DUT 的 `read` Grant，不能写；`dut_files` 省略 `dutId` 时默认落到该 DUT；跨 DUT 请求返回 `LeaseRequired/UNAUTHORIZED`。DUT 专用监听器不出现在通用 Agent 接入页。
 
-`agentAccess.lanAccess` 默认关闭（只绑 `127.0.0.1`）。显式开启后监听 `0.0.0.0`，同一端口同时接受回环与局域网地址，且强制 Bearer（认证关闭时 fail closed）。局域网为明文 HTTP，Token 与 DUT 数据可被同网段嗅探，仅限可信网络并配合防火墙；跨公网仍使用可信 HTTPS 网关或安全隧道。Token 缺失、无效、停用、跨监听器或接入关闭时返回 HTTP 401。
+`agentAccess.lanAccess` 默认关闭（只绑 `127.0.0.1`）。显式开启后监听 `0.0.0.0`，同一端口同时接受回环与局域网地址，且强制 Bearer（认证关闭时 fail closed）。局域网为明文 HTTP，Token 与 DUT 数据可被同网段嗅探，仅限可信网络并配合防火墙；跨公网仍使用可信 HTTPS 网关或安全隧道。Token 缺失、无效、停用、跨监听器或接入关闭时返回 HTTP 401。`Host` 校验在回环监听下仅放行 `localhost`/`127.0.0.1`/`::1`；开启 `lanAccess`（非回环/通配监听）时自动追加本机局域网接口 IP 与本机主机名，并支持在 `agentAccess.allowedHosts`（`camelCase`，默认空且省略序列化）中追加自定义域名或反向代理 `host:port`；`Origin` 头默认全部拒绝（防浏览器 CSRF/DNS rebinding）。打开串口会话默认保持 `ready`（不自动抢占永久 GUI 租约），仅在人工显式开启「人工独占」/「强制接管」或桌面终端正在键入（有限 TTL）时进入 `manual_takeover`/`busy_gui`。MCP 返回给 Agent 的串口与归档日志文本（`serial_read`、`serial_exec.output`、`log_segment_read`、`serial/tail`、`logs/{segmentId}`）自动剥离 ANSI 颜色/高亮转义序列以减轻上下文负担，落盘原始日志保持原始字节不变。
 
 ### 本地 Agent（goose，下载安装）
 

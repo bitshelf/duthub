@@ -1,5 +1,17 @@
 # Duthub MCP — Copy-Paste Verified Recipes
 
+## 0. Direct LAN HTTP Connectivity Smoke Check (Bypassing Client Proxy)
+
+Always pass `--noproxy '*'` (or set `NO_PROXY`) so local HTTP proxies never intercept LAN MCP traffic:
+
+```bash
+curl --noproxy '*' -s -D - -X POST 'http://<LAN-IP>:<PORT>/mcp' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H "Authorization: Bearer $DUTHUB_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}'
+```
+
 ## 1. Preflight Check
 
 ```json

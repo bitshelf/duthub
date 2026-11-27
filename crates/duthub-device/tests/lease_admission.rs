@@ -46,16 +46,23 @@ fn agent(name: &str) -> LeaseHolder {
     }
 }
 
-/// GUI interactive path: opening a session auto-holds the lease and closing releases it;
-/// while held, agent writes are rejected and System (heartbeat) writes pass (INV-01).
+/// Opening a session leaves the DUT free for Agent control by default (no implicit lock
+/// when Manual Takeover is off). An explicit GUI lease blocks agent writes and allows
+/// GUI/System writes, records `write.deny`, and releases cleanly when the session closes.
 #[test]
-fn gui_session_auto_holds_lease_and_blocks_agent_writes() {
+fn open_session_stays_free_for_agents_and_explicit_gui_lease_blocks_agent_writes() {
     let (service, mgr, sink) = service_with_lease("auto-hold");
     service
         .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
         .unwrap();
     std::thread::sleep(Duration::from_millis(120));
-    // GUI holds the lease immediately on open.
+    // Opening a serial session does not lock out Agents unless Manual Takeover or explicit GUI lease is held.
+    assert_eq!(mgr.status("dut-a").phase, LeasePhase::Free);
+    let initial_agent = mgr.acquire("dut-a", &agent("claude"), None).unwrap();
+    mgr.release("dut-a", &initial_agent.lease_id).unwrap();
+
+    // Explicit GUI lease acquisition holds control and blocks Agent writes (INV-01).
+    mgr.acquire("dut-a", &LeaseHolder::Gui, None).unwrap();
     let status = mgr.status("dut-a");
     assert_eq!(status.phase, LeasePhase::Held);
     assert_eq!(status.holder.as_deref(), Some("GUI（人类在场）"));
@@ -95,7 +102,7 @@ fn gui_session_auto_holds_lease_and_blocks_agent_writes() {
     assert!(sink.recent(200).iter().any(|e| e.action == "write.deny"
         && e.dut.as_deref() == Some("dut-a")
         && e.result == AuditOutcome::Denied));
-    // Closing the session automatically releases the lease.
+    // Closing the session automatically releases the GUI lease.
     service.close_session("dut-a").unwrap();
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(mgr.status("dut-a").phase, LeasePhase::Free);
@@ -186,6 +193,7 @@ fn control_entry_lease_admission_gates_agent_actions() {
         .open_session("dut-a", "COM3", 115_200, SessionKind::Demo)
         .unwrap();
     std::thread::sleep(Duration::from_millis(120));
+    mgr.acquire("dut-a", &LeaseHolder::Gui, None).unwrap();
     let backend = Arc::new(MockBackend::default());
     let approval = Arc::new(ApprovalManager::new());
     let control = ControlService::new(Some(backend.clone()), approval.clone())

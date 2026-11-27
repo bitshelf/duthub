@@ -1,8 +1,8 @@
 ---
 name: duthub
-description: Debug embedded Linux and Android boards over network through duthub.exe Streamable HTTP MCP. Read serial logs and clean VT100 screens, wait on serial output without race conditions, send validated logical keys or shell commands with settle/stall detection, capture HDMI snapshots/recordings, run scoped ADB debugging, coordinate multi-agent leases, flash firmware safely, and submit tool feedback. Use whenever interacting with a DUT hosted on duthub.
+description: Connect to and debug embedded Linux/Android DUTs hosted on Windows duthub.exe over Streamable HTTP MCP (LAN HTTP or SSH tunnel). Use whenever inspecting, troubleshooting, or controlling a DUT via duthub (dut_list, dut_status, serial_read, serial_exec, dut_control, adb_exec, media_streams, log_segments, dut_files, notify_user, agent_feedback): clean ANSI-free serial reads, VT100 screens, cursor-safe waits, logical keys, hardware relay/flash leases, ADB debugging, and HTTP connectivity checks.
 license: Apache-2.0
-compatibility: Requires network access to a running duthub.exe Streamable HTTP MCP endpoint with a Bearer token (LAN or SSH reverse tunnel). No server-side duthub binary is required.
+compatibility: Requires HTTP access to a running duthub.exe Streamable HTTP MCP endpoint with a Bearer token (direct LAN HTTP when lanAccess is enabled, or SSH reverse tunnel). No server-side duthub binary is required.
 metadata:
   author: bitshelf
   version: "0.1.1"
@@ -10,10 +10,14 @@ metadata:
 
 # Duthub MCP — Remote Embedded Board Debugging
 
-## Connection Model (Single-Binary `duthub.exe` + Remote HTTP)
+## Connection Model (Single-Binary `duthub.exe` + Streamable HTTP)
 
-- Only the Windows host connected to the boards runs **`duthub.exe`**. Remote Linux servers do **not** install any duthub binary — connect over **Streamable HTTP (`POST /mcp`)** with `Authorization: Bearer <TOKEN>`:
-  - Endpoint: `http://127.0.0.1:8797/mcp` (or the LAN/tunnel URL provided by the operator, e.g. SSH reverse tunnel `ssh -N -R localhost:18799:localhost:<port> user@linux-server`).
+- Only the Windows host connected to the boards runs **`duthub.exe`**. Remote Linux clients do **not** install any duthub binary — connect directly over **Streamable HTTP (`POST /mcp`)** with `Authorization: Bearer <TOKEN>` and `Accept: application/json, text/event-stream`:
+  - Endpoint: `http://127.0.0.1:8797/mcp` (or the LAN URL `http://<LAN-IP>:<port>/mcp` when `agentAccess.lanAccess` is enabled, or an SSH reverse tunnel `ssh -N -R localhost:18799:localhost:<port> user@linux-server`).
+- **HTTP Transport Rules (Avoid Common Pitfalls)**:
+  - **Bypass HTTP proxies for LAN endpoints**: ensure `NO_PROXY` covers the duthub LAN IP (or pass `--noproxy '*'` in `curl`). Sending LAN MCP traffic through a local/corporate proxy causes empty `502 Bad Gateway` (`Proxy-Connection`) errors that do not come from duthub.
+  - **Do not send an `Origin` header** from CLI/agent clients: duthub enforces strict Origin validation and rejects browser `Origin` headers with `403` to block CSRF / DNS rebinding.
+  - **`Host` header validation**: when `lanAccess` is enabled, duthub automatically allows loopback, the host's LAN IPs, and local hostname; for custom DNS names or reverse-proxy hosts, add them to `agentAccess.allowedHosts` in `.duthub/settings.json` rather than spoofing `Host` or running `socat`.
 - **Hard path boundary**: You run on a remote host. **Never assume access to Windows local paths.** Read and write DUT logs, screenshots, recordings, ADB files, and firmware images strictly through MCP tools or `duthub://` resources.
 
 ## Mandatory 3-Step Preflight (Never Skip)
@@ -26,11 +30,11 @@ metadata:
 
 | `dutState` | Meaning | Required Action |
 |---|---|---|
-| `ready` | Serial open & free | Proceed with `serial_read`, `serial_exec`, `adb_exec`, or `dut_control`. |
-| `busy_gui` | Desktop operator holds serial | **Do NOT retry-loop.** Call `notify_user` asking the operator to release control (or start `duthub.exe` with `--release-gui-lease`). Read-only tools still work. |
+| `ready` | Serial open & free (default when Manual Takeover is off) | Proceed immediately with `serial_read`, `serial_exec`, `adb_exec`, or `dut_control`. |
+| `busy_gui` | Desktop operator actively typing (finite TTL) or explicitly took over | **Do NOT retry-loop.** Read-only tools still work. If `remaining_secs` is present, wait briefly or queue with `waitMs`; if held indefinitely, call `notify_user` asking the operator to release control (or start `duthub.exe` with `--release-gui-lease`). |
 | `busy_agent` | Another Agent holds lease | Inspect `controlStatus.sessionName`, `occupiedSecs`, and `queueLen`. Pass `waitMs` to queue in FIFO order, or call `notify_user` if occupied unusually long. |
 | `flashing` | Protected flash in progress | Do NOT send control/serial writes. Monitor progress via `serial_read` or `dut_status` until `ready`. |
-| `manual_takeover` | Human emergency takeover | Read-only inspection only. Wait for operator to disable Manual Takeover. |
+| `manual_takeover` | Human emergency Manual Takeover enabled | Read-only inspection only. Wait for operator to disable Manual Takeover. |
 | `needs_inspection` | Locked after hardware fault | **Stop writes immediately.** Call `notify_user` and wait for operator clearance. |
 | `disconnected` | Serial session closed | Read historical logs via `log_segments` / `log_segment_read`, or call `notify_user` to open the port. |
 
@@ -39,9 +43,11 @@ metadata:
 1. **Logical control keys — always use `keys`, never hand-escaped strings**:
    - Send interrupts, menu navigation, or escapes via `serial_exec.keys`: `["ctrl+c"]`, `["ctrl+d"]`, `["ctrl+z"]`, `["esc"]`, `["enter"]`, `["tab"]`, `["space"]`, `["backspace"]`, `["up"|"down"|"left"|"right"|"home"|"end"]`.
    - Invalid keys fail the entire batch with `INVALID_KEY` before transmitting any byte.
-2. **Clean screen vs. raw stream**:
-   - For interactive menus, prompts, progress bars, or ANSI-heavy output, use `serial_read(dutId, mode="screen")` or resource `duthub://dut/{dutId}/serial/screen`.
+2. **Clean ANSI-free output & screen vs. stream**:
+   - All MCP serial and log responses (`serial_read`, `serial_exec.output`, `log_segment_read`, `serial/tail`) automatically strip ANSI color/highlight escape codes so you receive clean plain text (raw bytes remain preserved on disk).
+   - For full-screen TUIs, menus, prompts, or carriage-return progress bars, use `serial_read(dutId, mode="screen")` or resource `duthub://dut/{dutId}/serial/screen`.
    - For incremental log streaming or waiting on boot lines without missing output between calls, pass your last `sinceSeq` into `serial_read(dutId, sinceSeq, waitFor="...", waitRegex="...", timeoutMs=15000)`.
+   - If periodic probe commands (such as `uname -a`) appear while no Agent holds a lease, that is the DUT's desktop heartbeat (automatically paused while your Agent holds a lease).
 3. **Completion detection & anti-echo sentinel**:
    - Shell commands: use a split sentinel so local echo never matches prematurely: `{"dutId":"<id>","text":"uname -a; echo __OK_''DONE__\r","expect":"__OK_DONE__","timeoutMs":8000}`.
    - Unknown output length: pass `settleMs` (e.g. `800`) to complete automatically once output goes quiet for `settleMs`, or `expectRegex` for prompt matching.

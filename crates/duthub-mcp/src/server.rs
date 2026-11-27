@@ -1797,6 +1797,7 @@ impl McpServerCore {
 
             let matched = matched_by != "timeout";
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            clean_log_lines(&mut collected);
             let mut payload = serde_json::json!({
                 "dut_id": args.dut_id,
                 "session_id": session_id,
@@ -1823,6 +1824,7 @@ impl McpServerCore {
                 Some(mut result) => {
                     let start = result.lines.len().saturating_sub(tail);
                     result.lines.drain(..start);
+                    clean_log_lines(&mut result.lines);
                     let mut payload =
                         serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
                     payload["cursorReset"] = serde_json::json!(false);
@@ -1837,7 +1839,8 @@ impl McpServerCore {
         }
         let limit = args.limit.clamp(1, 400);
         match self.state.serial_read(&args.dut_id, args.since_seq, limit) {
-            Some(result) => {
+            Some(mut result) => {
+                clean_log_lines(&mut result.lines);
                 let mut payload = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
                 payload["cursorReset"] = serde_json::json!(result.last_seq < args.since_seq);
                 Ok(Json(payload))
@@ -1903,9 +1906,10 @@ impl McpServerCore {
             .state
             .log_archive_dir()
             .ok_or_else(|| state_err("Log archive unavailable"))?;
-        let page =
+        let mut page =
             duthub_core::log_archive::read(&dir, &args.dut_id, &args.segment_id, args.offset)
                 .map_err(|err| state_err(&err.to_string()))?;
+        page.text = crate::keys::strip_ansi_codes(&page.text);
         Ok(Json(serde_json::json!(page)))
     }
 
@@ -3762,6 +3766,7 @@ impl McpServerCore {
             && bytes_observed == 0
             && post_send_at.elapsed() >= stall_threshold;
 
+        let clean_output = crate::keys::strip_ansi_codes(&captured);
         let mut response = serde_json::json!({
             "ok": true,
             "dutId": args.dut_id,
@@ -3772,7 +3777,7 @@ impl McpServerCore {
             "bytesObserved": bytes_observed,
             "stalled": stalled,
             "waitedMs": waited_ms,
-            "output": captured,
+            "output": clean_output,
             "lastSeq": cursor,
         });
         if keys_sent_count > 0 {
@@ -3808,6 +3813,14 @@ fn compile_bounded_regex(pattern: &str, field: &str) -> Result<regex::Regex, rmc
                 Some(serde_json::json!({ "code": "INVALID_REGEX" })),
             )
         })
+}
+
+fn clean_log_lines(lines: &mut [crate::state::LogLineDto]) {
+    for line in lines {
+        if line.text.as_bytes().contains(&0x1b) {
+            line.text = crate::keys::strip_ansi_codes(&line.text);
+        }
+    }
 }
 
 fn tail_text_lines(text: &str, max_lines: usize) -> String {
@@ -4253,10 +4266,11 @@ impl ServerHandler for McpServerCore {
             let start = result.lines.len().saturating_sub(150);
             let mut text = String::new();
             for line in &result.lines[start..] {
-                if text.len() + line.text.len() > MAX_TEXT_RESOURCE_BYTES {
+                let clean = crate::keys::strip_ansi_codes(&line.text);
+                if text.len() + clean.len() > MAX_TEXT_RESOURCE_BYTES {
                     break;
                 }
-                text.push_str(&line.text);
+                text.push_str(&clean);
             }
             return Ok(rmcp::model::ReadResourceResponse::Complete(
                 rmcp::model::ReadResourceResult::new(vec![rmcp::model::ResourceContents::text(
@@ -4275,16 +4289,17 @@ impl ServerHandler for McpServerCore {
             loop {
                 let page = duthub_core::log_archive::read(&dir, dut_id, segment_id, offset)
                     .map_err(|err| state_err(&err.to_string()))?;
-                if !page.text.is_empty() {
+                let clean_page = crate::keys::strip_ansi_codes(&page.text);
+                if !clean_page.is_empty() {
                     let remaining = MAX_TEXT_RESOURCE_BYTES.saturating_sub(out.len());
-                    if page.text.len() <= remaining {
-                        out.push_str(&page.text);
+                    if clean_page.len() <= remaining {
+                        out.push_str(&clean_page);
                     } else {
                         let mut cut = remaining;
-                        while cut > 0 && !page.text.is_char_boundary(cut) {
+                        while cut > 0 && !clean_page.is_char_boundary(cut) {
                             cut -= 1;
                         }
-                        out.push_str(&page.text[..cut]);
+                        out.push_str(&clean_page[..cut]);
                         break;
                     }
                 }

@@ -5,7 +5,7 @@
 //! HTTP requests are denied when authentication is disabled.
 
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -165,7 +165,7 @@ pub fn http_router_on(
     access: Option<Arc<AccessContext>>,
     listener_id: Option<Arc<str>>,
 ) -> axum::Router {
-    http_router_for_listener(state, access, listener_id, None, None, None)
+    http_router_for_listener(state, access, listener_id, None, None, None, None)
 }
 
 /// Create a DUT-scoped router without the user notifier.
@@ -190,17 +190,30 @@ pub fn http_router_on_dut_with_notifier(
     listener_dut: Option<Arc<str>>,
     notifier: Option<Arc<dyn UserNotifier>>,
 ) -> axum::Router {
-    http_router_for_listener(state, access, listener_id, None, listener_dut, notifier)
+    http_router_for_listener(
+        state,
+        access,
+        listener_id,
+        None,
+        None,
+        listener_dut,
+        notifier,
+    )
 }
 
 fn http_router_for_listener(
     state: Arc<dyn McpState>,
     access: Option<Arc<AccessContext>>,
     listener_id: Option<Arc<str>>,
+    bind_addr: Option<SocketAddr>,
     endpoint: Option<SocketAddr>,
     listener_dut: Option<Arc<str>>,
     notifier: Option<Arc<dyn UserNotifier>>,
 ) -> axum::Router {
+    let configured_hosts = access
+        .as_ref()
+        .map_or_default(|ctx| ctx.auth.settings().allowed_hosts);
+    let allowed_hosts = allowed_hosts_for_listener(bind_addr, endpoint, &configured_hosts);
     let core = McpServerCore::new(state, access.clone())
         .with_listener_endpoint(endpoint)
         .with_listener_dut_arc(listener_dut)
@@ -209,6 +222,7 @@ fn http_router_for_listener(
         move || Ok(core.clone()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
+            .with_allowed_hosts(allowed_hosts)
             .enforce_origin_validation()
             .with_json_response(true),
     );
@@ -364,10 +378,12 @@ async fn serve_listener(
     advertised: SocketAddr,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
+    let bind_addr = listener.local_addr().ok();
     let router = http_router_for_listener(
         state,
         access,
         listener_id,
+        bind_addr,
         Some(advertised),
         listener_dut,
         notifier,
@@ -375,7 +391,7 @@ async fn serve_listener(
     let listener = tokio::net::TcpListener::from_std(listener)
         .map_err(|e| format!("listener 迁移失败: {e}"))?;
     eprintln!(
-        "[mcp] HTTP serving on {}",
+        "[mcp] HTTP serving on {} (advertised {advertised})",
         listener.local_addr().map_or_default(|a| a.to_string())
     );
     axum::serve(
@@ -423,6 +439,18 @@ fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local() && !is_virtual_tun_ipv4(ip)
 }
 
+fn is_usable_lan_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_usable_lan_ipv4(v4),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_unicast_link_local()
+                && !v6.is_multicast()
+        }
+    }
+}
+
 fn probe_route_ipv4(target: Ipv4Addr) -> Option<Ipv4Addr> {
     let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect((target, 80)).ok()?;
@@ -432,21 +460,124 @@ fn probe_route_ipv4(target: Ipv4Addr) -> Option<Ipv4Addr> {
     }
 }
 
-/// Detect the host's reachable LAN IPv4 address via routing-table lookup
+const LAN_PROBE_TARGETS: [Ipv4Addr; 6] = [
+    Ipv4Addr::new(8, 8, 8, 8),
+    Ipv4Addr::new(192, 168, 1, 1),
+    Ipv4Addr::new(192, 168, 0, 1),
+    Ipv4Addr::new(10, 0, 0, 1),
+    Ipv4Addr::new(172, 16, 0, 1),
+    Ipv4Addr::new(100, 64, 0, 1),
+];
+
+/// Detect the host's primary reachable LAN IPv4 address via routing-table lookup
 /// (UDP connect sends no packets; result is cached per process). Falls back to
-/// RFC 1918 gateway probes when the default internet route enters a virtual TUN.
+/// RFC 1918 / CGNAT gateway probes when the default internet route enters a virtual TUN.
 fn detect_lan_ipv4() -> Option<Ipv4Addr> {
     static CACHE: OnceLock<Option<Ipv4Addr>> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        const PROBES: [Ipv4Addr; 5] = [
-            Ipv4Addr::new(8, 8, 8, 8),
-            Ipv4Addr::new(192, 168, 1, 1),
-            Ipv4Addr::new(192, 168, 0, 1),
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(172, 16, 0, 1),
-        ];
-        PROBES.into_iter().find_map(probe_route_ipv4)
-    })
+    *CACHE.get_or_init(|| LAN_PROBE_TARGETS.into_iter().find_map(probe_route_ipv4))
+}
+
+/// Sanitize a hostname or `host:port` entry for the `rmcp` Host header allowlist.
+fn sanitize_allowed_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@' | '*')
+        })
+    {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+fn push_unique_host(hosts: &mut Vec<String>, candidate: &str) {
+    let Some(clean) = sanitize_allowed_host(candidate) else {
+        return;
+    };
+    if !hosts.iter().any(|existing| existing == &clean) {
+        hosts.push(clean);
+    }
+}
+
+fn local_hostname() -> Option<String> {
+    for key in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty()
+                && trimmed
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+            {
+                return Some(trimmed.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// Collect all usable local LAN IP addresses reachable on this host without unsafe code.
+fn collect_local_lan_ips(hostname: Option<&str>) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    for target in LAN_PROBE_TARGETS {
+        if let Some(ip) = probe_route_ipv4(target) {
+            let addr = IpAddr::V4(ip);
+            if !ips.contains(&addr) {
+                ips.push(addr);
+            }
+        }
+    }
+    if let Some(name) = hostname
+        && let Ok(resolved) = (name, 0u16).to_socket_addrs()
+    {
+        for socket_addr in resolved {
+            let ip = socket_addr.ip();
+            if is_usable_lan_ip(ip) && !ips.contains(&ip) {
+                ips.push(ip);
+            }
+        }
+    }
+    ips
+}
+
+/// Build the `Host` header allowlist for an MCP Streamable HTTP listener.
+///
+/// Loopback listeners keep strict loopback defaults (`localhost`, `127.0.0.1`, `::1`).
+/// Non-loopback and wildcard (`0.0.0.0` / `[::]`) listeners additionally allow the bound
+/// address, advertised LAN address, detected local interface IPs, local hostname, and any
+/// operator-configured `agentAccess.allowedHosts` entries. The returned list is always
+/// non-empty so `rmcp`'s DNS-rebinding Host validation remains active.
+#[must_use]
+pub fn allowed_hosts_for_listener(
+    bind_addr: Option<SocketAddr>,
+    advertised: Option<SocketAddr>,
+    configured: &[String],
+) -> Vec<String> {
+    let mut hosts = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    if let Some(bind) = bind_addr
+        && !bind.ip().is_loopback()
+    {
+        if !bind.ip().is_unspecified() {
+            push_unique_host(&mut hosts, &bind.ip().to_string());
+        }
+        if let Some(adv) = advertised
+            && !adv.ip().is_unspecified()
+        {
+            push_unique_host(&mut hosts, &adv.ip().to_string());
+        }
+        if bind.ip().is_unspecified() {
+            let hostname = local_hostname();
+            for ip in collect_local_lan_ips(hostname.as_deref()) {
+                push_unique_host(&mut hosts, &ip.to_string());
+            }
+            if let Some(name) = hostname {
+                push_unique_host(&mut hosts, &name);
+            }
+        }
+    }
+    for entry in configured {
+        push_unique_host(&mut hosts, entry);
+    }
+    hosts
 }
 
 #[cfg(test)]
@@ -521,5 +652,40 @@ mod tests {
         assert!(is_virtual_tun_ipv4(Ipv4Addr::new(198, 18, 0, 1)));
         assert!(!is_usable_lan_ipv4(Ipv4Addr::new(198, 18, 0, 1)));
         assert!(is_usable_lan_ipv4(Ipv4Addr::new(192, 168, 1, 175)));
+    }
+
+    #[test]
+    fn allowed_hosts_covers_lan_binds_and_sanitizes_configured_entries() {
+        let loopback: SocketAddr = "127.0.0.1:8797".parse().unwrap();
+        let loopback_hosts = allowed_hosts_for_listener(Some(loopback), Some(loopback), &[]);
+        assert_eq!(loopback_hosts, vec!["localhost", "127.0.0.1", "::1"]);
+
+        let lan: SocketAddr = "192.168.1.175:33612".parse().unwrap();
+        let lan_hosts = allowed_hosts_for_listener(
+            Some("0.0.0.0:33612".parse().unwrap()),
+            Some(lan),
+            &[
+                "  LAB-BOX.local:33612 ".into(),
+                "*".into(),
+                "http://bad.example/mcp".into(),
+                "192.168.1.175".into(),
+            ],
+        );
+        assert!(lan_hosts.contains(&"127.0.0.1".to_string()));
+        assert!(lan_hosts.contains(&"192.168.1.175".to_string()));
+        assert!(lan_hosts.contains(&"lab-box.local:33612".to_string()));
+        assert!(
+            !lan_hosts
+                .iter()
+                .any(|host| host == "*" || host.contains('/'))
+        );
+        assert_eq!(
+            lan_hosts
+                .iter()
+                .filter(|host| *host == "192.168.1.175")
+                .count(),
+            1,
+            "duplicate host entries must be deduplicated"
+        );
     }
 }

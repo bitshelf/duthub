@@ -711,7 +711,7 @@ impl ControlLeaseManager {
         if !self.holder_enabled(&held.holder) || held.revoked {
             return Err(LeaseError::Unauthorized);
         }
-        if self.gui_session_bound && held.holder == LeaseHolder::Gui {
+        if held.expires_at_ms == u64::MAX {
             return Ok(Self::grant_view(dut_id, held, st.generation));
         }
         let ttl = self.ttl_ms.load(Ordering::Relaxed);
@@ -914,12 +914,9 @@ impl ControlLeaseManager {
                 )
             }
             (false, false, false, Some(held)) => {
-                // An automatic GUI lease has no TTL to display.
-                let remaining = if held.holder == LeaseHolder::Gui {
-                    None
-                } else {
-                    Some(held.expires_at_ms.saturating_sub(now) / 1000)
-                };
+                // Explicit session-bound GUI leases have no finite TTL to display.
+                let remaining = (held.expires_at_ms != u64::MAX)
+                    .then(|| held.expires_at_ms.saturating_sub(now) / 1000);
                 (
                     LeasePhase::Held,
                     Some(held.holder.label()),
@@ -1321,20 +1318,31 @@ impl LeaseAuthority for ControlLeaseManager {
                 if st.inspection {
                     return Err(LeaseError::NeedsInspection);
                 }
-                match &st.lease {
-                    Some(held) if held.holder == LeaseHolder::Gui => Ok(Some(WriteCtx {
-                        lease_id: held.lease_id.clone(),
-                        generation: st.generation,
-                    })),
+                match &mut st.lease {
+                    Some(held) if held.holder == LeaseHolder::Gui => {
+                        if held.expires_at_ms != u64::MAX {
+                            held.expires_at_ms =
+                                now.saturating_add(self.ttl_ms.load(Ordering::Relaxed));
+                        }
+                        Ok(Some(WriteCtx {
+                            lease_id: held.lease_id.clone(),
+                            generation: st.generation,
+                        }))
+                    }
                     Some(held) => Err(LeaseError::Busy {
                         holder: held.holder.label(),
                         queue_len: st.queue.len(),
                     }),
                     None => {
-                        // Acquire a GUI lease when the human operator writes to a free DUT.
+                        // Acquire a finite-TTL GUI lease while the human is actively typing on
+                        // a free DUT so Agents are not blocked indefinitely after idle input.
                         let gui_session = self.default_session_name(dut_id, &LeaseHolder::Gui);
                         let grant =
                             self.grant_free(st, dut_id, &LeaseHolder::Gui, &gui_session, now, 0);
+                        let finite_expiry = now.saturating_add(self.ttl_ms.load(Ordering::Relaxed));
+                        if let Some(held) = st.lease.as_mut() {
+                            held.expires_at_ms = finite_expiry;
+                        }
                         Ok(Some(WriteCtx {
                             lease_id: grant.lease_id,
                             generation: grant.generation,
@@ -1706,6 +1714,38 @@ mod tests {
         // Explicitly releasing the GUI grant frees the DUT.
         m.release_for_holder("dut", &LeaseHolder::Gui);
         assert_eq!(m.status("dut").phase, LeasePhase::Free);
+    }
+
+    #[test]
+    fn implicit_gui_write_lease_expires_after_ttl_so_agents_can_resume() {
+        let m = ControlLeaseManager::new(Some(AuditSink::memory()))
+            .with_ttl(Duration::from_millis(60))
+            .with_gui_session_lifetime();
+        // Typing on a free DUT grants a finite-TTL GUI lease rather than blocking Agents forever.
+        let ctx = m
+            .admit_write("dut", &WriteIdentity::gui())
+            .expect("GUI write admitted")
+            .expect("returns lease context");
+        let status = m.status("dut");
+        assert_eq!(status.phase, LeasePhase::Held);
+        assert!(
+            status.remaining_secs.is_some(),
+            "implicit GUI typing lease must expose a finite TTL"
+        );
+        std::thread::sleep(Duration::from_millis(90));
+        assert_eq!(m.status("dut").phase, LeasePhase::Free);
+        // Once idle TTL elapses, an Agent can acquire control immediately.
+        let agent_grant = m
+            .acquire(
+                "dut",
+                &LeaseHolder::Agent {
+                    agent_name: "bot".into(),
+                    credential_id: "cred".into(),
+                },
+                None,
+            )
+            .expect("agent acquires after implicit GUI write TTL expires");
+        assert!(agent_grant.generation > ctx.generation);
     }
 
     #[test]

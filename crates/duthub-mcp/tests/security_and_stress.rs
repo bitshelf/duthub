@@ -1809,6 +1809,42 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     };
     assert!(res_text.contains("Loading 100%"), "{res_text}");
 
+    // 2b) Default stream serial_read and serial/tail resource also strip ANSI highlight codes.
+    let stream_resp = call_json(
+        &client,
+        "serial_read",
+        json!({"dutId": "dut-rk3576", "tail": 20}),
+    )
+    .await
+    .unwrap();
+    let stream_joined: String = stream_resp["lines"]
+        .as_array()
+        .expect("lines array")
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .collect();
+    assert!(stream_joined.contains("U-Boot 2025"), "{stream_joined}");
+    assert!(
+        !stream_joined.contains("\x1b["),
+        "serial_read stream output must strip ANSI highlights: {stream_joined}"
+    );
+
+    let tail_res = client
+        .read_resource(rmcp::model::ReadResourceRequestParams::new(
+            "duthub://dut/dut-rk3576/serial/tail",
+        ))
+        .await
+        .expect("serial/tail resource");
+    let tail_text = match &tail_res.contents[0] {
+        rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.as_str(),
+        other => panic!("expected text resource, got {other:?}"),
+    };
+    assert!(tail_text.contains("U-Boot 2025"), "{tail_text}");
+    assert!(
+        !tail_text.contains("\x1b["),
+        "serial/tail resource must strip ANSI highlights: {tail_text}"
+    );
+
     // 3) serial_read(sinceSeq, waitRegex, timeoutMs) waits without missing newly pushed output.
     let cursor = screen_resp["last_seq"].as_u64().unwrap();
     let state_bg = state.clone();

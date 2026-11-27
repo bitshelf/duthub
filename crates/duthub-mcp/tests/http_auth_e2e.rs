@@ -1225,3 +1225,150 @@ async fn skill_export_requires_a_read_grant_over_http() {
 
     task.abort();
 }
+
+async fn post_json_with_headers(
+    addr: std::net::SocketAddr,
+    host: &str,
+    auth: Option<&str>,
+    origin: Option<&str>,
+    body: &str,
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream =
+        tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+            .await
+            .expect("connect timeout")
+            .unwrap();
+    let auth_line = match auth {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    let origin_line = match origin {
+        Some(o) => format!("Origin: {o}\r\n"),
+        None => String::new(),
+    };
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {host}\r\n{auth_line}{origin_line}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+    let raw = String::from_utf8_lossy(&buf).to_string();
+    let status: u16 = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+    (status, body)
+}
+
+#[tokio::test]
+async fn lan_wildcard_listener_allows_lan_and_configured_hosts_and_blocks_foreign_host_or_origin() {
+    let token = duthub_core::agent_access::generate_token();
+    let auth = AgentAccessRuntime::from_settings(AgentAccessSettings {
+        enabled: true,
+        lan_access: true,
+        allowed_hosts: vec!["192.168.1.175".into(), "lab-box.internal:33612".into()],
+        agents: vec![duthub_core::AgentCredential {
+            listener_id: None,
+            id: "cred-lan".into(),
+            agent_name: "lan-bot".into(),
+            token: token.clone(),
+            enabled: true,
+            grants: vec![DutGrant {
+                dut_id: "dut-a".into(),
+                actions: vec![DutAction::Read],
+            }],
+        }],
+        ..Default::default()
+    });
+    let ctx = Arc::new(AccessContext::new(
+        auth,
+        Arc::new(ControlLeaseManager::new(Some(AuditSink::memory()))),
+        AuditSink::memory(),
+    ));
+    let std_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    let handle = duthub_mcp::transport::spawn_http_listener_on(
+        std_listener,
+        RecordingState::new(ctx.lease.clone()),
+        Some(ctx),
+        None,
+        None,
+        None,
+    )
+    .expect("spawn wildcard LAN HTTP listener");
+    let connect_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let init_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"lan-test","version":"1"}}}"#;
+
+    // 1) Advertised LAN IP host header succeeds with valid Bearer.
+    let adv_host = handle.endpoint.to_string();
+    let (status, body) =
+        post_json_with_headers(connect_addr, &adv_host, Some(&token), None, init_body).await;
+    assert_eq!(
+        status, 200,
+        "advertised LAN host must pass: {adv_host} -> {body}"
+    );
+
+    // 2) Configured LAN IP & host:port entries succeed.
+    let (status, body) = post_json_with_headers(
+        connect_addr,
+        &format!("192.168.1.175:{port}"),
+        Some(&token),
+        None,
+        init_body,
+    )
+    .await;
+    assert_eq!(status, 200, "configured LAN IP must pass: {body}");
+    let (status, body) = post_json_with_headers(
+        connect_addr,
+        "lab-box.internal:33612",
+        Some(&token),
+        None,
+        init_body,
+    )
+    .await;
+    assert_eq!(status, 200, "configured host:port must pass: {body}");
+
+    // 3) Loopback Host still succeeds.
+    let (status, body) = post_json_with_headers(
+        connect_addr,
+        &format!("127.0.0.1:{port}"),
+        Some(&token),
+        None,
+        init_body,
+    )
+    .await;
+    assert_eq!(status, 200, "loopback Host must pass: {body}");
+
+    // 4) Unlisted Host and browser Origin remain rejected with 403; missing Bearer returns 401.
+    let (status, body) = post_json_with_headers(
+        connect_addr,
+        &format!("evil.example:{port}"),
+        Some(&token),
+        None,
+        init_body,
+    )
+    .await;
+    assert_eq!(status, 403, "foreign Host must be rejected: {body}");
+
+    let (status, body) = post_json_with_headers(
+        connect_addr,
+        &adv_host,
+        Some(&token),
+        Some("http://evil.example"),
+        init_body,
+    )
+    .await;
+    assert_eq!(status, 403, "browser Origin must be rejected: {body}");
+
+    let (status, _) = post_json_with_headers(connect_addr, &adv_host, None, None, init_body).await;
+    assert_eq!(
+        status, 401,
+        "missing Bearer must return 401 before Host check"
+    );
+
+    assert!(handle.shutdown_and_join_with_timeout(Duration::from_secs(3)));
+}

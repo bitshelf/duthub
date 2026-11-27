@@ -572,8 +572,10 @@ impl DeviceService {
                 let observed_session = session_id.clone();
                 registry.insert(handle);
                 if let Some(lease) = &self.lease {
+                    // Record the GUI session label for explicit takeovers without locking out
+                    // Agents on port open; Agents stay free to acquire control unless Manual
+                    // Takeover or an explicit GUI takeover is active.
                     lease.set_gui_session_name(dut_id, format!("GUI/{port}"));
-                    let _ = lease.acquire(dut_id, &LeaseHolder::Gui, None);
                 }
                 drop(registry);
 

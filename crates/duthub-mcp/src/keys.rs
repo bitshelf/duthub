@@ -51,13 +51,13 @@ pub fn encode_logical_keys(keys: &[String]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Strip ANSI escape sequences and collapse carriage-return progress overwrites.
-///
-/// Used as a clean fallback when a session has no live VT100 `SerialScreen`
-/// snapshot (such as demo sessions or persisted snapshots) and when matching
-/// wait patterns against colored serial streams.
+/// Strip ANSI escape sequences (colors, highlights, cursor motion, OSC titles)
+/// while preserving raw chunk whitespace and newlines.
 #[must_use]
-pub fn strip_ansi_escapes(input: &str) -> String {
+pub fn strip_ansi_codes(input: &str) -> String {
+    if !input.as_bytes().contains(&0x1b) {
+        return input.to_owned();
+    }
     let bytes = input.as_bytes();
     let mut cleaned = String::with_capacity(input.len());
     let mut i = 0;
@@ -110,6 +110,17 @@ pub fn strip_ansi_escapes(input: &str) -> String {
             break;
         }
     }
+    cleaned
+}
+
+/// Strip ANSI escape sequences and collapse carriage-return progress overwrites.
+///
+/// Used as a clean fallback when a session has no live VT100 `SerialScreen`
+/// snapshot (such as demo sessions or persisted snapshots) and when matching
+/// wait patterns against colored serial streams.
+#[must_use]
+pub fn strip_ansi_escapes(input: &str) -> String {
+    let cleaned = strip_ansi_codes(input);
 
     // Resolve in-line carriage return overwrites (e.g. progress bars) line by line.
     let mut lines: Vec<&str> = cleaned
@@ -188,5 +199,12 @@ mod tests {
     fn strips_ansi_and_progress_overwrites() {
         let raw = "\x1b[32mBooting...\x1b[0m\r\n10%\r50%\r100% done   \r\n\n";
         assert_eq!(strip_ansi_escapes(raw), "Booting...\n100% done");
+    }
+
+    #[test]
+    fn strip_ansi_codes_removes_highlights_and_preserves_chunk_spacing() {
+        let colored = "\x1b[1;32mconsole:/\x1b[0m $ \x1b]0;title\x07\x1b[Kls\r\n";
+        assert_eq!(strip_ansi_codes(colored), "console:/ $ ls\r\n");
+        assert_eq!(strip_ansi_codes("plain text "), "plain text ");
     }
 }
