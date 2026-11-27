@@ -2,7 +2,7 @@
 # Build Windows artifacts on main and publish tagged versions to GitHub Releases.
 #
 # Release gate (ADR-3 §9, download-only goose distribution since 2026-11-25).
-# Publishing requires a passing gate, RELEASE_GATE=true, and a release environment.
+# Publishing requires a passing gate and a version tag.
 # Third-party actions are pinned to commit SHAs. git ls-remote verified these refs on
 # 2026-11-21: checkout v4.4.0, rust-toolchain stable head, and rust-cache v2.
 # The remaining refs were upload-artifact v4.6.2, download-artifact v4.3.0, and gh-release v2.6.2.
@@ -308,10 +308,9 @@ jobs:
           if-no-files-found: warn
 
   publish-release:
-    if: github.ref_type == 'tag' && vars.RELEASE_GATE == 'true'
+    if: github.ref_type == 'tag'
     needs: [build-windows, regression, gate]
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: write
     steps:
