@@ -95,8 +95,9 @@ jobs:
 
       - name: Stage artifact
         shell: pwsh
-        # Distribute duthub.exe as a single executable with license and provenance files alongside.
-        # Users install goose from Tool Downloads. Include its PROVENANCE.md with the release.
+        # Stage duthub.exe for the release. License and provenance files stay in the
+        # workflow artifact for verification only; the release itself ships the
+        # executable alone. Users install goose from Tool Downloads.
         # The old assets/goose license, notice, and manifest are no longer in the tree.
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
@@ -318,20 +319,19 @@ jobs:
         with:
           name: duthub-windows-x64
           path: dist
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: duthub-release-gate
-          path: dist
+      - name: Replace any existing release for this tag
+        # Re-publishing a tag must start from a clean release so the asset list
+        # contains exactly what this run uploads and no stale body text remains.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete "${GITHUB_REF_NAME}" --yes || true
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          body_path: dist/RELEASE_NOTES.md
+          # The release ships the single duthub executable with no body text.
           generate_release_notes: false
           fail_on_unmatched_files: true
           files: |
             dist/duthub.exe
-            dist/licenses/duthub/LICENSE
-            dist/licenses/duthub/NOTICE
-            dist/licenses/goose/PROVENANCE.md
-            dist/SHA256SUMS
-            dist/sbom/*
