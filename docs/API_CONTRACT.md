@@ -137,3 +137,10 @@ MCP 2026-07-28 客户端通过 `server/discover` 发现能力，并为每个请�
   | `MEDIA_OP_TIMEOUT` | 30 s 内桌面未应答 |
 - **没有 `MEDIA_QUOTA` / `MEDIA_BACKEND_UNAVAILABLE` 码**：配额是存储边界，按 `MEDIA_CAPTURE_FAILED` 报；这两个名字只在测试里断言「不在面内」（`apps/desktop/tests/capture_backend_logic.rs:287-288`）。
 - **`note`**：去控制字符、截到 64 字符，仅作元数据——不参与文件名、不进审计（`crates/duthub-mcp/src/server.rs:183`、`:334-342`）。
+
+## 流式上传、并发烧录与 `.duthub/logs/` 契约补注
+
+- **同端口高吞吐上传**：同一 MCP HTTP 监听器挂载 `PUT /dut/{dutId}/image/{filename}`（适配 `curl -T`）与 tus 1.0.0 `/dut/{dutId}/transfer`（适配 `ztus` `h2c` 及标准 tus 客户端），统一采用 4 MiB 流水线 `BufWriter`、增量 SHA-256 及调优后的 TCP/HTTP1/HTTP2 接收窗口。均要求 `DutAction::Flash` 授权与 `.img`/`.bin`/`.iso` 白名单。
+- **上传与烧录文件级互斥**：`LeasePhase::Protected` 期间按规范化文件名（不区分大小写）检查：上传**不同文件名**允许与烧录同步进行；上传或覆盖正在烧录的**同一文件**返回 `409 FILE_IN_USE`；反向保护在 `flash_update` 入口拒绝正在上传中的同一文件（`UPLOAD_IN_PROGRESS`）。人工接管（`MANUAL_CONTROL`）与硬件核检锁（`NEEDS_INSPECTION`）仍拦截全部上传。
+- **批量日志导出与 `.duthub/logs/` 规范**：`log_export` 工具与 `GET /dut/{dutId}/logs/export`（支持 `format=gzip` 与 ANSI 清理）提供单次快照全量导出。宿主机 Agent 审计与 `--trace` 日志统一落盘到 `.duthub/logs/audit/` 与 `.duthub/logs/traces/`；远端/本地 Agent 侧下载日志与传输日志规范存放在其工作区 `.duthub/logs/<dutId>/`。
+- **阻断告警降噪与多语言**：`LEASE_UNKNOWN`/`LEASE_EXPIRED`/`LEASE_REQUIRED`/`NOT_HOLDER`/`STALE_GENERATION`/`QUEUED_AHEAD` 与正常烧录保护态不弹桌面人工介入窗。阻断告警的标题、正文和 MCP 错误数据中的 `reason`、`suggestedAction` 使用生成时 duthub 的界面语言（`zh-CN`/`en-US`）。独立 MCP 默认使用 `zh-CN`。

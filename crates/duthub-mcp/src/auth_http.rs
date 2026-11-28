@@ -17,7 +17,7 @@
 //! The service wrapper makes the request context explicit.
 //!
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -38,13 +38,15 @@ use rmcp::handler::server::tool::ToolCallContext;
 
 use crate::server::McpServerCore;
 
-/// Shared authentication, lease, and audit context used by middleware and tool handlers.
+/// Shared authentication, lease, audit, and active-upload tracking context used by
+/// middleware, HTTP transfer routes, and MCP tool handlers.
 /// Tests can supply in-memory implementations.
 #[derive(Clone)]
 pub struct AccessContext {
     pub auth: Arc<AgentAccessRuntime>,
     pub lease: Arc<ControlLeaseManager>,
     pub audit: Arc<AuditSink>,
+    active_uploads: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 impl std::fmt::Debug for AccessContext {
@@ -53,13 +55,42 @@ impl std::fmt::Debug for AccessContext {
     }
 }
 
+fn normalized_upload_key(dut_id: &str, filename: &str) -> (String, String) {
+    let base = filename.trim().rsplit(['/', '\\']).next().unwrap_or("");
+    (dut_id.to_owned(), base.to_ascii_lowercase())
+}
+
 impl AccessContext {
     pub fn new(
         auth: Arc<AgentAccessRuntime>,
         lease: Arc<ControlLeaseManager>,
         audit: Arc<AuditSink>,
     ) -> Self {
-        Self { auth, lease, audit }
+        Self {
+            auth,
+            lease,
+            audit,
+            active_uploads: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Reserve an active upload slot for `(dut_id, filename)` (case-insensitive basename).
+    /// Returns `false` if another upload for the exact same DUT and filename is already active.
+    pub(crate) fn try_begin_upload(&self, dut_id: &str, filename: &str) -> bool {
+        let mut guard = duthub_core::util::lock_unpoisoned(&self.active_uploads);
+        guard.insert(normalized_upload_key(dut_id, filename))
+    }
+
+    /// Release an active upload slot for `(dut_id, filename)`.
+    pub(crate) fn end_upload(&self, dut_id: &str, filename: &str) {
+        let mut guard = duthub_core::util::lock_unpoisoned(&self.active_uploads);
+        guard.remove(&normalized_upload_key(dut_id, filename));
+    }
+
+    /// Check whether an upload for `(dut_id, filename)` is currently in progress.
+    pub(crate) fn is_upload_active(&self, dut_id: &str, filename: &str) -> bool {
+        let guard = duthub_core::util::lock_unpoisoned(&self.active_uploads);
+        guard.contains(&normalized_upload_key(dut_id, filename))
     }
 }
 

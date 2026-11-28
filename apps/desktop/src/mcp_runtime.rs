@@ -549,6 +549,7 @@ impl McpState for RuntimeMcpState {
             generation: status.generation,
             queue_len: status.queue_len,
             protected_op: status.protected_op,
+            protected_file: status.protected_file,
         })
     }
 
@@ -895,6 +896,13 @@ impl McpState for RuntimeMcpState {
 
     fn locale(&self) -> duthub_mcp::i18n::McpLocale {
         duthub_mcp::i18n::McpLocale::from_setting(crate::i18n::active_code())
+    }
+
+    fn blocked_notice_texts(
+        &self,
+        kind: duthub_mcp::i18n::BlockedNoticeKind<'_>,
+    ) -> (&'static str, String, &'static str) {
+        crate::i18n::blocked_notice_texts(kind)
     }
 
     fn session_epoch(&self, dut_id: &str) -> Option<u64> {

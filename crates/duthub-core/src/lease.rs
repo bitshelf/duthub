@@ -271,6 +271,9 @@ pub struct LeaseStatus {
     pub remaining_secs: Option<u64>,
     pub queue_len: usize,
     pub protected_op: Option<String>,
+    /// Basename of the firmware image currently being flashed during `LeasePhase::Protected`, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_file: Option<String>,
 }
 
 #[derive(Debug)]
@@ -298,6 +301,7 @@ struct DutState {
     generation: u64,
     lease: Option<HeldLease>,
     protected_op: Option<String>,
+    protected_file: Option<String>,
     inspection: bool,
     queue: VecDeque<Waiter>,
     cancelled_waiters: HashSet<u64>,
@@ -873,6 +877,7 @@ impl ControlLeaseManager {
                     remaining_secs: None,
                     queue_len: 0,
                     protected_op: None,
+                    protected_file: None,
                 };
             }
             return LeaseStatus {
@@ -886,6 +891,7 @@ impl ControlLeaseManager {
                 remaining_secs: None,
                 queue_len: 0,
                 protected_op: None,
+                protected_file: None,
             };
         };
         self.expire_if_due(st, dut_id, now);
@@ -939,6 +945,7 @@ impl ControlLeaseManager {
             remaining_secs: remaining,
             queue_len: st.queue.len(),
             protected_op: st.protected_op.clone(),
+            protected_file: st.protected_file.clone(),
         }
     }
 
@@ -986,6 +993,18 @@ impl ControlLeaseManager {
     /// Enter the protected phase for an uninterruptible operation and block lease changes and writes.
     /// A current lease is required.
     pub fn enter_protected(&self, dut_id: &str, op: &str) -> Result<(), LeaseError> {
+        self.enter_protected_with_file(dut_id, op, None)
+    }
+
+    /// Enter the protected phase while recording the canonical firmware image basename being
+    /// flashed, so concurrent uploads targeting *different* files can proceed safely while
+    /// writes/overwrites to the same active image file are rejected.
+    pub fn enter_protected_with_file(
+        &self,
+        dut_id: &str,
+        op: &str,
+        file_name: Option<&str>,
+    ) -> Result<(), LeaseError> {
         let mut states = crate::util::lock_unpoisoned(&self.states);
         let st = states.entry(dut_id.to_string()).or_default();
         let now = unix_ms();
@@ -1000,6 +1019,10 @@ impl ControlLeaseManager {
         };
         let holder = held.holder.clone();
         st.protected_op = Some(op.to_string());
+        st.protected_file = file_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|raw| raw.rsplit(['/', '\\']).next().unwrap_or(raw).to_owned());
         self.audit_lease(
             "lease.protected.enter",
             Some(&holder),
@@ -1021,6 +1044,7 @@ impl ControlLeaseManager {
         let Some(op) = st.protected_op.take() else {
             return Err(LeaseError::UnknownLease);
         };
+        st.protected_file = None;
         st.lease = None; // A protected operation never restores the previous grant.
         self.audit_lease(
             "lease.protected.exit",

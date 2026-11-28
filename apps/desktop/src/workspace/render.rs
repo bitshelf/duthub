@@ -39,7 +39,7 @@ impl Workbench {
         // Tray icon host: installed on the first render because this is the
         // only place a `&mut Window` exists. `--self-test` never installs one,
         // and a failure latches `tray_failed` so close quits for real.
-        if !self.agent_self_test && self.tray.is_none() && !self.tray_failed {
+        if !self.agent_self_test && !self.quitting && self.tray.is_none() && !self.tray_failed {
             match duthub_desktop::tray::install(
                 window,
                 duthub_desktop::tray::TrayOptions {
@@ -49,6 +49,7 @@ impl Workbench {
                 },
             ) {
                 Ok(tray) => {
+                    let _ = tray.set_icon_visible(true);
                     self.tray_tooltip = crate::i18n::label("trayTooltip").to_string();
                     self.tray = Some(tray);
                 }
@@ -358,6 +359,8 @@ impl Workbench {
         } else {
             crate::alerts::alert_headline(source, &item.title, &item.detail)
         };
+        let detail_text = item.detail.trim();
+        let show_detail = !detail_text.is_empty() && detail_text != title;
         let close = icon_btn("alert-close", "x", p)
             .accessibility_label(crate::i18n::label("close"))
             .tooltip(crate::i18n::label("close"))
@@ -457,6 +460,7 @@ impl Workbench {
             .child(icon("check").size(px(15.)).text_color(p.accent_contrast))
             .child(crate::i18n::label("acknowledgeAlert"))
             .on_click(cx.listener(move |this, _ev, window, cx| {
+                duthub_core::util::lock_unpoisoned(&this.alerts).acknowledge_pending();
                 this.alert_dialog_open = false;
                 this.active_alert_dialog = None;
                 this.dismiss_active_alert_dialog = false;
@@ -476,14 +480,21 @@ impl Workbench {
             .child(mute_btn)
             .child(ack_btn);
 
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(14.))
-            .w_full()
-            .child(header)
-            .child(footer)
-            .into_any_element()
+        let detail_block = show_detail.then(|| {
+            div()
+                .pl(px(56.))
+                .text_size(px(13.))
+                .line_height(px(19.))
+                .text_color(p.muted)
+                .whitespace_normal()
+                .child(detail_text.to_owned())
+        });
+
+        let mut container = div().flex().flex_col().gap(px(12.)).w_full().child(header);
+        if let Some(detail_el) = detail_block {
+            container = container.child(detail_el);
+        }
+        container.child(footer).into_any_element()
     }
 
     /// Render the home view with connection actions, device tools, and up to ten recent connection tiles.
@@ -1181,19 +1192,16 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let query = self.find_query.clone();
-        let folded_query = query.to_lowercase();
-        let total = if folded_query.is_empty() {
-            0
-        } else {
+        let total = self.find_pattern.as_ref().map_or(0, |pattern| {
             self.sessions.get(self.active_session).map_or(0, |v| {
                 v.lines
                     .iter()
                     .map(|line| line.text.as_ref())
                     .chain(v.displayed_rows().map(|row| row.text.as_str()))
-                    .filter(|line| line.to_lowercase().contains(&folded_query))
+                    .filter(|line| pattern.is_match(line))
                     .count()
             })
-        };
+        });
         let mut bar = div()
             .flex()
             .items_center()
@@ -1204,15 +1212,19 @@ impl Workbench {
             .border_b_1()
             .border_color(p.border)
             .child(icon("search").size(px(15.)).text_color(p.muted));
-        let input = div().max_w(px(360.)).flex_1().child(self.text_field(
-            In::Find,
-            &query,
-            crate::i18n::label("findTerminal"),
-            false,
-            p,
-            window,
-            cx,
-        ));
+        let input = div()
+            .min_w_0()
+            .max_w(px(360.))
+            .flex_1()
+            .child(self.text_field(
+                In::Find,
+                &query,
+                crate::i18n::label("findTerminal"),
+                false,
+                p,
+                window,
+                cx,
+            ));
         bar = bar
             .child(input)
             .child(
@@ -1227,6 +1239,8 @@ impl Workbench {
             .child(
                 div()
                     .id("find-close")
+                    .ml_auto()
+                    .flex_shrink_0()
                     .on_click(cx.listener(|this, _ev, _win, cx| {
                         this.find_open = false;
                         cx.notify();
@@ -1250,7 +1264,6 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let query = self.find_query.to_lowercase();
         // Follow output only while the viewport is at the bottom.
         let near_bottom = {
             let state = self.terminal_scroll.0.borrow();
@@ -1525,7 +1538,6 @@ impl Workbench {
             let annotations = session.lines.len();
             let item_count = annotations + rows_len + usize::from(!is_device);
             let weak = cx.entity().downgrade();
-            let query = query.clone();
             let highlight_rules = self.compiled_highlight_rules();
             viewport = viewport.child(
                 gpui_kit::uniform_list("terminal-list", item_count, move |range, _window, cx| {
@@ -1547,7 +1559,7 @@ impl Workbench {
                             items.push(
                                 Self::terminal_line_item(
                                     line,
-                                    &query,
+                                    this.find_pattern.as_ref(),
                                     sel_range,
                                     selection_bg,
                                     row_height,
@@ -1568,7 +1580,7 @@ impl Workbench {
                                 Self::terminal_row_item(
                                     session,
                                     row_idx,
-                                    &query,
+                                    this.find_pattern.as_ref(),
                                     &highlight_rules,
                                     sel_range,
                                     selection_bg,
@@ -1621,47 +1633,54 @@ impl Workbench {
     /// Render an annotation at the same fixed height as a terminal row.
     pub(super) fn terminal_line_item(
         line: &LogLine,
-        query: &str,
+        query: Option<&regex::Regex>,
         selection: Option<(usize, usize)>,
         selection_bg: gpui_kit::Rgba,
         row_height: Pixels,
         font_size: Pixels,
         p: &'static Palette,
     ) -> AnyElement {
-        let hit = !query.is_empty() && line.text.to_lowercase().contains(query);
         let mut el = div()
             .h(row_height)
             .pr(px(19.))
             .line_height(row_height)
             .text_size(font_size)
             .whitespace_nowrap()
-            .text_color(line.color(p))
-            .when(hit, |el| el.bg(p.match_));
-        if line.kind == LineKind::Mark {
-            // Segment marker divider flanked by thin rules.
-            let mut label = div().flex_none().text_size(font_size * 0.84);
-            if selection.is_some() {
-                label = label.bg(selection_bg);
-            }
-            el = el
-                .flex()
+            .text_color(line.color(p));
+        let is_mark = line.kind == LineKind::Mark;
+        let mut label = div()
+            .flex()
+            .flex_none()
+            .when(is_mark, |label| label.text_size(font_size * 0.84));
+        if query.is_some_and(|pattern| pattern.is_match(&line.text)) || selection.is_some() {
+            let segments = crate::highlight::row_segments_with_selection(
+                &line.text,
+                &[],
+                None,
+                selection,
+                query,
+            );
+            label = label.children(segments.into_iter().map(|segment| {
+                div()
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .when(segment.search_match, |cell| cell.bg(p.match_))
+                    .when(segment.selected, |cell| cell.bg(selection_bg))
+                    .child(SharedString::from(segment.text))
+            }));
+        } else {
+            label = label.child(line.text.clone());
+        }
+        el = if is_mark {
+            el.flex()
                 .items_center()
                 .gap(px(9.))
                 .child(div().flex_1().h(px(1.)).bg(p.line))
-                .child(label.child(line.text.clone()))
-                .child(div().flex_1().h(px(1.)).bg(p.line));
-        } else if selection.is_some() {
-            let runs = crate::terminal_selection::split_plain_selection(&line.text, selection);
-            el = el.flex().children(runs.into_iter().map(|(text, selected)| {
-                let mut cell = div().flex_shrink_0().whitespace_nowrap();
-                if selected {
-                    cell = cell.bg(selection_bg);
-                }
-                cell.child(SharedString::from(text.to_owned()))
-            }));
+                .child(label)
+                .child(div().flex_1().h(px(1.)).bg(p.line))
         } else {
-            el = el.child(line.text.clone());
-        }
+            el.flex().child(label)
+        };
         el.into_any_element()
     }
 
@@ -1717,7 +1736,7 @@ impl Workbench {
     pub(super) fn terminal_row_item(
         session: &SessionView,
         idx: usize,
-        query: &str,
+        query: Option<&regex::Regex>,
         highlight_rules: &[crate::highlight::CompiledRule],
         selection: Option<(usize, usize)>,
         selection_bg: gpui_kit::Rgba,
@@ -1728,15 +1747,13 @@ impl Workbench {
         let Some(row) = session.displayed_row(idx) else {
             return div().h(row_height).into_any_element();
         };
-        let hit = !query.is_empty() && row.text.to_lowercase().contains(query);
         let mut el = div()
             .h(row_height)
             .pr(px(19.))
             .line_height(row_height)
             .text_size(font_size)
             .whitespace_nowrap()
-            .text_color(row.fg.map_or(p.term_fg, theme::rgba_hex))
-            .when(hit, |el| el.bg(p.match_));
+            .text_color(row.fg.map_or(p.term_fg, theme::rgba_hex));
         if let Some(bg) = row.bg {
             el = el.bg(theme::rgba_hex(bg));
         }
@@ -1746,9 +1763,11 @@ impl Workbench {
             highlight_rules,
             cursor_char,
             selection,
+            query,
         );
         if segments.len() == 1
             && !segments[0].is_cursor
+            && !segments[0].search_match
             && !segments[0].selected
             && segments[0].color.is_none()
         {
@@ -1769,6 +1788,8 @@ impl Workbench {
                     }
                     if segment.selected {
                         cell = cell.bg(selection_bg);
+                    } else if segment.search_match {
+                        cell = cell.bg(p.match_);
                     }
                     cell.child(SharedString::from(segment.text))
                 }
@@ -2073,6 +2094,7 @@ impl Workbench {
             .selected
             .min(self.duts.file.duts.len().saturating_sub(1));
         self.clear_dut_endpoint_drafts();
+        self.collapsed_connection_panels.remove(dut_id);
         self.heartbeat_drafts.remove(dut_id);
         self.boot_reference_edits.remove(dut_id);
         if let Some(index) = self.sessions.iter().position(|view| view.dut_id == dut_id) {

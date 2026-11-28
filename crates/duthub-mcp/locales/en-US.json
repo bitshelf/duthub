@@ -1,0 +1,23 @@
+{
+  "mcpBlockedUnauthorizedTitle": "Human intervention: Agent permission denied",
+  "mcpBlockedUnauthorizedDetail": "Agent '{requester}' cannot run '{action}' on {dut}: missing required DUT grant. Enable the grant in Connection mappings → MCP service if intended.",
+  "mcpBlockedUnauthorizedAction": "Grant the required DUT permission in duthub UI (Connection mappings → MCP service) or use a credential with the needed grant.",
+  "mcpBlockedManualTakeoverTitle": "Human intervention: Manual takeover active",
+  "mcpBlockedManualTakeoverDetail": "Agent '{requester}' cannot run '{action}' on {dut}: manual takeover mode is active. Click 'Release manual control' when ready to resume Agents.",
+  "mcpBlockedManualTakeoverAction": "Wait for the human operator to click 'Release manual control' in duthub.",
+  "mcpBlockedNeedsInspectionTitle": "Human intervention: DUT needs safety check",
+  "mcpBlockedNeedsInspectionDetail": "Agent '{requester}' cannot run '{action}' on {dut}: the outcome of the previous protected operation is unknown. Inspect the hardware and click 'Mark safe & recover' in duthub.",
+  "mcpBlockedNeedsInspectionAction": "Wait for the human operator to inspect the hardware and click 'Mark safe & recover'.",
+  "mcpBlockedProtectedTitle": "DUT in protected operation",
+  "mcpBlockedProtectedDetail": "Agent '{requester}' cannot run '{action}' on {dut}: protected operation '{op}' is running.",
+  "mcpBlockedProtectedAction": "Wait for the protected operation (such as firmware flashing) to finish, then retry.",
+  "mcpBlockedGuiHeldTitle": "Human intervention: GUI holds DUT control",
+  "mcpBlockedGuiHeldDetail": "Agent '{requester}' cannot run '{action}' on {dut}: desktop GUI currently holds control. Click 'Release control' to let Agents proceed.",
+  "mcpBlockedGuiHeldAction": "Ask the human operator to click 'Release control' in duthub (or launch with --release-gui-lease for unattended mode).",
+  "mcpBlockedMultiAgentTitle": "Human intervention: Multi-Agent DUT contention",
+  "mcpBlockedMultiAgentDetail": "Agent '{requester}' waited {waited_ms}ms for '{action}' on {dut}, still held by '{holder}' (queue {queue_len}). Check for Agent conflict or take over/release control.",
+  "mcpBlockedMultiAgentAction": "Wait for the current Agent to release its lease, increase waitMs, or wait for human intervention.",
+  "mcpBlockedGenericTitle": "DUT access blocked",
+  "mcpBlockedGenericDetail": "Agent '{requester}' cannot run '{action}' on {dut}: {error_msg}",
+  "mcpBlockedGenericAction": "Check dut_status and acquire/renew the control lease before retrying."
+}

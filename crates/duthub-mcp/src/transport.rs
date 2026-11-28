@@ -366,10 +366,20 @@ pub fn spawn_http_listener_loopback(
 
 fn build_http_runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .build()
         .map_err(|e| format!("MCP runtime 启动失败: {e}"))
+}
+
+/// Tune TCP socket buffers and disable Nagle's algorithm for high-throughput
+/// LAN image uploads (`curl -T` and `ztus` `h2c`) without failing on OS caps.
+fn tune_tcp_stream(stream: &tokio::net::TcpStream) {
+    const SOCKET_BUF_BYTES: usize = 4 * 1024 * 1024;
+    let _ = stream.set_nodelay(true);
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_recv_buffer_size(SOCKET_BUF_BYTES);
+    let _ = sock.set_send_buffer_size(SOCKET_BUF_BYTES);
 }
 
 /// Share routing, authentication, and logging between the blocking and managed server entry points.
@@ -387,6 +397,16 @@ async fn serve_listener(
     advertised: SocketAddr,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
+    use tower::ServiceExt as _;
+
+    const HTTP1_MAX_BUF_BYTES: usize = 1024 * 1024;
+    const HTTP2_STREAM_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
+    const HTTP2_CONN_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+    const HTTP2_MAX_FRAME_BYTES: u32 = 1024 * 1024;
+
     let bind_addr = listener.local_addr().ok();
     let router = http_router_for_listener(
         state,
@@ -403,13 +423,69 @@ async fn serve_listener(
         "[mcp] HTTP serving on {} (advertised {advertised})",
         listener.local_addr().map_or_default(|a| a.to_string())
     );
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
-    .map_err(|e| format!("MCP HTTP 服务错误: {e}"))
+
+    let (close_tx, close_rx) = tokio::sync::watch::channel(false);
+    let mut conns = tokio::task::JoinSet::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                let _ = close_tx.send(true);
+                break;
+            }
+            accepted = listener.accept() => {
+                let (stream, peer_addr) = match accepted {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        eprintln!("[mcp] accept error: {err}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                tune_tcp_stream(&stream);
+                let io = TokioIo::new(stream);
+                let svc_router = router.clone();
+                let mut conn_close = close_rx.clone();
+                conns.spawn(async move {
+                    let mut builder = AutoConnBuilder::new(TokioExecutor::new());
+                    builder.http1().max_buf_size(HTTP1_MAX_BUF_BYTES);
+                    builder
+                        .http2()
+                        .initial_stream_window_size(HTTP2_STREAM_WINDOW_BYTES)
+                        .initial_connection_window_size(HTTP2_CONN_WINDOW_BYTES)
+                        .adaptive_window(true)
+                        .max_frame_size(HTTP2_MAX_FRAME_BYTES);
+                    let service = service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                        let router = svc_router.clone();
+                        req.extensions_mut().insert(axum::extract::ConnectInfo(peer_addr));
+                        async move {
+                            let req = req.map(Body::new);
+                            router.oneshot(req).await
+                        }
+                    });
+                    let conn = builder.serve_connection_with_upgrades(io, service);
+                    let mut conn = std::pin::pin!(conn);
+                    tokio::select! {
+                        _ = conn.as_mut() => {}
+                        _ = conn_close.changed() => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = tokio::time::timeout(Duration::from_secs(2), conn).await;
+                        }
+                    }
+                });
+                // Reap finished connections eagerly so idle memory stays flat.
+                while conns.try_join_next().is_some() {}
+            }
+        }
+    }
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while conns.join_next().await.is_some() {}
+    })
+    .await;
+    Ok(())
 }
 
 /// Allow loopback binds and require Bearer authentication for other addresses.

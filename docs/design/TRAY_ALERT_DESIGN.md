@@ -17,7 +17,7 @@
 | # | 用户需求 | 可验收契约 |
 |---|---|---|
 | R1 | 心跳判板子卡死 → 弹出 ⚠ 放大警告 | 可见态沿用「需要人工干预」Dialog，`icon("alert")` 25px → 44px；只改尺寸/布局，**不动任何既有文案** |
-| R2 | 点 X = 最小化到通知区域，程序继续运行 | 首次 render 装好托盘（§2.1），四条关闭入口 → 隐藏 + 图标出现；进程/会话/采集/MCP 存活；**双开不得产生无法关闭的隐藏进程**（§2.3） |
+| R2 | 点 X = 最小化到通知区域，程序继续运行 | 首次 render 注册图标（§2.1），四条关闭入口 → 隐藏窗口；进程/会话/采集/MCP 存活；**双开不得产生无法关闭的隐藏进程**（§2.3） |
 | R3 | 已在通知区域 → 不弹窗，改为图标抖动 | 隐藏态由 50 ms tick 的 `alert_present_tick` 消费 AlertCenter：气球 + 闪烁（§5.1）；恢复后按队列补弹 |
 | R4 | 继电器掉线也是异常 | 板卡级单通道只读 STATUS；`Online→Offline` 才告警；占用/按住测试/PDU/空 node/未绑定**不算掉线**（§6.2） |
 | R5 | 最小化后整个程序正常运行 | §3.1 职责表：每行都有隐藏后仍运行的 owner |
@@ -29,14 +29,21 @@
 
 ### 2.1 托盘安装（首次 render）+ 关闭（四条入口 → 一个决策点）
 
-**托盘在首次 `render_root` 安装**（那里有 `&mut Window`）：`tray::install(window, options)` 自己取 `HWND` 并存进 `TrayHandle`，A2 全程不碰 `windows` crate。`install` 只建线程与隐藏窗口、**不** `NIM_ADD`（图标只在 `hide_main()` 时出现）。不需要新开 `if !self_test` 块（`install` 本身判 `!self_test`，规避坑 #79 的锚点）。
+**首次渲染时注册托盘图标**：`tray::install(window, options)` 获取 `HWND` 并创建托盘宿主。安装成功后，工作台调用 `set_icon_visible(true)` 注册图标。注册失败时保留宿主，供下次隐藏窗口时重试。`--self-test` 跳过安装。
 
 ```rust
 // render_root 首次帧
-if !self_test && self.tray.is_none() && !self.tray_failed {
+if !self.agent_self_test && !self.quitting && self.tray.is_none() && !self.tray_failed {
     match tray::install(window, TrayOptions { tooltip: t(trayTooltip), show_label: t(trayShowMain), quit_label: t(trayQuit) }) {
-        Ok(h) => self.tray = Some(h),
-        Err(e) => { self.tray_failed = true; eprintln!("[tray] 安装失败: {e}"); self.pending_toasts.push(t(trayUnavailable)); }
+        Ok(tray) => {
+            let _ = tray.set_icon_visible(true);
+            self.tray = Some(tray);
+        }
+        Err(error) => {
+            self.tray_failed = true;
+            eprintln!("[tray] install failed: {error}");
+            self.notify_toast(crate::i18n::label("trayUnavailable"));
+        }
     }
 }
 ```
@@ -48,7 +55,7 @@ if !self_test && self.tray.is_none() && !self.tray_failed {
 
 ```text
 should_close(window, cx)                     // 回调内只读字段，绝不做窗口操作
- ├ quitting → true                            // 托盘退出只在隐藏态发起；浮窗已在隐藏时关闭
+ ├ quitting → true                            // 托盘菜单可在主窗口打开或隐藏时发起退出
  └ close_disposition(tray.is_some(), false) 的两个分支都：cx.defer(move |cx| run_close_plan(plan)); false
 
 run_close_plan(cx: &mut App)                 // defer 回调：此刻没有 Workbench 租约
@@ -63,11 +70,11 @@ run_close_plan(cx: &mut App)                 // defer 回调：此刻没有 Work
 
 **为什么 Quit 也必须走这条链**：浮窗也是窗口，主窗销毁后 `windows` 不空 → 进程不退且只剩孤立浮窗；随后主窗观察者 feed `MainWindowClosed` → `(P::Floating, E::MainWindowClosed) => (P::Closing, A::CloseFloatWindow)`（`capture_ui.rs:112-116`）→ `close_float_window`（`workspace.rs:7042-7049`）在自己的租约内 `float.handle.update(...remove_window())` → 浮窗 `trail` 再调观察者 → `double_lease_panic`。先关浮窗再销毁主窗，`windows` 才会真的空。**两条必须同时做的防呆**：① **唯一的 `cx.on_window_closed` 订阅（float / main 两分支）body 一律改为 `cx.defer(move |cx| { let _ = weak.update(...) })`**——观察者在 `trail` 里同步执行，推迟一拍就从根上消除「在别人的租约里 weak.update 自己」这一类 panic。② **运行期 `NIM_ADD` 失败必须有回退**（`hide_main()` 返回 false 时同步回滚；`TaskbarCreated` 重放失败由托盘线程发 `TrayEvent::IconLost`，UI 收到后 `show_from_tray` + toast `trayIconFailed`）。也不能改成「先 `take()` 再 `remove_window`」：观察者靠 `float_window.handle.window_id()` 匹配（`workspace.rs:1593-1611`），take 后永不匹配 → placement 停在 `Floating`、`frame_pump.float` 被清空 → `release_monitor` 因 `Floating` 提前返回（`workspace.rs:6970-6976`）。
 
-`show_from_tray`：`tray.show_main()`（内部 `ShowWindowAsync(main_hwnd, SW_SHOW)`；**不是** `SW_SHOWNORMAL`——后者在最大化/最小化时恢复原始尺寸会丢最大化）→ `main_window.update(cx,|_,w,_| w.activate_window())` → `hidden=false`、`set_merge_duplicates(false)`、`tray.set_alert(false)`、`tray.set_icon_visible(false)`。顺序不可颠倒：`activate()` 只在 `IsIconic` 时 `SW_RESTORE`，对隐藏窗什么都不做（`gpui-pre-windows/src/window.rs:817-829`）。一律 `ShowWindowAsync`（gpui 最小化路径同样用异步版，`events.rs:1139-1142`）：从 update 里同步 `ShowWindow` 会重入 WndProc 触发一次被 defer 的 draw。
+`show_from_tray`：`tray.show_main()`（内部 `ShowWindowAsync(main_hwnd, SW_SHOW)`；**不是** `SW_SHOWNORMAL`——后者在最大化/最小化时恢复原始尺寸会丢最大化）→ `main_window.update(cx,|_,w,_| w.activate_window())` → `hidden=false`、`set_merge_duplicates(false)`、`tray.set_alert(false)`。恢复后托盘图标继续保留。显示窗口应先于激活：`activate()` 只在 `IsIconic` 时 `SW_RESTORE`，对隐藏窗什么都不做（`gpui-pre-windows/src/window.rs:817-829`）。一律 `ShowWindowAsync`（gpui 最小化路径同样用异步版，`events.rs:1139-1142`）：从 update 里同步 `ShowWindow` 会重入 WndProc 触发一次被 defer 的 draw。
 
 ### 2.2 状态与退出
 
-`Visible`（可见、无图标、应用内 Dialog）→ `Hidden`（隐藏、有图标、气球+闪烁）→ `Quitting`（图标删除、不呈现告警）。`quitting` 置位后 `close_disposition` 恒 `Quit`。`Workbench::begin_quit(&mut self, cx)`：① **`release_relay_and_join(cx, 3s)`**——`release_relay` 只发 oneshot（`workspace.rs:5014-5020`），worker 要等 `released.blocking_recv()`（`control.rs:469`）之后才 `backend.power(off)`（`:472-478`），退出必须等它：发信号后轮询 `RelayPress.worker.is_finished()` 至多 3 s，完成即 `join()` 取结果；超时记日志「继电器 OFF 未确认」并继续退出（绝不再重发 ON）。隐藏路径只发信号不 join（UI 还在跑，worker 会自己完成）。② 逐个 `device.close_session(dut_id)`（`try_send(Close)` + 异步 abort，**不阻塞 UI 线程**；写线程收尾在会话 task 的 `SessionCtx` Drop 里，3 s 兜底，坑 #47）。③ `agent_host.take() → stop_all()`、`a2a.take() → shutdown()`、`mcp_runtime.shutdown()`（每监听器 ≤500 ms，`mcp_runtime.rs:512-520`）。④ `tray.remove()`（§4.5）→ `cx.quit()`。UI 线程预算 ≤5 s（含 ①），超时仍继续退出。**用 `take()` 保证 `Drop for Workbench`（`workspace.rs:1200-1211`）幂等**。采集/录屏不在此拆：`Capture::Drop`/`InlinePreview::Drop`（`media.rs:526` 起）+ 应用级 Job 容器（`main.rs:38-47`）兜底；录制中会话被 pin（坑 #94）。
+`Visible`（可见、有托盘图标、应用内 Dialog）→ `Hidden`（隐藏、有图标、气球+闪烁）→ `Quitting`（图标删除、不呈现告警）。`quitting` 置位后 `close_disposition` 恒 `Quit`。`Workbench::begin_quit(&mut self, cx)`：① **`release_relay_and_join(cx, 3s)`**——`release_relay` 只发 oneshot（`workspace.rs:5014-5020`），worker 要等 `released.blocking_recv()`（`control.rs:469`）之后才 `backend.power(off)`（`:472-478`），退出必须等它：发信号后轮询 `RelayPress.worker.is_finished()` 至多 3 s，完成即 `join()` 取结果；超时记日志「继电器 OFF 未确认」并继续退出（绝不再重发 ON）。隐藏路径只发信号不 join（UI 还在跑，worker 会自己完成）。② 逐个 `device.close_session(dut_id)`（`try_send(Close)` + 异步 abort，**不阻塞 UI 线程**；写线程收尾在会话 task 的 `SessionCtx` Drop 里，3 s 兜底，坑 #47）。③ `agent_host.take() → stop_all()`、`a2a.take() → shutdown()`、`mcp_runtime.shutdown()`（每监听器 ≤500 ms，`mcp_runtime.rs:512-520`）。④ `tray.remove()`（§4.5）→ `cx.quit()`。UI 线程预算 ≤5 s（含 ①），超时仍继续退出。**用 `take()` 保证 `Drop for Workbench`（`workspace.rs:1200-1211`）幂等**。采集/录屏不在此拆：`Capture::Drop`/`InlinePreview::Drop`（`media.rs:526` 起）+ 应用级 Job 容器（`main.rs:38-47`）兜底；录制中会话被 pin（坑 #94）。
 
 **系统关机/注销**：`WM_QUERYENDSESSION → 1`、`WM_ENDSESSION → handle_end_session → quit 回调 → PostQuitMessage`（`gpui-pre-windows/src/platform.rs:1221-1222`、`1274-1290`），**绕过** `should_close`，隐藏态照样退出；托盘线程随进程退出（注销时 shell 自清图标），`--self-test` 从不安装托盘。副作用：不带 `/F` 的 `taskkill` 结束不了进程（WM_CLOSE 被吞），回归脚本用 `/F`。**最小化按钮保持原生**：`WindowControlArea::Minimize` 由 gpui 直接 `ShowWindowAsync(SW_MINIMIZE)`（`events.rs:1139-1142`）。官方要求「隐藏挂 Minimize、不要劫持 Close」；本产品按用户需求偏离，故偏离只限 Close。
 
@@ -109,7 +116,7 @@ run_close_plan(cx: &mut App)                 // defer 回调：此刻没有 Work
 
 ### 4.3 注册、版本、重建
 
-`NIM_ADD → NIM_SETVERSION(uVersion = NOTIFYICON_VERSION_4)` 每次成对（版本设置不跨登录保持）。`TaskbarCreated = RegisterWindowMessageW("TaskbarCreated")` 必须在首次 ADD **之前**注册好；收到后按**当前期望状态**整体重放 `NIM_ADD + NIM_SETVERSION`；**重放失败 → `send(TrayEvent::IconLost)`**（UI 恢复主窗 + toast，§2.1 防呆②）。图标**只在隐藏期间存在**：`set_icon_visible(false)` → `NIM_DELETE`（带 GUID），`true` → `NIM_ADD + NIM_SETVERSION`（返回 `bool`）。
+`NIM_ADD → NIM_SETVERSION(uVersion = NOTIFYICON_VERSION_4)` 每次成对（版本设置不跨登录保持）。`TaskbarCreated = RegisterWindowMessageW("TaskbarCreated")` 必须在首次 ADD **之前**注册好；收到后按**当前期望状态**整体重放 `NIM_ADD + NIM_SETVERSION`；**重放失败 → `send(TrayEvent::IconLost)`**（UI 恢复主窗 + toast，§2.1 防呆②）。首次渲染成功注册后，图标在最小化、隐藏和恢复期间持续存在，退出时由 `remove()` 清理。
 
 ### 4.4 事件与菜单
 
@@ -156,6 +163,8 @@ alert_present_tick():                        // 每 50 ms tick 调一次；闭�
 `render_alert_dialog_body`（`workspace.rs:7320-7449`）：`icon("alert").size(px(25.))` → 独立首行 `px(44.)`（`p.red`），来源 chip 与相对时间同排；标题/正文/按钮排顺序与文案**逐字不变**；浮层按钮继续手绘 div（坑 #2）。
 
 ### 5.3 队列：按来源隔离 + 上界 + 抑制路由
+
+告警弹窗中点击「知道了」会一次确认当前弹窗和点击时已排队的所有告警。之后新到的告警继续按既有规则提示。右上角关闭按钮只关闭当前一条，「忽略告警」继续按来源抑制。
 
 - `MAX_PENDING = 64`、`MAX_PENDING_PER_SOURCE = 16`：满时**只在同来源内**丢最旧；同来源也满则**拒收**。`AgentNotice` 永远不能驱逐 `Heartbeat`/`Control`/`Serial`/`Relay`/`Flash`/`Agent`。
 - **不改既有签名**：`report_at`/`report_at_for`/`report_for` **全部保持 `-> bool`**（既有测试的 `assert!` 与 4 处裸语句调用原样通过，避免 `unused_must_use` 打红 clippy）。新增 `report_checked_at_for`/`report_checked_for` → `Result<(), ReportRejection>`，`ReportRejection { Disabled, Suppressed, Duplicate, Capacity }`（`Disabled` = 该 DUT 的 `alertsByDut.<id>.enabled=false`；**全局总开关已于 2026-11-25 从 `settings.alerts` 移除**，非 DUT 主体只能按来源抑制）；旧的 bool 版一律 `.is_ok()` 委托；**通知器调用 checked 变体**才能拿到 `reason`。
@@ -377,7 +386,7 @@ impl duthub_mcp::notify::UserNotifier for RuntimeMcpState { fn notify(&self, req
 
 ### 10.2 托盘集成测试（`#[ignore]`，实机显式跑）
 
-`tests/tray_win32.rs`（`#[ignore]` 项前置：必须有交互式桌面会话）：① `install(&mut window, …)` 后 `hide_main()` 返回 true，`test_probe().main_visible == false` 且 `icon_rect.is_some()`（None 时打印「图标在溢出区」并失败）；② `show_main()` 后 `main_visible == true`（最大化窗口恢复后仍最大化，人工确认）；③ 向 `test_probe().hwnd` 投 `taskbar_created_msg` 后 `icon_rect` 仍可达；④ `set_alert(true/false)` 可停，等到 `FLASH_MAX_MS` 自动停止；⑤ `remove()` 后 `icon_rect.is_none()` 且 `Drop` 二调不 panic；⑥ `animations_enabled()`/`notification_gate()` 可调用不 panic。该文件另含菜单映射/门查询/「图标未建立时命令无副作用」等无 shell 项。`HiddenAlertRouter` + 真实 `TrayHandle` 的联动用例（原 `tray_alert_route.rs`）**本轮未单独落地**：纯路由由 `tests/tray_logic.rs` 覆盖，真实气球由 `icon_lifecycle_against_a_real_shell` 手工调用覆盖；两者组合见 §12.6。
+`tests/tray_win32.rs`（`#[ignore]` 项前置：必须有交互式桌面会话）：① 安装宿主并注册图标后，窗口可见且 `icon_rect.is_some()`。`hide_main()` 成功后窗口隐藏，图标仍可达；② `show_main()` 后窗口可见，图标仍可达（任务栏按钮和托盘图标共存、最大化窗口恢复后仍最大化，由人工确认）；③ 向 `test_probe().hwnd` 投 `taskbar_created_msg` 后 `icon_rect` 仍可达；④ `set_alert(true/false)` 可停，等到 `FLASH_MAX_MS` 自动停止；⑤ `remove()` 后 `icon_rect.is_none()` 且 `Drop` 二调不 panic；⑥ `animations_enabled()`/`notification_gate()` 可调用不 panic。该文件另含菜单映射/门查询/「图标未建立时命令无副作用」等无 shell 项。`HiddenAlertRouter` + 真实 `TrayHandle` 的联动用例（原 `tray_alert_route.rs`）**本轮未单独落地**：纯路由由 `tests/tray_logic.rs` 覆盖，真实气球由 `icon_lifecycle_against_a_real_shell` 手工调用覆盖；两者组合见 §12.6。
 
 ### 10.3 桌面定向测试与实机验收
 

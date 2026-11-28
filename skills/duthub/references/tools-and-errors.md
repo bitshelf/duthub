@@ -79,7 +79,9 @@ Response: `segmentCount`, `totalRawBytes`, `exportBytes`, `sha256`, `snapshotAtU
 | `SESSION_NAME_REQUIRED` | `acquire_lease` called without valid `sessionName` | Retry with a concise descriptive `sessionName` (e.g. `"ci-flash-rk3576"`). |
 | `INVALID_KEY` | Unknown logical key in `serial_exec.keys` (zero bytes sent) | Fix the key name to the allowed list (`ctrl+c`, `esc`, `enter`, `up`, etc.) and retry. |
 | `INVALID_REGEX` | Malformed or oversized regex in `waitRegex` / `expectRegex` | Simplify pattern (≤256 chars) and retry. |
-| `DUT_PROTECTED` | Active protected operation (e.g. `flash_update`) | Wait and poll `dut_status` until `dutState == "ready"`. |
+| `DUT_PROTECTED` | Active protected operation (e.g. `flash_update`) | Wait and poll `dut_status` until `dutState == "ready"`. Note: uploading a **different** image filename is allowed concurrently while flashing. |
+| `FILE_IN_USE` (`409`) | Attempted to upload/overwrite the exact image file currently being flashed (`activeFlashFile`) | Upload under a different filename to run concurrently, or wait until `flash_update` completes. |
+| `UPLOAD_IN_PROGRESS` (`409` / MCP) | Same `(dutId, filename)` already has an active upload, or `flash_update` targeted an image still being uploaded | Wait for the active upload to finish before flashing or re-uploading that filename (different filenames can run concurrently). |
 | `MANUAL_CONTROL` | Human Manual Takeover is enabled | Stop all write/control calls; wait until operator turns off Manual Takeover. |
 | `NEEDS_INSPECTION` | Hardware fault locked the DUT | Call `notify_user` summarizing the failure and wait for operator clearance. |
 | `INVALID_FILE_ID` / `IMAGE_NOT_FOUND` | Bad image filename/path or image not staged inside the DUT folder | Pass a plain filename or `image/<name>` (`.img`/`.bin`/`.iso`) from `dut_files(category="image")`; if absent, upload via `PUT /dut/{dutId}/image/{filename}` (`curl -T`) or tus 1.0.0 `/dut/{dutId}/transfer` (`ztus`). |

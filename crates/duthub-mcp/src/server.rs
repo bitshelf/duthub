@@ -305,7 +305,7 @@ pub struct LogExportArgs {
 struct DutFilesArgs {
     /// Omit to discover all DUT folders in the working directory.
     dut_id: Option<String>,
-    /// Optional category filter: `image` | `TEST` | `压力&老化` | `串口日志` | `misc` | `feedback`.
+    /// Optional category filter. Use an exact category name listed in the tool description.
     #[serde(default)]
     category: Option<String>,
     #[serde(default)]
@@ -1184,72 +1184,103 @@ impl McpServerCore {
             .as_ref()
             .is_some_and(|a| a.lease.manual_control());
 
-        let (title, reason, suggested_action) = match (code.as_str(), manual, status.as_ref()) {
+        let self_recoverable_code = matches!(
+            code.as_str(),
+            "LEASE_UNKNOWN"
+                | "LEASE_EXPIRED"
+                | "LEASE_REQUIRED"
+                | "NOT_HOLDER"
+                | "STALE_GENERATION"
+                | "QUEUED_AHEAD"
+        );
+        let (requires_human, notice_kind) = match (code.as_str(), manual, status.as_ref()) {
             ("UNAUTHORIZED", _, _) => (
-                "Human intervention: Agent permission denied",
-                format!(
-                    "Agent '{requester}' cannot run '{action_label}' on {dut_label}: missing required DUT grant. Enable the grant in Connection -> MCP service if intended."
-                ),
-                "Grant the required DUT permission in duthub UI (Connection -> MCP service) or use a credential with the needed grant.",
+                true,
+                crate::i18n::BlockedNoticeKind::Unauthorized {
+                    requester,
+                    action: action_label,
+                    dut: &dut_label,
+                },
             ),
             (_, true, _) => (
-                "Human intervention: Manual takeover active",
-                format!(
-                    "Agent '{requester}' cannot run '{action_label}' on {dut_label}: manual takeover mode is active. Turn off Manual Takeover when ready to resume Agents."
-                ),
-                "Wait for the human operator to disable Manual Takeover in duthub.",
+                true,
+                crate::i18n::BlockedNoticeKind::ManualTakeover {
+                    requester,
+                    action: action_label,
+                    dut: &dut_label,
+                },
             ),
             (_, false, Some(st)) if st.phase == duthub_core::lease::LeasePhase::NeedsInspection => {
                 (
-                    "Human intervention: DUT needs safety check",
-                    format!(
-                        "Agent '{requester}' cannot run '{action_label}' on {dut_label}: previous critical operation requires manual inspection and recovery in duthub."
-                    ),
-                    "Wait for the human operator to inspect the hardware and click 'Mark safe & recover'.",
+                    true,
+                    crate::i18n::BlockedNoticeKind::NeedsInspection {
+                        requester,
+                        action: action_label,
+                        dut: &dut_label,
+                    },
                 )
             }
-            (_, false, Some(st)) if st.phase == duthub_core::lease::LeasePhase::Protected => {
-                let op = st.protected_op.as_deref().unwrap_or("critical operation");
-                (
-                    "Human intervention: DUT in protected operation",
-                    format!(
-                        "Agent '{requester}' cannot run '{action_label}' on {dut_label}: protected operation '{op}' is running."
-                    ),
-                    "Wait for the protected operation (such as firmware flashing) to finish, then retry.",
-                )
-            }
+            // Normal protected operations (such as active firmware flashing) do not need
+            // a human-intervention popup — return clear status so the Agent waits or
+            // uploads a different image concurrently.
+            (_, false, Some(st)) if st.phase == duthub_core::lease::LeasePhase::Protected => (
+                false,
+                crate::i18n::BlockedNoticeKind::Protected {
+                    requester,
+                    action: action_label,
+                    dut: &dut_label,
+                    op: st.protected_op.as_deref().unwrap_or("critical operation"),
+                },
+            ),
+            // Agent-recoverable lease errors (stale/expired/missing leaseId) do not warrant
+            // interrupting the desktop operator; the Agent can simply call `acquire_lease`.
+            _ if self_recoverable_code => (
+                false,
+                crate::i18n::BlockedNoticeKind::Generic {
+                    requester,
+                    action: action_label,
+                    dut: &dut_label,
+                    error_msg: &err.message,
+                },
+            ),
             (_, false, Some(st)) if st.phase == duthub_core::lease::LeasePhase::Held => {
                 let holder = st.holder.as_deref().unwrap_or("another holder");
                 if holder.starts_with("GUI") {
                     (
-                        "Human intervention: GUI holds DUT control",
-                        format!(
-                            "Agent '{requester}' cannot run '{action_label}' on {dut_label}: desktop GUI currently holds control. Click 'Release control' to let Agents proceed."
-                        ),
-                        "Ask the human operator to click 'Release control' in duthub (or launch with --release-gui-lease for unattended mode).",
+                        true,
+                        crate::i18n::BlockedNoticeKind::GuiHeld {
+                            requester,
+                            action: action_label,
+                            dut: &dut_label,
+                        },
                     )
                 } else {
                     (
-                        "Human intervention: Multi-Agent DUT contention",
-                        format!(
-                            "Agent '{requester}' waited {waited_ms}ms for '{action_label}' on {dut_label}, still held by '{holder}' (queue {}). Check for Agent conflict or take over/release control.",
-                            st.queue_len
-                        ),
-                        "Wait for the current Agent to release its lease, increase waitMs, or wait for human intervention.",
+                        true,
+                        crate::i18n::BlockedNoticeKind::MultiAgent {
+                            requester,
+                            action: action_label,
+                            dut: &dut_label,
+                            holder,
+                            waited_ms,
+                            queue_len: st.queue_len,
+                        },
                     )
                 }
             }
             _ => (
-                "Human intervention: DUT access blocked",
-                format!(
-                    "Agent '{requester}' cannot run '{action_label}' on {dut_label}: {}",
-                    err.message
-                ),
-                "Check dut_status and resolve lease or permission state before retrying.",
+                false,
+                crate::i18n::BlockedNoticeKind::Generic {
+                    requester,
+                    action: action_label,
+                    dut: &dut_label,
+                    error_msg: &err.message,
+                },
             ),
         };
+        let (title, reason, suggested_action) = self.state.blocked_notice_texts(notice_kind);
 
-        let should_notify = notify_on_blocked.unwrap_or(true);
+        let should_notify = requires_human && notify_on_blocked.unwrap_or(true);
         let notify_outcome = if should_notify && let Some(notifier) = &self.notifier {
             let req = NotifyRequest {
                 dut_id: Some(dut_id.to_owned()),
@@ -1698,6 +1729,7 @@ impl McpServerCore {
             "allowedExtensions": [".img", ".bin", ".iso"],
             "maxBytes": crate::http_transfer::MAX_IMAGE_UPLOAD_BYTES,
             "canUpload": can_flash,
+            "concurrentWithFlash": true,
             "clients": ["curl", "ztus"],
         });
         let logs_export = serde_json::json!({
@@ -1705,12 +1737,16 @@ impl McpServerCore {
             "downloadUrl": format!("{base_url}/dut/{dut_id_ref}/logs/export"),
             "gzipDownloadUrl": format!("{base_url}/dut/{dut_id_ref}/logs/export?format=gzip"),
         });
+        let active_flash_file = control_dto.as_ref().and_then(|c| c.protected_file.clone());
         let mut payload = serde_json::to_value(&info).unwrap_or(serde_json::Value::Null);
         payload["dutState"] = serde_json::json!(dut_state);
         payload["nextActionHint"] = serde_json::json!(next_action_hint);
         payload["session_id"] = serde_json::json!(session_id);
         payload["session_open"] = serde_json::json!(session_id.is_some());
         payload["sessionEpoch"] = serde_json::json!(self.state.session_epoch(&args.dut_id));
+        if let Some(active_file) = active_flash_file {
+            payload["activeFlashFile"] = serde_json::json!(active_file);
+        }
         payload["capabilities"] = capabilities;
         payload["flashPresets"] = serde_json::json!(flash_presets);
         payload["transfer"] = transfer;
@@ -3429,6 +3465,16 @@ impl McpServerCore {
                             "INVALID_FILE_ID: '{fid}' is not a valid DUT image fileId. Pass a plain filename or 'image/<name>' ending with .img/.bin/.iso from dut_files(category=\"image\")."
                         ));
                     }
+                    // Reject flashing a file whose upload is still in progress (reverse race guard).
+                    let target_basename = fid.rsplit(['/', '\\']).next().unwrap_or(fid);
+                    if access
+                        .as_ref()
+                        .is_some_and(|ctx| ctx.is_upload_active(&dut_id, target_basename))
+                    {
+                        return Err(format!(
+                            "UPLOAD_IN_PROGRESS: '{fid}' is currently being uploaded; wait for the upload to complete before flashing it (other already-uploaded images can be flashed concurrently)."
+                        ));
+                    }
                     // Pre-check image presence before entering Protected state so missing files
                     // return actionable guidance and available images without locking the DUT.
                     if let (Some(root), Some(dut)) =
@@ -3475,7 +3521,15 @@ impl McpServerCore {
                         });
                     let protected = access
                         .as_ref()
-                        .and_then(|ctx| ctx.lease.enter_protected(&dut_id, &format!("flash_update {fid}")).ok())
+                        .and_then(|ctx| {
+                            ctx.lease
+                                .enter_protected_with_file(
+                                    &dut_id,
+                                    &format!("flash_update {fid}"),
+                                    Some(target_basename),
+                                )
+                                .ok()
+                        })
                         .is_some();
                     let outcome = state.flash_update(&dut_id, fid, preset_id.as_deref(), identity);
                     if protected && let Some(ctx) = &access {
@@ -4757,10 +4811,10 @@ QUICK RECIPES (one-shot, zero guessing):\n\
 1. Discover & inspect: `dut_list` -> `dut_status` {{\"dutId\":\"<id>\"}} (check `dutState`, `capabilities`, `flashPresets`, `transfer`, `logsExport`, `relay.channels`, `adbSerial`, `bootModes.recommendedLoaderFlow`).\n\
 2. Live/archived serial, bulk logs & screenshots (Tools OR Resources; ANSI highlight codes stripped automatically):\n\
    - Live tail: resource `duthub://dut/{{dutId}}/serial/tail` OR `serial_read` {{\"dutId\":\"<id>\",\"tail\":100}} (track `sessionEpoch` to detect restarts).\n\
-   - Bulk logs: `log_export` {{\"dutId\":\"<id>\"}} (inline if <=256 KiB, or single HTTP GET on `downloadUrl`/`gzipDownloadUrl` with SHA-256); per-segment pagination via `log_segments` + `log_segment_read`.\n\
+   - Bulk logs: `log_export` {{\"dutId\":\"<id>\"}} (inline if <=256 KiB, or single HTTP GET on `downloadUrl`/`gzipDownloadUrl` with SHA-256); per-segment pagination via `log_segments` + `log_segment_read`. Always save Agent-side downloaded logs and transfer logs under `.duthub/logs/<dutId>/` in your workspace (never repo root or `/tmp`).\n\
    - Screenshot/Recording: `media_streams` {{\"dutId\":\"<id>\",\"op\":{{\"kind\":\"snapshot\"}}}} (read returned PNG via `artifact.resourceUri`) or `recordStart`/`recordStop`.\n\
 3. Upload images, control board, ADB debug & flash (user-configured listeners with matching DUT grants):\n\
-   - Image upload (requires `flash` grant): stream `.img`/`.bin`/`.iso` via `PUT /dut/{{dutId}}/image/{{filename}}` (`curl -T`, optional `X-Content-SHA256`) or resumable tus 1.0.0 `/dut/{{dutId}}/transfer` (`ztus` / `curl`), then verify via `dut_files` {{\"dutId\":\"<id>\",\"category\":\"image\"}}.\n\
+   - Image upload (requires `flash` grant): stream `.img`/`.bin`/`.iso` via `PUT /dut/{{dutId}}/image/{{filename}}` (`curl -T`, optional `X-Content-SHA256`) or resumable high-speed tus 1.0.0 `/dut/{{dutId}}/transfer` (`ztus` / `curl`), then verify via `dut_files` {{\"dutId\":\"<id>\",\"category\":\"image\"}}. Uploading a different filename is allowed concurrently while flashing; uploading the same `activeFlashFile` returns `409 FILE_IN_USE`.\n\
    - Hardware control: `dut_control` {{\"dutId\":\"<id>\",\"action\":\"reset\"|\"power_cycle\"|\"enter_maskrom\"|\"enter_loader\"|\"flash_list\"|\"flash_update\"|\"flash_reboot\"}}.\n\
    - Multi-Agent arbitration: concurrent calls auto-queue in FIFO order (`waitMs`, default 5000ms). For multi-step atomic flows (enter Loader -> flash -> boot), acquire a session lease via `dut_control` {{\"dutId\":\"<id>\",\"action\":\"acquire_lease\",\"sessionName\":\"...\",\"waitMs\":15000}}, pass `leaseId` to each step, and finish with `release_lease`. If access cannot be acquired (manual takeover, GUI holding control, another Agent busy, protected flash, or missing grant), duthub automatically raises a desktop human-intervention alert explaining why and returns `humanNotified`/`reason`/`holder` in error data (set `notifyOnBlocked: false` to probe silently).\n\
    - Only `reset` wired: `serial_exec` {{\"dutId\":\"<id>\",\"triggerReset\":true,\"waitFor\":\"Hit any key\",\"send\":\"\\r\",\"thenSend\":\"rockusb 0 mmc 0\\r\",\"timeoutMs\":15000}} or Linux `{{\"dutId\":\"<id>\",\"text\":\"reboot loader\\r\"}}`.\n\

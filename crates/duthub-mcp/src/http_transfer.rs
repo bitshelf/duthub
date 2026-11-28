@@ -13,7 +13,7 @@
 //! rejected with actionable guidance). Log export requires `DutAction::Read`.
 
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{BufWriter, Seek as _, SeekFrom, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,10 +24,10 @@ use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, options, put};
 use base64::Engine as _;
+use bytes::Bytes;
 use http_body_util::BodyExt as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 use duthub_core::Principal;
 use duthub_core::agent_access::DutAction;
@@ -46,6 +46,10 @@ pub const MAX_IMAGE_UPLOAD_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 pub const TUS_VERSION: &str = "1.0.0";
 /// Maximum simultaneous in-flight tus sessions kept in memory per listener.
 const MAX_TUS_SESSIONS: usize = 64;
+/// Sequential write buffer size per upload writer thread (4 MiB) to minimize OS syscalls.
+const UPLOAD_WRITE_BUF_BYTES: usize = 4 * 1024 * 1024;
+/// Bounded pipeline queue depth between async network reads and blocking disk writes.
+const UPLOAD_CHANNEL_CAPACITY: usize = 16;
 
 #[derive(Clone)]
 pub(crate) struct HttpTransferState {
@@ -80,8 +84,123 @@ struct TusUploadSession {
     total_length: u64,
     offset: u64,
     expected_sha256: Option<String>,
-    hasher: Sha256,
+    hasher: Option<Sha256>,
     busy: bool,
+}
+
+/// RAII reservation of an active upload slot for single-request `PUT` uploads.
+struct ActiveUploadGuard {
+    access: Option<Arc<AccessContext>>,
+    dut_id: String,
+    filename: String,
+}
+
+impl Drop for ActiveUploadGuard {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.access.as_ref() {
+            ctx.end_upload(&self.dut_id, &self.filename);
+        }
+    }
+}
+
+struct StreamWriteConfig {
+    start_offset: u64,
+    max_total_bytes: u64,
+    overflow_status: StatusCode,
+    overflow_payload: serde_json::Value,
+    truncate_to_written: bool,
+}
+
+/// Stream an HTTP body into a dedicated blocking buffered file writer while updating SHA-256
+/// incrementally on the writer thread. Keeps memory bounded (O(1)) and overlaps network I/O
+/// with disk writes and hashing.
+async fn stream_body_to_file(
+    mut body: Body,
+    file: std::fs::File,
+    cfg: StreamWriteConfig,
+    mut hasher: Sha256,
+) -> Result<(u64, Sha256), (StatusCode, serde_json::Value)> {
+    let StreamWriteConfig {
+        start_offset,
+        max_total_bytes,
+        overflow_status,
+        overflow_payload,
+        truncate_to_written,
+    } = cfg;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(UPLOAD_CHANNEL_CAPACITY);
+    let writer_handle = tokio::task::spawn_blocking(move || -> std::io::Result<Sha256> {
+        let mut file = file;
+        if start_offset > 0 {
+            file.seek(SeekFrom::Start(start_offset))?;
+        }
+        let mut written: u64 = 0;
+        let mut writer = BufWriter::with_capacity(UPLOAD_WRITE_BUF_BYTES, file);
+        while let Some(chunk) = rx.blocking_recv() {
+            writer.write_all(&chunk)?;
+            hasher.update(&chunk);
+            written = written.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        }
+        writer.flush()?;
+        if truncate_to_written {
+            let inner = writer
+                .into_inner()
+                .map_err(std::io::IntoInnerError::into_error)?;
+            let _ = inner.set_len(start_offset.saturating_add(written));
+        }
+        Ok(hasher)
+    });
+
+    let mut received: u64 = 0;
+    let mut stream_err: Option<(StatusCode, serde_json::Value)> = None;
+    while let Some(frame_result) = body.frame().await {
+        let frame = match frame_result {
+            Ok(f) => f,
+            Err(err) => {
+                stream_err = Some((
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({ "error": "upload_stream_error", "detail": err.to_string() }),
+                ));
+                break;
+            }
+        };
+        if let Ok(data) = frame.into_data() {
+            if data.is_empty() {
+                continue;
+            }
+            let chunk_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            if start_offset
+                .saturating_add(received)
+                .saturating_add(chunk_len)
+                > max_total_bytes
+            {
+                stream_err = Some((overflow_status, overflow_payload));
+                break;
+            }
+            if tx.send(data).await.is_err() {
+                // Writer task exited early with an I/O error; collect its exact error below.
+                break;
+            }
+            received = received.saturating_add(chunk_len);
+        }
+    }
+    drop(tx);
+
+    let writer_res = writer_handle.await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": "upload_writer_panicked", "detail": err.to_string() }),
+        )
+    })?;
+    if let Some(err) = stream_err {
+        return Err(err);
+    }
+    let updated_hasher = writer_res.map_err(|err| {
+        (
+            StatusCode::INSUFFICIENT_STORAGE,
+            serde_json::json!({ "error": "upload_write_failed", "detail": err.to_string() }),
+        )
+    })?;
+    Ok((received, updated_hasher))
 }
 
 impl HttpTransferState {
@@ -256,7 +375,11 @@ impl HttpTransferState {
         Ok(())
     }
 
-    fn ensure_upload_slot_open(&self, dut_id: &str) -> Result<(), Box<Response>> {
+    fn ensure_upload_slot_open(
+        &self,
+        dut_id: &str,
+        target_filename: &str,
+    ) -> Result<(), Box<Response>> {
         let Some(ctx) = self.access.as_ref() else {
             return Ok(());
         };
@@ -273,15 +396,35 @@ impl HttpTransferState {
         }
         let status = ctx.lease.status(dut_id);
         match status.phase {
-            LeasePhase::Protected => Err(Box::new(json_error(
-                StatusCode::CONFLICT,
-                serde_json::json!({
-                    "error": "dut_protected",
-                    "code": "DUT_PROTECTED",
-                    "dutId": dut_id,
-                    "hint": "DUT is currently executing a protected flash operation; wait until dutState returns to ready."
-                }),
-            ))),
+            LeasePhase::Protected => {
+                if let Some(active_file) = status.protected_file.as_deref() {
+                    if active_file.eq_ignore_ascii_case(target_filename) {
+                        return Err(Box::new(json_error(
+                            StatusCode::CONFLICT,
+                            serde_json::json!({
+                                "error": "file_in_use_by_flash",
+                                "code": "FILE_IN_USE",
+                                "dutId": dut_id,
+                                "activeFlashFile": active_file,
+                                "hint": format!(
+                                    "Cannot upload or overwrite '{target_filename}' while it is being flashed. Upload under a different filename to run concurrently, or wait for flashing to finish."
+                                )
+                            }),
+                        )));
+                    }
+                    // Different target file: safe to upload concurrently while another image flashes.
+                    return Ok(());
+                }
+                Err(Box::new(json_error(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({
+                        "error": "dut_protected",
+                        "code": "DUT_PROTECTED",
+                        "dutId": dut_id,
+                        "hint": "DUT is currently executing an unnamed protected operation; wait until dutState returns to ready."
+                    }),
+                )))
+            }
             LeasePhase::NeedsInspection => Err(Box::new(json_error(
                 StatusCode::CONFLICT,
                 serde_json::json!({
@@ -293,6 +436,34 @@ impl HttpTransferState {
             ))),
             LeasePhase::Free | LeasePhase::Held => Ok(()),
         }
+    }
+
+    fn reserve_upload_guard(
+        &self,
+        dut_id: &str,
+        target_filename: &str,
+    ) -> Result<ActiveUploadGuard, Box<Response>> {
+        if let Some(ctx) = self.access.as_ref()
+            && !ctx.try_begin_upload(dut_id, target_filename)
+        {
+            return Err(Box::new(json_error(
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "upload_already_in_progress",
+                    "code": "UPLOAD_IN_PROGRESS",
+                    "dutId": dut_id,
+                    "filename": target_filename,
+                    "hint": format!(
+                        "Another upload for '{target_filename}' on DUT '{dut_id}' is already in progress; wait for it to finish or upload under a different filename."
+                    )
+                }),
+            )));
+        }
+        Ok(ActiveUploadGuard {
+            access: self.access.clone(),
+            dut_id: dut_id.to_owned(),
+            filename: target_filename.to_owned(),
+        })
     }
 
     fn resolve_dut_target(&self, dut_id: &str) -> Result<(PathBuf, String), Box<Response>> {
@@ -387,9 +558,6 @@ async fn handle_put_image(
     if let Err(resp) = ctx.authorize_dut_action(&principal, &dut_id, DutAction::Flash) {
         return *resp;
     }
-    if let Err(resp) = ctx.ensure_upload_slot_open(&dut_id) {
-        return *resp;
-    }
     let clean_name = match duthub_core::dut_artifacts::validate_image_filename(&filename) {
         Ok(name) => name.to_owned(),
         Err(err) => {
@@ -404,6 +572,13 @@ async fn handle_put_image(
             );
         }
     };
+    if let Err(resp) = ctx.ensure_upload_slot_open(&dut_id, &clean_name) {
+        return *resp;
+    }
+    let _upload_guard = match ctx.reserve_upload_guard(&dut_id, &clean_name) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
     let expected_sha256 = match parse_optional_sha256_header(&headers, "x-content-sha256") {
         Ok(val) => val,
         Err(msg) => {
@@ -413,10 +588,11 @@ async fn handle_put_image(
             );
         }
     };
-    if let Some(declared) = headers
+    let declared_len = headers
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    if let Some(declared) = declared_len
         && declared > MAX_IMAGE_UPLOAD_BYTES
     {
         return json_error(
@@ -443,55 +619,37 @@ async fn handle_put_image(
             );
         }
     };
-    let mut async_file = tokio::fs::File::from_std(std_file);
-    let mut hasher = Sha256::new();
-    let mut received: u64 = 0;
-    let mut stream = body;
-    while let Some(frame_result) = stream.frame().await {
-        let frame = match frame_result {
-            Ok(f) => f,
-            Err(err) => {
-                drop(async_file);
-                duthub_core::dut_artifacts::remove_image_upload_temp(
-                    &root, &dut_id, &dut_name, &temp_name,
-                );
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    serde_json::json!({ "error": "upload_stream_error", "detail": err.to_string() }),
-                );
-            }
-        };
-        if let Ok(data) = frame.into_data() {
-            let chunk_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            if received.saturating_add(chunk_len) > MAX_IMAGE_UPLOAD_BYTES {
-                drop(async_file);
-                duthub_core::dut_artifacts::remove_image_upload_temp(
-                    &root, &dut_id, &dut_name, &temp_name,
-                );
-                return json_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    serde_json::json!({
-                        "error": "payload_too_large",
-                        "maxBytes": MAX_IMAGE_UPLOAD_BYTES
-                    }),
-                );
-            }
-            if let Err(err) = async_file.write_all(&data).await {
-                drop(async_file);
-                duthub_core::dut_artifacts::remove_image_upload_temp(
-                    &root, &dut_id, &dut_name, &temp_name,
-                );
-                return json_error(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    serde_json::json!({ "error": "upload_write_failed", "detail": err.to_string() }),
-                );
-            }
-            hasher.update(&data);
-            received = received.saturating_add(chunk_len);
-        }
+    if let Some(declared) = declared_len
+        && declared > 0
+    {
+        let _ = std_file.set_len(declared);
     }
+    let (received, hasher) = match stream_body_to_file(
+        body,
+        std_file,
+        StreamWriteConfig {
+            start_offset: 0,
+            max_total_bytes: MAX_IMAGE_UPLOAD_BYTES,
+            overflow_status: StatusCode::PAYLOAD_TOO_LARGE,
+            overflow_payload: serde_json::json!({
+                "error": "payload_too_large",
+                "maxBytes": MAX_IMAGE_UPLOAD_BYTES
+            }),
+            truncate_to_written: true,
+        },
+        Sha256::new(),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err((status, payload)) => {
+            duthub_core::dut_artifacts::remove_image_upload_temp(
+                &root, &dut_id, &dut_name, &temp_name,
+            );
+            return json_error(status, payload);
+        }
+    };
     if received == 0 {
-        drop(async_file);
         duthub_core::dut_artifacts::remove_image_upload_temp(&root, &dut_id, &dut_name, &temp_name);
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -501,15 +659,10 @@ async fn handle_put_image(
             }),
         );
     }
-    if let Err(err) = async_file.flush().await {
-        drop(async_file);
+    if let Err(resp) = ctx.ensure_upload_slot_open(&dut_id, &clean_name) {
         duthub_core::dut_artifacts::remove_image_upload_temp(&root, &dut_id, &dut_name, &temp_name);
-        return json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({ "error": "upload_flush_failed", "detail": err.to_string() }),
-        );
+        return *resp;
     }
-    drop(async_file);
     let actual_sha256 = duthub_core::util::hex_lower(&hasher.finalize());
     if let Some(expected) = expected_sha256.as_deref()
         && expected != actual_sha256
@@ -638,9 +791,6 @@ async fn handle_tus_create(
     if let Err(resp) = ctx.authorize_dut_action(&principal, &dut_id, DutAction::Flash) {
         return *resp;
     }
-    if let Err(resp) = ctx.ensure_upload_slot_open(&dut_id) {
-        return *resp;
-    }
     let Some(total_length) = headers
         .get("upload-length")
         .and_then(|v| v.to_str().ok())
@@ -692,6 +842,9 @@ async fn handle_tus_create(
             );
         }
     };
+    if let Err(resp) = ctx.ensure_upload_slot_open(&dut_id, &clean_name) {
+        return *resp;
+    }
     let overwrite = metadata
         .get("overwrite")
         .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
@@ -708,23 +861,47 @@ async fn handle_tus_create(
         Ok(pair) => pair,
         Err(resp) => return *resp,
     };
+    if let Some(access) = ctx.access.as_ref()
+        && !access.try_begin_upload(&dut_id, &clean_name)
+    {
+        return json_error(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "upload_already_in_progress",
+                "code": "UPLOAD_IN_PROGRESS",
+                "dutId": dut_id,
+                "filename": clean_name,
+                "hint": format!(
+                    "Another upload for '{clean_name}' on DUT '{dut_id}' is already in progress; wait for it to finish or upload under a different filename."
+                )
+            }),
+        );
+    }
     let upload_id = uuid::Uuid::new_v4().simple().to_string();
     let temp_name = format!(".upload-tus-{upload_id}.part");
-    let (_, temp_path) = match duthub_core::dut_artifacts::create_image_upload_temp(
+    let (std_file, temp_path) = match duthub_core::dut_artifacts::create_image_upload_temp(
         &root, &dut_id, &dut_name, &temp_name,
     ) {
         Ok(pair) => pair,
         Err(err) => {
+            if let Some(access) = ctx.access.as_ref() {
+                access.end_upload(&dut_id, &clean_name);
+            }
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 serde_json::json!({ "error": "upload_init_failed", "detail": err.to_string() }),
             );
         }
     };
+    let _ = std_file.set_len(total_length);
+    drop(std_file);
     let subject = principal_subject(&principal);
     {
         let mut sessions = duthub_core::util::lock_unpoisoned(&ctx.tus_sessions);
         if sessions.len() >= MAX_TUS_SESSIONS {
+            if let Some(access) = ctx.access.as_ref() {
+                access.end_upload(&dut_id, &clean_name);
+            }
             duthub_core::dut_artifacts::remove_image_upload_temp(
                 &root, &dut_id, &dut_name, &temp_name,
             );
@@ -747,7 +924,7 @@ async fn handle_tus_create(
                 total_length,
                 offset: 0,
                 expected_sha256,
-                hasher: Sha256::new(),
+                hasher: Some(Sha256::new()),
                 busy: false,
             },
         );
@@ -813,8 +990,6 @@ async fn handle_tus_head(
     response
 }
 
-type PatchWriteResult = Result<(u64, Vec<Vec<u8>>), (StatusCode, serde_json::Value)>;
-
 async fn handle_tus_patch(
     State(ctx): State<HttpTransferState>,
     Path((dut_id, upload_id)): Path<(String, String)>,
@@ -835,9 +1010,6 @@ async fn handle_tus_patch(
             Err(resp) => return *resp,
         };
     if let Err(resp) = ctx.authorize_dut_action(&principal, &dut_id, DutAction::Flash) {
-        return *resp;
-    }
-    if let Err(resp) = ctx.ensure_upload_slot_open(&dut_id) {
         return *resp;
     }
     let content_type = headers
@@ -864,7 +1036,7 @@ async fn handle_tus_patch(
         );
     };
     let subject = principal_subject(&principal);
-    let (temp_path, start_offset, total_length) = {
+    let (temp_path, final_name, start_offset, total_length, hasher_for_patch) = {
         let mut sessions = duthub_core::util::lock_unpoisoned(&ctx.tus_sessions);
         let Some(session) = sessions.get_mut(&upload_id) else {
             return StatusCode::NOT_FOUND.into_response();
@@ -874,6 +1046,9 @@ async fn handle_tus_patch(
                 StatusCode::FORBIDDEN,
                 serde_json::json!({ "error": "upload_owner_mismatch" }),
             );
+        }
+        if let Err(resp) = ctx.ensure_upload_slot_open(&dut_id, &session.final_name) {
+            return *resp;
         }
         if session.busy {
             return json_error(
@@ -891,81 +1066,67 @@ async fn handle_tus_patch(
                 }),
             );
         }
+        let Some(hasher) = session.hasher.take() else {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "error": "upload_busy" }),
+            );
+        };
         session.busy = true;
         (
             session.temp_path.clone(),
+            session.final_name.clone(),
             session.offset,
             session.total_length,
+            hasher,
         )
     };
 
-    // Stream chunk bytes outside the session lock so no Mutex is ever held across `.await`.
-    let write_outcome: PatchWriteResult = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&temp_path)
-            .await
-            .map_err(|err| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": "upload_open_failed", "detail": err.to_string() }),
-                )
-            })?;
-        file.seek(std::io::SeekFrom::Start(start_offset))
-            .await
-            .map_err(|err| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": "upload_seek_failed", "detail": err.to_string() }),
-                )
-            })?;
-        let mut added: u64 = 0;
-        let mut hash_chunks: Vec<Vec<u8>> = Vec::new();
-        let mut stream = body;
-        while let Some(frame_result) = stream.frame().await {
-            let frame = frame_result.map_err(|err| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    serde_json::json!({ "error": "upload_stream_error", "detail": err.to_string() }),
-                )
-            })?;
-            if let Ok(data) = frame.into_data() {
-                let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-                if start_offset.saturating_add(added).saturating_add(len) > total_length {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        serde_json::json!({
-                            "error": "upload_exceeds_declared_length",
-                            "declaredLength": total_length
-                        }),
-                    ));
-                }
-                file.write_all(&data).await.map_err(|err| {
-                    (
-                        StatusCode::INSUFFICIENT_STORAGE,
-                        serde_json::json!({ "error": "upload_write_failed", "detail": err.to_string() }),
-                    )
-                })?;
-                added = added.saturating_add(len);
-                hash_chunks.push(data.to_vec());
-            }
-        }
-        file.flush().await.map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                serde_json::json!({ "error": "upload_flush_failed", "detail": err.to_string() }),
-            )
-        })?;
-        Ok((added, hash_chunks))
-    }
-    .await;
+    // Keep a snapshot clone of the pre-patch hasher so an aborted/failed PATCH can restore
+    // exact state for tus resumption without losing prior chunk digests.
+    let rollback_hasher = hasher_for_patch.clone();
 
-    let (added, hash_chunks) = match write_outcome {
+    // Open synchronously in `std::fs` and hand directly to the pipelined blocking writer
+    // so zero Mutexes are held across `.await` and memory stays O(1) even for multi-GB PATCHes.
+    let std_file = match std::fs::OpenOptions::new().write(true).open(&temp_path) {
+        Ok(f) => f,
+        Err(err) => {
+            if let Some(session) =
+                duthub_core::util::lock_unpoisoned(&ctx.tus_sessions).get_mut(&upload_id)
+            {
+                session.hasher = Some(rollback_hasher);
+                session.busy = false;
+            }
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "upload_open_failed", "detail": err.to_string() }),
+            );
+        }
+    };
+
+    let (added, updated_hasher) = match stream_body_to_file(
+        body,
+        std_file,
+        StreamWriteConfig {
+            start_offset,
+            max_total_bytes: total_length,
+            overflow_status: StatusCode::CONFLICT,
+            overflow_payload: serde_json::json!({
+                "error": "upload_exceeds_declared_length",
+                "declaredLength": total_length
+            }),
+            truncate_to_written: false,
+        },
+        hasher_for_patch,
+    )
+    .await
+    {
         Ok(res) => res,
         Err((status, payload)) => {
             if let Some(session) =
                 duthub_core::util::lock_unpoisoned(&ctx.tus_sessions).get_mut(&upload_id)
             {
+                session.hasher = Some(rollback_hasher);
                 session.busy = false;
             }
             return json_error(status, payload);
@@ -977,9 +1138,7 @@ async fn handle_tus_patch(
         let Some(session) = sessions.get_mut(&upload_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        for chunk in &hash_chunks {
-            session.hasher.update(chunk);
-        }
+        session.hasher = Some(updated_hasher);
         session.offset = session.offset.saturating_add(added);
         session.busy = false;
         let new_offset = session.offset;
@@ -998,7 +1157,26 @@ async fn handle_tus_patch(
     let Some(session) = completed else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let actual_sha256 = duthub_core::util::hex_lower(&session.hasher.finalize());
+    let _release_slot = ActiveUploadGuard {
+        access: ctx.access.clone(),
+        dut_id: dut_id.clone(),
+        filename: final_name,
+    };
+    if let Err(resp) = ctx.ensure_upload_slot_open(&dut_id, &session.final_name) {
+        duthub_core::dut_artifacts::remove_image_upload_temp(
+            &session.root,
+            &session.dut_id,
+            &session.dut_name,
+            &session.temp_name,
+        );
+        return *resp;
+    }
+    let actual_sha256 = duthub_core::util::hex_lower(
+        &session
+            .hasher
+            .expect("completed tus session must hold hasher")
+            .finalize(),
+    );
     if let Some(expected) = session.expected_sha256.as_deref()
         && expected != actual_sha256
     {
@@ -1113,6 +1291,9 @@ async fn handle_tus_delete(
         sessions.remove(&upload_id)
     };
     if let Some(session) = removed {
+        if let Some(access) = ctx.access.as_ref() {
+            access.end_upload(&session.dut_id, &session.final_name);
+        }
         duthub_core::dut_artifacts::remove_image_upload_temp(
             &session.root,
             &session.dut_id,

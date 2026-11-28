@@ -1,8 +1,8 @@
 use super::{
-    AppContext, BtnVariant, Checkbox, Context, Disableable, FluentBuilder, In, Input, InputEvent,
-    InputState, InteractiveElement, IntoElement, Palette, ParentElement, RelayChannels,
-    RelayConfig, SharedString, StatefulInteractiveElement, Styled, Window, Workbench, btn, chip,
-    collapsible_panel, div, field, icon_btn, px, setting_row, subtle, switch_panel_header, toggle,
+    AppContext, BtnVariant, Checkbox, ConnectionPanel, Context, Disableable, FluentBuilder, In,
+    Input, InputEvent, InputState, InteractiveElement, IntoElement, Palette, ParentElement,
+    RelayChannels, RelayConfig, SharedString, StatefulInteractiveElement, Styled, Window,
+    Workbench, btn, chip, div, field, icon_btn, px, setting_row, subtle, toggle,
 };
 
 pub(crate) fn render_relay_boards(
@@ -345,9 +345,7 @@ pub(super) fn relay_panel(
     let enabled = !matches!(dut.relay, RelayConfig::Disabled);
     let initial_board = board_ids.first().cloned();
     let toggle_dut = dut.id.clone();
-    let header = switch_panel_header(
-        "bolt",
-        crate::i18n::t(w.lang, "relay"),
+    let header = ConnectionPanel::new("relay", "bolt", crate::i18n::t(w.lang, "relay")).control(
         toggle("dut-relay-toggle", enabled, p)
             .disabled(!enabled && initial_board.is_none())
             .on_click(cx.listener(move |this, checked, _, cx| {
@@ -369,10 +367,9 @@ pub(super) fn relay_panel(
                 }
                 cx.notify();
             })),
-        p,
     );
     if !enabled {
-        return collapsible_panel(header, None, p);
+        return header.render(w, None, p, cx);
     }
     let options: Vec<_> = boards
         .iter()
@@ -549,7 +546,7 @@ pub(super) fn relay_panel(
             body = body.child(row);
         }
     }
-    collapsible_panel(header, Some(body), p)
+    header.render(w, Some(body), p, cx)
 }
 
 pub(super) fn set_relay_channel(w: &mut Workbench, key: &str, channel: Option<u8>) {

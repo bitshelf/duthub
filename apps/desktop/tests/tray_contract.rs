@@ -136,6 +136,14 @@ fn tray_is_installed_on_the_first_render_and_hidden_from_the_tick() {
         "tray install must be guarded by the self-test flag"
     );
     assert!(
+        render.contains("tray.set_icon_visible(true)"),
+        "first render must register the notification icon"
+    );
+    assert!(
+        render.contains("!self.quitting"),
+        "rendering during shutdown must not reinstall the notification icon"
+    );
+    assert!(
         render.contains("self.dialog_open ="),
         "dialog state is read here"
     );
@@ -214,8 +222,8 @@ fn hide_and_show_stay_behind_the_tray_api() {
         "hide_main adds the icon before hiding and reports the real result"
     );
     assert!(
-        hide.contains("set_icon_visible(false)"),
-        "a failed hide clears any partially added icon"
+        !hide.contains("set_icon_visible(false)"),
+        "a failed hide must preserve the notification icon"
     );
     assert!(
         hide.contains("self.hidden = false"),
@@ -229,7 +237,10 @@ fn hide_and_show_stay_behind_the_tray_api() {
         "minimizing to the tray must be silent"
     );
     let show = fn_block(&workspace, "fn show_from_tray(");
-    assert!(show.contains("set_icon_visible(false)"));
+    assert!(
+        !show.contains("set_icon_visible(false)"),
+        "restoring the window must preserve the notification icon"
+    );
     assert!(show.contains("set_alert(false)"));
     assert!(show.contains("set_merge_duplicates(false)"));
 }

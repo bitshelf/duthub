@@ -1878,9 +1878,14 @@ pub(crate) fn render_bindings(
             )
         })
         .child(enable);
-    let header = panel_head("eye", crate::i18n::label("captureDevicesTitle"), p).child(controls);
+    let header = crate::pages::ConnectionPanel::new(
+        "captureDevicesTitle",
+        "eye",
+        crate::i18n::label("captureDevicesTitle"),
+    )
+    .control(controls);
     if !enabled {
-        return crate::pages::collapsible_panel(header, None, p);
+        return header.render(w, None, p, cx);
     }
     let mut body = div().flex().flex_col().gap(px(12.));
     let sources: Vec<_> = Source::configured_sources(&dut.media).collect();
@@ -1897,7 +1902,7 @@ pub(crate) fn render_bindings(
                 .child(w.media.output.clone()),
         );
     }
-    crate::pages::collapsible_panel(header, Some(body), p)
+    header.render(w, Some(body), p, cx)
 }
 
 fn add_capture_device(media: &mut duthub_core::model::DutMediaConfig) {

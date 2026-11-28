@@ -56,6 +56,20 @@ pub fn btn(
 /// `.panel-head`: Panel header row (icon + title + attachment on the right, added by the calling
 /// party).
 pub fn panel_head(icon_name: &str, title: &str, p: &Palette) -> Div {
+    panel_header_row(p).child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(9.))
+            .text_size(px(13.))
+            .font_weight(gpui_kit::FontWeight(670.0))
+            .text_color(p.text)
+            .child(icon(icon_name).size(px(17.)).text_color(p.accent))
+            .child(SharedString::from(title.to_string())),
+    )
+}
+
+pub(crate) fn panel_header_row(p: &Palette) -> Div {
     div()
         .flex()
         .items_center()
@@ -66,17 +80,6 @@ pub fn panel_head(icon_name: &str, title: &str, p: &Palette) -> Div {
         .pb(px(14.))
         .border_b_1()
         .border_color(p.line)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(9.))
-                .text_size(px(13.))
-                .font_weight(gpui_kit::FontWeight(670.0))
-                .text_color(p.text)
-                .child(icon(icon_name).size(px(17.)).text_color(p.accent))
-                .child(SharedString::from(title.to_string())),
-        )
 }
 
 /// `.field`: A vertical form field containing a label, control, and optional help text (the control

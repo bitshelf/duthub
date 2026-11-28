@@ -1375,6 +1375,7 @@ pub struct Workbench {
     /// Heartbeat Engine (Requirement ⑦): Desktop timer driver; Agent modified via heartbeat.set
     /// command.
     pub heartbeat: Arc<duthub_device::heartbeat::HeartbeatService>,
+    pub(crate) collapsed_connection_panels: HashMap<String, HashSet<&'static str>>,
     heartbeat_drafts: HashMap<String, duthub_core::heartbeat::HeartbeatConfig>,
     /// Shared Device Operation Interface (Control Action Authorization/Binding/Capability
     /// Verification Interface; DUT Configures Registration per Frame)
@@ -1396,6 +1397,7 @@ pub struct Workbench {
     agent_model_name: String,
     pub find_open: bool,
     pub find_query: String,
+    pub find_pattern: Option<regex::Regex>,
     pub rec_on: bool,
     pub rec_buffer: Vec<String>,
     /// System notifications to be displayed (Kit notifications, displayed through the Root layer
@@ -2181,6 +2183,7 @@ impl Workbench {
             agent,
             find_open: false,
             find_query: String::new(),
+            find_pattern: None,
             rec_on: false,
             rec_buffer: Vec::new(),
             pending_toasts: toast.into_iter().collect(),
@@ -2217,6 +2220,7 @@ impl Workbench {
             core_lines,
             snapshot_ref: snapshot_ref.clone(),
             heartbeat: heartbeat.clone(),
+            collapsed_connection_panels: HashMap::new(),
             heartbeat_drafts: HashMap::new(),
             control: control.clone(),
             media,

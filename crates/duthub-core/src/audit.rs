@@ -4,7 +4,7 @@
 //!   `lease.acquire`/`renew`/`release`/`expire`/`takeover`/`queue`/`cancel`/`protected.enter`/`protected.exit`,
 //!   `write.admit`/`write.deny`, `control.execute`/`control.deny`, `approval.issue`/`consume`.
 //! - Dual channel: in-memory ring buffer (capacity 1000, read by the GUI panel) plus daily rotated
-//!   JSONL files at `<workdir>/audit/agent-access-YYYYMMDD.jsonl` (authoritative on-disk record).
+//!   JSONL files at `.duthub/logs/audit/agent-access-YYYYMMDD.jsonl` (authoritative on-disk record).
 //! - **Redaction boundary**: raw tokens, approval tokens, and `Authorization` values are never
 //!   written to audit logs (including free-text `detail`, which is scrubbed via [`redact_detail`]
 //!   before writing). `lease_id` is a high-entropy handle (SPEC §6.3: handle != permission) and is

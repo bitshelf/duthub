@@ -437,7 +437,7 @@ impl AlertCenter {
     }
 
     /// Only the hidden-to-tray state merges repeats: while visible the queue
-    /// keeps one item per accepted report (the dialog shows each event).
+    /// keeps one item per accepted report until the user acknowledges the batch.
     pub fn set_merge_duplicates(&mut self, merge: bool) {
         self.merge_duplicates = merge;
     }
@@ -573,6 +573,11 @@ impl AlertCenter {
     /// silently discarded when dequeued; used for diagnostics/testing purposes).
     pub fn pending_len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Acknowledge all dialogs queued at the time of the click.
+    pub fn acknowledge_pending(&mut self) {
+        self.items.clear();
     }
 
     /// Discard all pending items from a certain source (clear the queue after "ignore this type" to
@@ -798,6 +803,21 @@ mod tests {
         assert_eq!(first.at, 1_000);
         assert_eq!(third.source, AlertSource::Serial);
         assert!(center.pop_next().is_none(), "The queue is empty.");
+    }
+
+    #[test]
+    fn acknowledging_pending_dialogs_only_clears_the_current_batch() {
+        let mut center = new_center();
+        assert!(center.report_at(0, AlertSource::UsbDebug, "disconnected", ""));
+        assert!(center.pop_next().is_some());
+        assert!(center.report_at(31_000, AlertSource::UsbDebug, "disconnected", ""));
+        assert!(center.report_at(31_000, AlertSource::Serial, "offline", ""));
+
+        center.acknowledge_pending();
+        assert!(center.pop_next().is_none());
+        assert!(!center.report_at(31_001, AlertSource::UsbDebug, "duplicate", ""));
+        assert!(center.report_at(62_000, AlertSource::UsbDebug, "disconnected again", ""));
+        assert_eq!(center.pop_next().unwrap().source, AlertSource::UsbDebug);
     }
 
     #[test]

@@ -220,6 +220,7 @@ impl McpState for FlashTransferFixture {
             remaining_secs: s.remaining_secs,
             queue_len: s.queue_len,
             protected_op: s.protected_op,
+            protected_file: s.protected_file,
         })
     }
 
@@ -323,12 +324,20 @@ impl McpState for FlashTransferFixture {
     }
 }
 
-struct DummyNotifier;
-impl duthub_mcp::notify::UserNotifier for DummyNotifier {
-    fn notify(
-        &self,
-        _req: &duthub_mcp::notify::NotifyRequest,
-    ) -> duthub_mcp::notify::NotifyOutcome {
+#[derive(Default)]
+struct RecordingNotifier {
+    notices: Mutex<Vec<duthub_mcp::notify::NotifyRequest>>,
+}
+
+impl RecordingNotifier {
+    fn take(&self) -> Vec<duthub_mcp::notify::NotifyRequest> {
+        std::mem::take(&mut *self.notices.lock().unwrap())
+    }
+}
+
+impl duthub_mcp::notify::UserNotifier for RecordingNotifier {
+    fn notify(&self, req: &duthub_mcp::notify::NotifyRequest) -> duthub_mcp::notify::NotifyOutcome {
+        self.notices.lock().unwrap().push(req.clone());
         duthub_mcp::notify::NotifyOutcome::Queued
     }
 }
@@ -410,13 +419,14 @@ async fn streaming_put_tus_h2c_flash_and_log_export_enforce_least_privilege() {
     let state = FlashTransferFixture::new(tmp.path(), lease.clone());
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = std_listener.local_addr().unwrap().port();
+    let notifier = Arc::new(RecordingNotifier::default());
     let handle = duthub_mcp::transport::spawn_http_listener_on(
         std_listener,
         state.clone(),
         Some(ctx),
         Some(Arc::from("dut-2-ep")),
         Some(Arc::from("dut-2")),
-        Some(Arc::new(DummyNotifier)),
+        Some(notifier.clone()),
     )
     .expect("spawn listener");
 
@@ -634,7 +644,7 @@ async fn streaming_put_tus_h2c_flash_and_log_export_enforce_least_privilege() {
     assert_eq!(status["transfer"]["canUpload"], true);
     assert_eq!(status["sessionEpoch"], 1_795_800_000_000u64);
 
-    // skill_export reflects actual granted capabilities (not hardcoded "不开放写工具").
+    // The exported skill reflects the capabilities granted to the session.
     let skill_resp = call_tool_json(&mcp_client, "skill_export", json!({}))
         .await
         .unwrap();
@@ -755,6 +765,215 @@ async fn streaming_put_tus_h2c_flash_and_log_export_enforce_least_privilege() {
     assert!(en_md.contains("scoped to DUT `dut-2`"), "{en_md}");
     assert!(en_md.contains("`flash`"), "{en_md}");
 
+    // 9) Concurrent upload + flash: different file allowed, same file rejected (409 FILE_IN_USE).
+    // Acquire a lease and enter Protected flashing `update.img`.
+    let flash_lease = call_tool_json(
+        &mcp_client,
+        "dut_control",
+        json!({
+            "dutId": "dut-2",
+            "action": "acquire_lease",
+            "sessionName": "concurrent-flash-test",
+            "waitMs": 2000
+        }),
+    )
+    .await
+    .unwrap();
+    let _flash_lease_id = flash_lease["leaseId"].as_str().unwrap();
+    lease
+        .enter_protected_with_file("dut-2", "flash_update image/update.img", Some("update.img"))
+        .unwrap();
+
+    // Same filename (including case-insensitive variant) is rejected with 409 FILE_IN_USE.
+    for blocked_name in ["update.img", "UPDATE.IMG"] {
+        let same_put = http
+            .put(format!(
+                "{base}/dut/dut-2/image/{blocked_name}?overwrite=true"
+            ))
+            .header("Authorization", format!("Bearer {flash_token}"))
+            .body("OVERWRITE-BLOCKED")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(same_put.status().as_u16(), 409);
+        let body: Value = same_put.json().await.unwrap();
+        assert_eq!(body["code"], "FILE_IN_USE", "{body}");
+    }
+    let same_fname_b64 = base64::engine::general_purpose::STANDARD.encode("update.img");
+    let same_tus = h2c
+        .post(format!("{base}/dut/dut-2/transfer"))
+        .header("Authorization", format!("Bearer {flash_token}"))
+        .header("Tus-Resumable", "1.0.0")
+        .header("Upload-Length", "16")
+        .header("Upload-Metadata", format!("filename {same_fname_b64}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(same_tus.status().as_u16(), 409);
+
+    // Different filename (`ubuntu.img`) succeeds concurrently while `update.img` is flashing!
+    let diff_bytes = b"CONCURRENT-UBUNTU-IMAGE-BYTES".to_vec();
+    let diff_sha = duthub_core::util::hex_lower(&Sha256::digest(&diff_bytes));
+    let diff_put = http
+        .put(format!("{base}/dut/dut-2/image/ubuntu.img"))
+        .header("Authorization", format!("Bearer {flash_token}"))
+        .header("X-Content-SHA256", &diff_sha)
+        .body(diff_bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(diff_put.status().as_u16(), 201);
+    lease.exit_protected("dut-2", true).unwrap();
+
+    // Reverse race: while `staging.img` has an in-flight tus upload, flashing `staging.img`
+    // fails closed with UPLOAD_IN_PROGRESS.
+    let staging_b64 = base64::engine::general_purpose::STANDARD.encode("staging.img");
+    let staging_create = h2c
+        .post(format!("{base}/dut/dut-2/transfer"))
+        .header("Authorization", format!("Bearer {flash_token}"))
+        .header("Tus-Resumable", "1.0.0")
+        .header("Upload-Length", "32")
+        .header("Upload-Metadata", format!("filename {staging_b64}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(staging_create.status().as_u16(), 201);
+    let staging_loc = staging_create
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let fresh_lease = call_tool_json(
+        &mcp_client,
+        "dut_control",
+        json!({
+            "dutId": "dut-2",
+            "action": "acquire_lease",
+            "sessionName": "reverse-race-test",
+            "waitMs": 2000
+        }),
+    )
+    .await
+    .unwrap();
+    let fresh_lease_id = fresh_lease["leaseId"].as_str().unwrap().to_owned();
+    let race_err = call_tool_json(
+        &mcp_client,
+        "dut_control",
+        json!({
+            "dutId": "dut-2",
+            "action": "flash_update",
+            "fileId": "image/staging.img",
+            "leaseId": fresh_lease_id
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(race_err.contains("UPLOAD_IN_PROGRESS"), "{race_err}");
+    // Delete the in-flight upload to clean up its slot cleanly.
+    let del = h2c
+        .delete(format!("{base}{staging_loc}"))
+        .header("Authorization", format!("Bearer {flash_token}"))
+        .header("Tus-Resumable", "1.0.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 204);
+
+    // 10) Blocked-access alert noise reduction & bilingual localization following duthub locale.
+    let _ = notifier.take();
+    // Stale/wrong leaseId while another lease is held (`NOT_HOLDER`) must NOT pop a desktop alert.
+    let wrong_lease_err = call_tool_json(
+        &mcp_client,
+        "dut_control",
+        json!({
+            "dutId": "dut-2",
+            "action": "flash_reboot",
+            "leaseId": "lease-stale-does-not-exist"
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(wrong_lease_err.contains("NOT_HOLDER"), "{wrong_lease_err}");
+    assert!(
+        wrong_lease_err.contains("\"humanNotified\":false"),
+        "{wrong_lease_err}"
+    );
+    // Release lease so `lease-stale-does-not-exist` hits `LEASE_UNKNOWN` — also must NOT pop an alert.
+    let _ = call_tool_json(
+        &mcp_client,
+        "dut_control",
+        json!({
+            "dutId": "dut-2",
+            "action": "release_lease",
+            "leaseId": fresh_lease_id
+        }),
+    )
+    .await
+    .unwrap();
+    let stale_err = call_tool_json(
+        &mcp_client,
+        "dut_control",
+        json!({
+            "dutId": "dut-2",
+            "action": "flash_reboot",
+            "leaseId": "lease-stale-does-not-exist"
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(stale_err.contains("LEASE_UNKNOWN"), "{stale_err}");
+    assert!(stale_err.contains("\"humanNotified\":false"), "{stale_err}");
+    assert!(
+        notifier.take().is_empty(),
+        "self-recoverable NOT_HOLDER/LEASE_UNKNOWN must not trigger a human-intervention popup"
+    );
+
+    // Unauthorized call with a read-only token DOES notify desktop in the active locale.
+    let ro_client = serve_client(
+        ClientConfig::default(),
+        StreamableHttpClientTransport::with_client(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            StreamableHttpClientTransportConfig::with_uri(format!("{base}/mcp"))
+                .auth_header(read_token.clone()),
+        ),
+    )
+    .await
+    .unwrap();
+
+    state.set_locale(duthub_mcp::i18n::McpLocale::ZhCn);
+    let _ = call_tool_json(
+        &ro_client,
+        "dut_control",
+        json!({"dutId": "dut-2", "action": "flash_reboot"}),
+    )
+    .await
+    .unwrap_err();
+    let zh_notices = notifier.take();
+    assert_eq!(zh_notices.len(), 1, "{zh_notices:?}");
+    assert_eq!(
+        zh_notices[0].title.as_deref(),
+        Some("需要人工介入：Agent 权限不足")
+    );
+    assert!(zh_notices[0].message.contains("DUT-2"), "{zh_notices:?}");
+
+    state.set_locale(duthub_mcp::i18n::McpLocale::EnUs);
+    let _ = call_tool_json(
+        &ro_client,
+        "dut_control",
+        json!({"dutId": "dut-2", "action": "flash_reboot"}),
+    )
+    .await
+    .unwrap_err();
+    let en_notices = notifier.take();
+    assert_eq!(en_notices.len(), 1, "{en_notices:?}");
+    assert_eq!(
+        en_notices[0].title.as_deref(),
+        Some("Human intervention: Agent permission denied")
+    );
+
+    ro_client.cancel().await.ok();
     mcp_client.cancel().await.ok();
     drop(http);
     drop(h2c);

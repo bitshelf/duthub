@@ -33,7 +33,7 @@ metadata:
 | `ready` | Serial open & free (default when Manual Takeover is off) | Proceed with `serial_read`, `serial_exec`, `adb_exec`, or `dut_control` according to `capabilities`. |
 | `busy_gui` | Desktop operator actively typing (finite TTL) or explicitly took over | **Do NOT retry-loop.** Read-only tools still work. If `remaining_secs` is present, wait briefly or queue with `waitMs`; if held indefinitely, call `notify_user` asking the operator to release control. |
 | `busy_agent` | Another Agent holds lease | Inspect `controlStatus.sessionName`, `occupiedSecs`, and `queueLen`. Pass `waitMs` to queue in FIFO order, or call `notify_user` if occupied unusually long. |
-| `flashing` | Protected flash in progress | Do NOT send control/serial writes. Monitor progress via `serial_read` or `dut_status` until `ready`. |
+| `flashing` | Protected flash in progress (`activeFlashFile`) | Do NOT send control/serial writes. Monitor progress via `serial_read` or `dut_status` until `ready`. **Uploading a different image filename via `PUT` / `ztus` is allowed concurrently**; uploading the same `activeFlashFile` is rejected with `409 FILE_IN_USE`. |
 | `manual_takeover` | Human emergency Manual Takeover enabled | Read-only inspection only. Wait for operator to disable Manual Takeover. |
 | `needs_inspection` | Locked after hardware fault | **Stop writes immediately.** Call `notify_user` and wait for operator clearance. |
 | `disconnected` | Serial session closed | Read historical logs via `log_export` / `log_segments` / `log_segment_read`, or call `notify_user` to open the port. |
@@ -43,7 +43,8 @@ metadata:
 Never try to pass local Linux paths to `flash_update` or send multi-GB images over JSON-RPC. Use duthub's streaming HTTP upload endpoints on the **same MCP port** (requires `capabilities.flash == true`; read-only tokens are rejected with `403 UNAUTHORIZED`):
 
 - **Single-command streaming upload (`curl`)**: `PUT http://<HOST>:<PORT>/dut/<dutId>/image/<filename>` (supports `.img`, `.bin`, `.iso`, optional `X-Content-SHA256: <64-hex>`, optional `?overwrite=true`).
-- **Resumable large-file upload (`ztus` or `curl` tus 1.0.0)**: `POST`/`HEAD`/`PATCH`/`DELETE http://<HOST>:<PORT>/dut/<dutId>/transfer` (supports `ztus` HTTP/2 `h2c` and `Upload-Checksum: sha256 <hex>`).
+- **Resumable high-speed upload (`ztus` or `curl` tus 1.0.0 — recommended for multi-GB images)**: `POST`/`HEAD`/`PATCH`/`DELETE http://<HOST>:<PORT>/dut/<dutId>/transfer` (supports `ztus` HTTP/2 `h2c` with large tuned flow-control windows and `Upload-Checksum: sha256 <hex>`).
+- **Concurrent upload & flashing**: You MAY upload a **different** image filename while another image is flashing (`dutState == "flashing"`). Uploading/overwriting the **same** `activeFlashFile` fails closed with `409 FILE_IN_USE`, and flashing a file whose upload is still in progress fails closed with `UPLOAD_IN_PROGRESS`.
 
 Always execute the full 8-step flash flow (exact copy-paste commands in [`references/recipes.md`](references/recipes.md)):
 1. Preflight `dut_status` (`capabilities.flash`, `bootModes`, `flashPresets`, `transfer`) + `dut_files(category="image")`.
@@ -64,9 +65,10 @@ Always execute the full 8-step flash flow (exact copy-paste commands in [`refere
    - For TUIs, menus, prompts, or carriage-return progress bars, use `serial_read(dutId, mode="screen")` or `duthub://dut/{dutId}/serial/screen`.
    - For cursor-safe incremental waits, pass your previous `last_seq` into `serial_read(dutId, sinceSeq, waitFor="...", waitRegex="...", timeoutMs=15000)`. Track `sessionEpoch` — if `sessionEpoch` changes or `cursorReset == true`, recover missed history via `log_export` before resuming `sinceSeq`.
    - Heartbeat probes only run after a full silent interval (never immediately on port open, and skipped automatically when the board produces serial output or while an Agent holds a lease).
-3. **Bulk log retrieval (avoid 100+ RPCs)**:
+3. **Bulk log retrieval & Agent log storage convention (avoid 100+ RPCs & root clutter)**:
    - Use **`log_export`** (`{"dutId": "<id>"}`) to snapshot all (or `tailSegments` / `sinceSegmentId`) archived segments with a fixed per-segment boundary and SHA-256 digest. Small exports (≤256 KiB) return `inlineText` directly; larger multi-MB exports return `downloadUrl` and `gzipDownloadUrl` (`GET /dut/{dutId}/logs/export?format=gzip`) for single-request HTTP download.
    - Use `log_segments` + `log_segment_read` only when inspecting a single specific segment.
+   - **Standard Agent log location (`.duthub/logs/`)**: Whenever you save downloaded DUT logs, `curl`/`ztus` transfer logs, or troubleshooting transcripts in your own working directory, store them strictly under **`.duthub/logs/<dutId>/`** (e.g. `.duthub/logs/<dutId>/serial-export.txt.gz`, `.duthub/logs/<dutId>/upload.log`) — never scatter `.log`/`.txt` files in the project root or `/tmp`. On the Windows host, duthub stores its own Agent access audit logs under `.duthub/logs/audit/`.
 4. **Completion detection & timeout/stall recovery (NEVER blindly resend)**:
    - Shell commands: split sentinel so echo never matches prematurely: `{"dutId":"<id>","text":"uname -a; echo __OK_''DONE__\r","expect":"__OK_DONE__","timeoutMs":8000}`, or use `settleMs` (e.g. `800`).
    - On `matchedBy == "timeout"` or `stalled == true`: inspect `screenTail` or `serial_read(mode="screen")` first; wait with `serial_read(sinceSeq=...)` if still running, or interrupt cleanly with `serial_exec(keys=["ctrl+c"])`.

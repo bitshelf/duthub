@@ -258,6 +258,7 @@ impl McpState for RecordingState {
             generation: s.generation,
             queue_len: s.queue_len,
             protected_op: s.protected_op,
+            protected_file: s.protected_file,
         })
     }
 

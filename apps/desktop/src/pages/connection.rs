@@ -1,9 +1,11 @@
+use gpui_kit::component::button::ButtonVariants;
+
 use super::{
     A2aStatus, BAUD_OPTIONS, BtnVariant, Context, Disableable, Div, FluentBuilder, In,
     InteractiveElement, IntoElement, Palette, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Switch, Window, WindowExt, Workbench, alerts_panel, btn,
-    chip, connection_agent_panel, connection_lease_action, copy_text, detected_lan_ip, div, field,
-    icon, icon_btn, panel_head, px, relay_panel, setting_row, subtle, toggle,
+    StatefulInteractiveElement, Styled, Window, WindowExt, Workbench, alerts_panel, btn, chip,
+    connection_agent_panel, connection_lease_action, copy_text, detected_lan_ip, div, field, icon,
+    icon_btn, panel_head, px, relay_panel, setting_row, subtle, toggle,
 };
 
 // ---------------------------------------------------------------------------
@@ -228,17 +230,18 @@ pub(super) fn serial_logs_panel(
     };
     let enabled = dut.serial.split_logs;
     let dut_id = dut.id.clone();
-    let header = panel_head("file-text", label("splitSerialLogs"), p).child(
-        toggle("opt-split-serial-logs", enabled, p).on_click(cx.listener(
-            move |this, enabled: &bool, _, cx| {
-                if let Some(dut) = this.duts.connection_mut(&dut_id) {
-                    dut.serial.split_logs = *enabled;
-                    this.duts.mark_connection_dirty();
-                }
-                cx.notify();
-            },
-        )),
-    );
+    let header = ConnectionPanel::new("splitSerialLogs", "file-text", label("splitSerialLogs"))
+        .control(
+            toggle("opt-split-serial-logs", enabled, p).on_click(cx.listener(
+                move |this, enabled: &bool, _, cx| {
+                    if let Some(dut) = this.duts.connection_mut(&dut_id) {
+                        dut.serial.split_logs = *enabled;
+                        this.duts.mark_connection_dirty();
+                    }
+                    cx.notify();
+                },
+            )),
+        );
     let body = enabled.then(|| {
         let minimum = w.input_value(In::BootSimilarity);
         let default = duthub_core::model::DEFAULT_BOOT_SIMILARITY.to_string();
@@ -317,7 +320,7 @@ pub(super) fn serial_logs_panel(
         }
         body
     });
-    collapsible_panel(header, body, p)
+    header.render(w, body, p, cx)
 }
 
 pub(super) fn heartbeat_panel(
@@ -331,17 +334,19 @@ pub(super) fn heartbeat_panel(
     };
     let state = w.heartbeat.state_or_default(&dut.id);
     let config = w.heartbeat_config(&dut.id);
-    let header = switch_panel_header(
+    let header = ConnectionPanel::new(
+        "sessionHeartbeat",
         "activity",
         crate::i18n::label("sessionHeartbeat"),
+    )
+    .control(
         toggle("hb-enable", config.enabled, p).on_click(cx.listener(|this, _, _, cx| {
             this.toggle_heartbeat();
             cx.notify();
         })),
-        p,
     );
     if !config.enabled {
-        return collapsible_panel(header, None, p);
+        return header.render(w, None, p, cx);
     }
     let mut body = div();
     // Multiple commands occupy one line of the form, which makes it easier to edit and check the
@@ -450,7 +455,7 @@ pub(super) fn heartbeat_panel(
             .text_color(status_color)
             .child(SharedString::from(summary)),
     );
-    collapsible_panel(header, Some(body), p)
+    header.render(w, Some(body), p, cx)
 }
 
 pub(crate) fn panel_shell(
@@ -479,13 +484,87 @@ pub(crate) fn collapsible_panel(header: Div, body: Option<Div>, p: &'static Pale
         .children(body.map(|body| div().px(px(18.)).py(px(18.)).max_w(px(780.)).child(body)))
 }
 
-pub(crate) fn switch_panel_header(
-    icon: &str,
-    title: &str,
-    switch: Switch,
-    p: &'static Palette,
-) -> Div {
-    panel_head(icon, title, p).child(div().flex_none().child(switch))
+pub(crate) struct ConnectionPanel {
+    key: &'static str,
+    icon: &'static str,
+    title: SharedString,
+    control: Option<gpui_kit::AnyElement>,
+}
+
+impl ConnectionPanel {
+    pub(crate) fn new(key: &'static str, icon: &'static str, title: &str) -> Self {
+        Self {
+            key,
+            icon,
+            title: title.to_owned().into(),
+            control: None,
+        }
+    }
+
+    pub(crate) fn control(mut self, control: impl IntoElement) -> Self {
+        self.control = Some(control.into_any_element());
+        self
+    }
+
+    pub(crate) fn render(
+        self,
+        w: &mut Workbench,
+        body: Option<Div>,
+        p: &'static Palette,
+        cx: &mut Context<Workbench>,
+    ) -> Div {
+        let Some(dut) = w.duts.selected() else {
+            return div();
+        };
+        let key = self.key;
+        let collapsed = w
+            .collapsed_connection_panels
+            .get_mut(&dut.id)
+            .is_some_and(|panels| {
+                if body.is_none() {
+                    panels.remove(key);
+                }
+                panels.contains(key)
+            });
+        let header = if body.is_some() {
+            let dut_id = dut.id.clone();
+            let title = gpui_kit::component::button::Button::new(key)
+                .ghost()
+                .label(self.title)
+                .icon(
+                    crate::icons::kit_icon(self.icon)
+                        .size(px(17.))
+                        .text_color(p.accent),
+                )
+                .child(
+                    crate::icons::kit_icon(if collapsed {
+                        "chevron-right"
+                    } else {
+                        "chevron-down"
+                    })
+                    .size(px(14.))
+                    .text_color(p.muted),
+                )
+                .on_click(cx.listener(move |w, _, _, cx| {
+                    let panels = w
+                        .collapsed_connection_panels
+                        .entry(dut_id.clone())
+                        .or_default();
+                    if !panels.remove(key) {
+                        panels.insert(key);
+                    }
+                    cx.notify();
+                }));
+            crate::components::panel_header_row(p).child(title)
+        } else {
+            panel_head(self.icon, &self.title, p)
+        };
+        collapsible_panel(
+            header.children(self.control),
+            body.filter(|_| !collapsed),
+            p,
+        )
+    }
 }
 
 pub(super) fn serial_panel(
@@ -588,7 +667,12 @@ pub(super) fn serial_panel(
             p,
         ));
     body = body.child(two);
-    panel_shell("terminal", crate::i18n::t(w.lang, "serialBinding"), body, p)
+    ConnectionPanel::new(
+        "serialBinding",
+        "terminal",
+        crate::i18n::t(w.lang, "serialBinding"),
+    )
+    .render(w, Some(body), p, cx)
 }
 
 pub(super) fn format_index(format: &str) -> usize {
@@ -653,9 +737,7 @@ pub(super) fn adb_panel(
     let hdc = dut.adb.tool == "hdc";
     let enabled = crate::workspace::usb_debug_enabled(&dut.adb);
     let tool = if hdc { "hdc" } else { "adb" };
-    let header = switch_panel_header(
-        "usb",
-        w.lang.usb_debug_title(),
+    let header = ConnectionPanel::new("usbDebug", "usb", w.lang.usb_debug_title()).control(
         toggle("dut-usb-debug-toggle", enabled, p).on_click(cx.listener(
             move |this, checked: &bool, _, cx| {
                 this.select_usb_debug_tool(checked.then_some(tool));
@@ -663,10 +745,9 @@ pub(super) fn adb_panel(
                 cx.notify();
             },
         )),
-        p,
     );
     if !enabled {
-        return collapsible_panel(header, None, p);
+        return header.render(w, None, p, cx);
     }
     let selected = usize::from(hdc);
     let body = div().child(field(
@@ -709,7 +790,7 @@ pub(super) fn adb_panel(
         Some(&status),
         p,
     ));
-    collapsible_panel(header, Some(body), p)
+    header.render(w, Some(body), p, cx)
 }
 
 /// Read-only address line + copy button.
@@ -1016,7 +1097,12 @@ pub(super) fn mcp_panel(
         };
         body = body.child(subtle(status, p));
     }
-    panel_shell("link", crate::i18n::label("mcpServiceTitle"), body, p)
+    ConnectionPanel::new(
+        "mcpServiceTitle",
+        "link",
+        crate::i18n::label("mcpServiceTitle"),
+    )
+    .render(w, Some(body), p, cx)
 }
 
 pub(crate) fn render_about(p: &'static Palette) -> Div {
@@ -1190,9 +1276,7 @@ pub(super) fn a2a_dut_panel(
             ),
         );
     }
-    let header = switch_panel_header(
-        "network",
-        "A2A",
+    let header = ConnectionPanel::new("a2a", "network", "A2A").control(
         toggle("dut-a2a-toggle", config.enabled, p)
             .disabled(!saved)
             .on_click(cx.listener(move |this, enabled, _, cx| {
@@ -1203,9 +1287,8 @@ pub(super) fn a2a_dut_panel(
                 }
                 cx.notify();
             })),
-        p,
     );
-    collapsible_panel(header, (saved && config.enabled).then_some(body), p)
+    header.render(w, (saved && config.enabled).then_some(body), p, cx)
 }
 
 pub(super) fn flash_panel(
@@ -1221,25 +1304,23 @@ pub(super) fn flash_panel(
     let enabled = !dut.flash.executable.trim().is_empty() || dut.flash.preset_id.is_some();
     let initial_preset = choices.first().map(|(_, id)| id.clone());
     let toggle_dut = id.clone();
-    let header = switch_panel_header(
-        "hard-drive",
-        crate::i18n::label("flashTitle"),
-        toggle("dut-flash-toggle", enabled, p)
-            .disabled(!enabled && initial_preset.is_none())
-            .on_click(cx.listener(move |this, checked, _, cx| {
-                if *checked {
-                    if let Some(id) = &initial_preset {
-                        this.set_dut_flash_preset(&toggle_dut, id);
+    let header = ConnectionPanel::new("flashTitle", "hard-drive", crate::i18n::label("flashTitle"))
+        .control(
+            toggle("dut-flash-toggle", enabled, p)
+                .disabled(!enabled && initial_preset.is_none())
+                .on_click(cx.listener(move |this, checked, _, cx| {
+                    if *checked {
+                        if let Some(id) = &initial_preset {
+                            this.set_dut_flash_preset(&toggle_dut, id);
+                        }
+                    } else {
+                        this.set_dut_flash_preset(&toggle_dut, "");
                     }
-                } else {
-                    this.set_dut_flash_preset(&toggle_dut, "");
-                }
-                cx.notify();
-            })),
-        p,
-    );
+                    cx.notify();
+                })),
+        );
     if !enabled {
-        return collapsible_panel(header, None, p);
+        return header.render(w, None, p, cx);
     }
     let selected = crate::data::flash_preset_index(&dut.flash, &w.settings.flash_tools);
     let label = selected.map_or_else(
@@ -1266,7 +1347,7 @@ pub(super) fn flash_panel(
         cx,
     );
     let body = field(crate::i18n::label("chooseFlashTool"), select, None, p);
-    collapsible_panel(header, Some(body), p)
+    header.render(w, Some(body), p, cx)
 }
 
 pub(super) fn actions_row(

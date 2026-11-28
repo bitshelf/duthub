@@ -45,7 +45,7 @@ pub const BAUD_OPTIONS: [&str; 20] = [
 // External exports used by workspace/components/side_panel.
 pub(crate) use agent_panel::{agent_inspector_panel, agent_runtime_panel};
 pub use connection::render_connection;
-pub(crate) use connection::{collapsible_panel, panel_shell, render_about, switch_panel_header};
+pub(crate) use connection::{ConnectionPanel, collapsible_panel, panel_shell, render_about};
 pub(crate) use relay::render_relay_boards;
 pub(crate) use serial_settings::prompt_rule_description;
 pub use serial_settings::{hex_to_rgba, render_serial_settings};

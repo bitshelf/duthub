@@ -261,7 +261,10 @@ impl Workbench {
         let dut = self.duts.selected_mut();
         let settings = &mut self.settings;
         match id {
-            In::Find => self.find_query = value,
+            In::Find => {
+                self.find_pattern = crate::highlight::terminal_search(&value);
+                self.find_query = value;
+            }
             In::CfgSearch => self.cfg_search = value,
             In::Target | In::AgentModel => {}
             In::GoosePath => {

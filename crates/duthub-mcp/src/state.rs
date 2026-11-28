@@ -295,6 +295,8 @@ pub struct ControlStatusDto {
     pub generation: u64,
     pub queue_len: usize,
     pub protected_op: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_file: Option<String>,
 }
 
 /// The host bridges tool calls to device services or a persisted snapshot.
@@ -525,6 +527,14 @@ pub trait McpState: Send + Sync + 'static {
     /// Active display locale for localized MCP text (follows duthub's active UI language).
     fn locale(&self) -> crate::i18n::McpLocale {
         crate::i18n::McpLocale::ZhCn
+    }
+
+    /// Localize a blocked DUT access event using the host's display catalog.
+    fn blocked_notice_texts(
+        &self,
+        kind: crate::i18n::BlockedNoticeKind<'_>,
+    ) -> (&'static str, String, &'static str) {
+        crate::i18n::blocked_notice_texts(self.locale(), kind)
     }
 
     /// Return a monotonic or startup-bound epoch identifier for the DUT's active serial session,

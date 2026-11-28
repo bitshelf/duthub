@@ -1,8 +1,8 @@
 use super::{
-    A2aStatus, BtnVariant, Context, Div, DutAction, FluentBuilder, In, InteractiveElement,
-    IntoElement, IpAddr, Ipv4Addr, LeasePhase, Palette, ParentElement, SharedString, SocketAddr,
-    Stateful, StatefulInteractiveElement, Styled, Window, Workbench, btn, chip, collapsible_panel,
-    copy_text, div, field, icon, icon_btn, panel_head, px, subtle, switch_panel_header, toggle,
+    A2aStatus, BtnVariant, ConnectionPanel, Context, Div, DutAction, FluentBuilder, In,
+    InteractiveElement, IntoElement, IpAddr, Ipv4Addr, LeasePhase, Palette, ParentElement,
+    SharedString, SocketAddr, Stateful, StatefulInteractiveElement, Styled, Window, Workbench, btn,
+    chip, copy_text, div, field, icon, icon_btn, panel_head, px, subtle, toggle,
 };
 
 // ---------------------------------------------------------------------------
@@ -409,19 +409,16 @@ pub(super) fn alerts_panel(
     let settings = w.dut_alert_settings(&id);
     let enabled = settings.enabled;
     let toggle_id = id.clone();
-    let header = switch_panel_header(
-        "alert",
-        label("alertsTitle"),
+    let header = ConnectionPanel::new("alertsTitle", "alert", label("alertsTitle")).control(
         toggle("opt-alerts-enabled", enabled, p).on_click(cx.listener(
             move |this, checked, _, cx| {
                 this.edit_dut_alerts(&toggle_id, |cfg| cfg.enabled = *checked);
                 cx.notify();
             },
         )),
-        p,
     );
     if !enabled {
-        return collapsible_panel(header, None, p);
+        return header.render(w, None, p, cx);
     }
     let garbled_on = w.dut_garbled_detection(&id).enabled;
     let garbled_id = id.clone();
@@ -570,7 +567,7 @@ pub(super) fn alerts_panel(
         }
         rows = rows.child(chips);
     }
-    collapsible_panel(header, Some(rows), p)
+    header.render(w, Some(rows), p, cx)
 }
 pub(super) fn settings_panel(
     title_icon: &str,

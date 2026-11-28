@@ -237,6 +237,7 @@ impl McpState for FixtureState {
             generation: 0,
             queue_len: 0,
             protected_op: None,
+            protected_file: None,
         })
     }
 

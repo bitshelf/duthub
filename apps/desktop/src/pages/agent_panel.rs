@@ -1,8 +1,8 @@
 use super::{
-    BtnVariant, Context, Disableable, Div, In, Input, InteractiveElement, IntoElement, Palette,
-    ParentElement, SessionStatus, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    TranscriptEntry, TranscriptKind, Window, Workbench, btn, bundle, collapsible_panel, div, field,
-    panel_shell, px, subtle, switch_panel_header, toggle,
+    BtnVariant, ConnectionPanel, Context, Disableable, Div, In, Input, InteractiveElement,
+    IntoElement, Palette, ParentElement, SessionStatus, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, TranscriptEntry, TranscriptKind, Window, Workbench, btn,
+    bundle, div, field, panel_shell, px, subtle, toggle,
 };
 
 pub(super) fn connection_agent_panel(
@@ -16,19 +16,21 @@ pub(super) fn connection_agent_panel(
     };
     let id = dut.id.clone();
     let enabled = w.agent_bindings.is_enabled(&id);
-    let header = switch_panel_header(
+    let header = ConnectionPanel::new(
+        "agentSessionTitle",
         "spark",
         crate::i18n::label("agentSessionTitle"),
+    )
+    .control(
         toggle("toggle-agent-session-details", enabled, p).on_click(cx.listener(
             move |this, checked, _, cx| {
                 this.set_dut_agent_enabled(&id, *checked);
                 cx.notify();
             },
         )),
-        p,
     );
     let body = enabled.then(|| agent_session_panel(w, p, window, cx));
-    collapsible_panel(header, body, p)
+    header.render(w, body, p, cx)
 }
 
 /// Per-DUT Agent session controls, process state, and streamed transcript.

@@ -35,13 +35,14 @@ Instead of 100+ paginated `log_segment_read` calls, call `log_export`:
   "stripAnsi": true
 }
 ```
-If the total log size exceeds 256 KiB, download the returned `gzipDownloadUrl` in one HTTP request and verify `X-Duthub-Sha256`:
+If the total log size exceeds 256 KiB, download the returned `gzipDownloadUrl` in one HTTP request into **`.duthub/logs/<id>/`** (the standard Agent log directory) and verify `X-Duthub-Sha256`:
 
 ```bash
+mkdir -p .duthub/logs/<id>
 NO_PROXY=<LAN-IP> curl -sSf -D - \
   -H 'Authorization: Bearer <TOKEN>' \
   'http://<LAN-IP>:<PORT>/dut/<id>/logs/export?format=gzip' \
-  -o dut-logs.txt.gz
+  -o .duthub/logs/<id>/dut-logs.txt.gz
 ```
 
 ## 2. Shell Command with Anti-Echo Sentinel
@@ -142,13 +143,15 @@ When only a `reset` relay is wired (check `dut_status.bootModes`):
        'http://<LAN-IP>:<PORT>/dut/<id>/image/update.img'
      ```
      *(Append `?overwrite=true` to intentionally replace an existing image of the same name.)*
-   - **Option B — Resumable tus 1.0.0 (`ztus`, supports HTTP/2 `h2c` & automatic resume)**:
+   - **Option B — Resumable high-speed tus 1.0.0 (`ztus`, HTTP/2 `h2c` with large tuned windows & automatic resume — recommended for multi-GB images)**:
      ```bash
+     mkdir -p .duthub/logs/<id>
      NO_PROXY=<LAN-IP> ztus upload update.img \
        'http://<LAN-IP>:<PORT>/dut/<id>/transfer' \
        --header 'Authorization: Bearer <TOKEN>' \
-       --checksum sha256
+       --checksum sha256 2>&1 | tee .duthub/logs/<id>/upload.log
      ```
+   *(You may upload a **different** image filename concurrently while another image is flashing; uploading the same `activeFlashFile` is rejected with `409 FILE_IN_USE`.)*
 3. Acquire exclusive lease with mandatory `sessionName`:
 ```json
 // Tool: dut_control

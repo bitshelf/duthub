@@ -16,6 +16,17 @@ pub struct CompiledRule {
     pub color: String,
 }
 
+/// Compile a literal find query with offsets into the original text.
+pub fn terminal_search(query: &str) -> Option<regex::Regex> {
+    if query.is_empty() {
+        return None;
+    }
+    regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
 /// A single styled rendering segment: text + optional foreground override +
 /// cursor/selection flags.
 pub struct Segment {
@@ -27,6 +38,7 @@ pub struct Segment {
     pub is_cursor: bool,
     /// This segment falls inside the active mouse text selection.
     pub selected: bool,
+    pub search_match: bool,
 }
 
 /// Splits a row into styled segments according to highlight rules and cursor.
@@ -34,7 +46,7 @@ pub struct Segment {
 /// beyond `text.chars().count()` appends a virtual trailing space cursor).
 #[cfg(test)]
 pub fn row_segments(text: &str, rules: &[CompiledRule], cursor_char: Option<u32>) -> Vec<Segment> {
-    row_segments_with_selection(text, rules, cursor_char, None)
+    row_segments_with_selection(text, rules, cursor_char, None, None)
 }
 
 /// Splits a row into styled segments with an optional character-offset selection
@@ -44,9 +56,14 @@ pub fn row_segments_with_selection(
     rules: &[CompiledRule],
     cursor_char: Option<u32>,
     selection: Option<(usize, usize)>,
+    search: Option<&regex::Regex>,
 ) -> Vec<Segment> {
+    let mut hits = search
+        .into_iter()
+        .flat_map(|query| query.find_iter(text))
+        .peekable();
     // Fast path: plain text with no highlight rules, cursor, or selection.
-    if rules.is_empty() && cursor_char.is_none() && selection.is_none() {
+    if rules.is_empty() && cursor_char.is_none() && selection.is_none() && hits.peek().is_none() {
         if text.is_empty() {
             return Vec::new();
         }
@@ -55,6 +72,7 @@ pub fn row_segments_with_selection(
             color: None,
             is_cursor: false,
             selected: false,
+            search_match: false,
         }];
     }
 
@@ -102,7 +120,7 @@ pub fn row_segments_with_selection(
             rule.regex.find_iter(text).for_each(add_match);
         }
     }
-    if ranges.is_empty() && cursor_char.is_none() && selection.is_none() {
+    if ranges.is_empty() && cursor_char.is_none() && selection.is_none() && hits.peek().is_none() {
         if text.is_empty() {
             return Vec::new();
         }
@@ -111,6 +129,7 @@ pub fn row_segments_with_selection(
             color: None,
             is_cursor: false,
             selected: false,
+            search_match: false,
         }];
     }
     ranges.sort_by_key(|(start, _, _)| *start);
@@ -127,70 +146,41 @@ pub fn row_segments_with_selection(
     // 3) Merge adjacent characters with matching style; append virtual cursor
     // space when cursor lies at or past the trimmed line end.
     let mut segments: Vec<Segment> = Vec::new();
-    let push = |segments: &mut Vec<Segment>,
-                text: String,
-                color: Option<&str>,
-                cursor: bool,
-                selected: bool| {
-        if text.is_empty() && !cursor {
-            return;
+    for (idx, ch) in chars.into_iter().enumerate() {
+        let byte = char_byte_offsets[idx];
+        while hits.peek().is_some_and(|hit| hit.end() <= byte) {
+            hits.next();
         }
+        let is_cursor = Some(idx) == cursor_idx;
+        let selected = selection.is_some_and(|(start, end)| idx >= start && idx < end);
+        let search_match =
+            !is_cursor && !selected && hits.peek().is_some_and(|hit| hit.start() <= byte);
+        let color = if is_cursor { None } else { colors[idx] };
         if let Some(last) = segments.last_mut()
-            && !cursor
-            && last.color.as_deref() == color
+            && !is_cursor
             && !last.is_cursor
+            && last.color.as_deref() == color
             && last.selected == selected
+            && last.search_match == search_match
         {
-            last.text.push_str(&text);
-            return;
+            last.text.push(ch);
+        } else {
+            segments.push(Segment {
+                text: ch.to_string(),
+                color: color.map(str::to_owned),
+                is_cursor,
+                selected,
+                search_match,
+            });
         }
-        segments.push(Segment {
-            text,
-            color: color.map(str::to_string),
-            is_cursor: cursor,
-            selected,
-        });
-    };
-    let mut run = String::new();
-    let mut run_color: Option<&str> = None;
-    let mut run_selected = false;
-    for (idx, ch) in chars.iter().enumerate() {
-        let cell_selected = selection.is_some_and(|(start, end)| idx >= start && idx < end);
-        if Some(idx) == cursor_idx {
-            // Always flush any preceding run before emitting the isolated cursor cell.
-            push(
-                &mut segments,
-                std::mem::take(&mut run),
-                run_color,
-                false,
-                run_selected,
-            );
-            push(&mut segments, ch.to_string(), None, true, cell_selected);
-            run_color = None;
-            run_selected = false;
-            continue;
-        }
-        let cell_color = colors[idx];
-        if cell_color != run_color || cell_selected != run_selected {
-            push(
-                &mut segments,
-                std::mem::take(&mut run),
-                run_color,
-                false,
-                run_selected,
-            );
-            run_color = cell_color;
-            run_selected = cell_selected;
-        }
-        run.push(*ch);
     }
-    push(&mut segments, run, run_color, false, run_selected);
     if cursor_idx.is_some_and(|ci| ci >= len) {
         segments.push(Segment {
             text: " ".to_string(),
             color: None,
             is_cursor: true,
             selected: false,
+            search_match: false,
         });
     }
     segments
@@ -608,9 +598,41 @@ mod tests {
     }
 
     #[test]
+    fn find_highlights_literal_matches_in_original_text() {
+        let search = terminal_search("d.g");
+        let segments =
+            row_segments_with_selection("中D.Gits d.g dig", &[], None, None, search.as_ref());
+        assert_eq!(texts(&segments), ["中", "D.G", "its ", "d.g", " dig"]);
+        assert_eq!(
+            segments.iter().map(|s| s.search_match).collect::<Vec<_>>(),
+            [false, true, false, true, false]
+        );
+        assert!(terminal_search("").is_none());
+    }
+
+    #[test]
+    fn find_respects_foreground_selection_and_cursor() {
+        let search = terminal_search("DIG");
+        let compiled = rules(&[("dig", "#abc")]);
+        let segments = row_segments_with_selection(
+            "digits",
+            &compiled,
+            Some(2),
+            Some((1, 2)),
+            search.as_ref(),
+        );
+        assert_eq!(texts(&segments), ["d", "i", "g", "its"]);
+        assert!(segments[0].search_match);
+        assert_eq!(segments[0].color.as_deref(), Some("#abc"));
+        assert!(segments[1].selected && !segments[1].search_match);
+        assert!(segments[2].is_cursor && !segments[2].search_match);
+    }
+
+    #[test]
     fn selection_splits_plain_and_highlighted_runs_while_preserving_text() {
         let compiled = rules(&[(r"root@KC", "#7ec699")]);
-        let segments = row_segments_with_selection("root@KC:~# ls", &compiled, None, Some((4, 10)));
+        let segments =
+            row_segments_with_selection("root@KC:~# ls", &compiled, None, Some((4, 10)), None);
         let summary: Vec<(&str, Option<&str>, bool)> = segments
             .iter()
             .map(|s| (s.text.as_str(), s.color.as_deref(), s.selected))

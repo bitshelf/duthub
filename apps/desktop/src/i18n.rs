@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use duthub_mcp::i18n::{self as mcp_i18n, BlockedNoticeKind, McpLocale};
+
 struct Locale {
     code: &'static str,
     name: &'static str,
@@ -114,7 +116,13 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         .filter(|text| !text.is_empty())
         .or_else(|| LOCALES[1].messages().get(key))
         .or_else(|| LOCALES[0].messages().get(key))
-        .map_or("(i18n missing)", String::as_str)
+        .map(String::as_str)
+        .or_else(|| {
+            let locale = McpLocale::from_setting(LOCALES[lang.0].code);
+            mcp_i18n::blocked_notice_template(locale, key)
+                .or_else(|| mcp_i18n::blocked_notice_template(McpLocale::EnUs, key))
+        })
+        .unwrap_or("(i18n missing)")
 }
 
 pub fn label(key: &str) -> &'static str {
@@ -127,17 +135,12 @@ pub fn active_code() -> &'static str {
 }
 
 pub fn message(key: &str, arguments: &[(&str, &str)]) -> String {
-    static PLACEHOLDER: OnceLock<regex::Regex> = OnceLock::new();
-    let pattern =
-        PLACEHOLDER.get_or_init(|| regex::Regex::new(r"\{([A-Za-z][A-Za-z0-9_]*)\}").unwrap());
-    pattern
-        .replace_all(label(key), |matched: &regex::Captures<'_>| {
-            arguments
-                .iter()
-                .find(|(name, _)| *name == &matched[1])
-                .map_or_else(|| matched[0].to_owned(), |(_, value)| (*value).to_owned())
-        })
-        .into_owned()
+    mcp_i18n::format_message(label(key), arguments)
+}
+
+pub fn blocked_notice_texts(kind: BlockedNoticeKind<'_>) -> (&'static str, String, &'static str) {
+    let lang = Lang(ACTIVE.load(Ordering::Relaxed));
+    mcp_i18n::blocked_notice_texts_with(kind, |key| t(lang, key))
 }
 
 #[cfg(test)]
@@ -160,6 +163,21 @@ mod tests {
     fn usb_debug_label_uses_only_the_selected_language() {
         assert_eq!(Lang::ZhCn.usb_debug_title(), "USB 调试");
         assert_eq!(Lang::EnUs.usb_debug_title(), "USB Debug");
+    }
+
+    #[test]
+    fn blocked_notice_catalog_matches_desktop_control_labels() {
+        for lang in [Lang::ZhCn, Lang::EnUs] {
+            for (detail, button) in [
+                ("mcpBlockedGuiHeldDetail", "leaseActionRelease"),
+                ("mcpBlockedManualTakeoverDetail", "releaseManualControl"),
+                ("mcpBlockedNeedsInspectionDetail", "leaseActionRecover"),
+                ("mcpBlockedUnauthorizedDetail", "mcpServiceTitle"),
+                ("mcpBlockedUnauthorizedDetail", "connectionTitle"),
+            ] {
+                assert!(t(lang, detail).contains(t(lang, button)), "{detail}");
+            }
+        }
     }
 
     #[test]

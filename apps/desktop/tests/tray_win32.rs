@@ -317,10 +317,7 @@ fn hide_main_never_strands_the_window() {
             "show_main must bring the window back"
         );
     }
-    // Ordering used by the desktop layer: show first, then drop the icon.
-    let _ = handle.set_icon_visible(false);
-    assert!(!handle.test_probe().icon_visible);
-    assert!(handle.test_probe().icon_rect.is_none());
+    assert_eq!(handle.test_probe().icon_visible, hidden);
 
     handle.remove();
     handle.remove(); // idempotent
@@ -339,7 +336,14 @@ fn icon_lifecycle_against_a_real_shell() {
     let window = TestWindow::create();
     let handle = tray::install_with_hwnd(window.raw(), options()).expect("tray install");
 
-    assert!(handle.hide_main(), "a desktop session must accept NIM_ADD");
+    assert!(
+        handle.set_icon_visible(true),
+        "a desktop session must accept NIM_ADD at startup"
+    );
+    assert!(handle.main_visible());
+    assert!(handle.test_probe().icon_rect.is_some());
+
+    assert!(handle.hide_main(), "a registered icon permits hiding");
     assert!(
         TestWindow::wait_until(Duration::from_millis(3000), || !handle.main_visible()),
         "the hidden window must not stay visible"
@@ -369,6 +373,12 @@ fn icon_lifecycle_against_a_real_shell() {
     TestWindow::pump(Duration::from_millis(200));
     assert!(!handle.test_probe().alerting);
 
+    assert!(handle.show_main());
+    assert!(TestWindow::wait_until(Duration::from_secs(3), || {
+        handle.main_visible()
+    }));
+    assert!(handle.test_probe().icon_rect.is_some());
+
     // A TaskbarCreated replay must either keep the icon reachable or report
     // IconLost so the UI can bring the window back.
     let taskbar_created = handle.test_probe().taskbar_created_msg;
@@ -389,11 +399,6 @@ fn icon_lifecycle_against_a_real_shell() {
         "after TaskbarCreated the icon must be reachable again or IconLost must be reported"
     );
 
-    // Restore.
-    assert!(handle.show_main());
-    let _ = handle.set_icon_visible(false);
-    TestWindow::pump(Duration::from_millis(400));
-    assert!(handle.test_probe().icon_rect.is_none());
     handle.remove();
     assert!(handle.test_probe().icon_rect.is_none());
     assert!(!handle.test_probe().icon_visible);

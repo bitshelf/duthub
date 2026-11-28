@@ -340,7 +340,7 @@ mod tests {
             "serial evidence"
         );
 
-        // Legacy `logs/` files remain readable alongside the new `串口日志/` folder.
+        // Files in both the legacy `logs/` folder and the current serial log folder remain readable.
         let (_, owner) =
             crate::dut_artifacts::open_dut_for_write(portable.path(), "a", "RK3576").unwrap();
         let legacy_dir = crate::dut_artifacts::open_subdir_for_write(&owner, "logs").unwrap();

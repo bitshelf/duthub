@@ -202,19 +202,23 @@ fn main() {
         }
     };
     let work_dir = artifact_root.join("duthub-data");
-    for component in ["audit", "runtime"] {
-        if let Err(error) = duthub_core::store::ensure_portable_child(&work_dir, component) {
-            eprintln!("{error}");
-            exit(1);
-        }
+    if let Err(error) = duthub_core::store::ensure_portable_child(&work_dir, "runtime") {
+        eprintln!("{error}");
+        exit(1);
+    }
+    let logs_dir = data_dir.join("logs");
+    if let Err(error) = duthub_core::store::ensure_portable_child(&data_dir, "logs")
+        .and_then(|()| duthub_core::store::ensure_portable_child(&logs_dir, "audit"))
+    {
+        eprintln!("{error}");
+        exit(1);
     }
 
-    // Enable Chrome Trace with `--trace`. Open the JSON trace from the work directory's traces
-    // subdirectory in ui.perfetto.dev. `RUST_LOG` sets the standard log filter and defaults to
-    // info.
+    // Enable Chrome Trace with `--trace`. Open the JSON trace from `.duthub/logs/traces/`
+    // in ui.perfetto.dev. `RUST_LOG` sets the standard log filter and defaults to info.
     let _trace_guard = if trace_enabled {
-        let trace_dir = work_dir.join("traces");
-        if let Err(error) = duthub_core::store::ensure_portable_child(&work_dir, "traces") {
+        let trace_dir = logs_dir.join("traces");
+        if let Err(error) = duthub_core::store::ensure_portable_child(&logs_dir, "traces") {
             eprintln!("{error}");
             exit(1);
         }
@@ -287,7 +291,7 @@ fn main() {
             // DeviceService.
             // (crates/duthub-device/src/lib.rs:91-95); otherwise, the automatic GUI lease will
             // expire due to TTL expiration.
-            let audit = duthub_core::AuditSink::at_dir(work_dir.join("audit"));
+            let audit = duthub_core::AuditSink::at_dir(logs_dir.join("audit"));
             let lease = Arc::new(
                 duthub_core::ControlLeaseManager::new(Some(audit.clone()))
                     .with_ttl(std::time::Duration::from_secs(u64::from(

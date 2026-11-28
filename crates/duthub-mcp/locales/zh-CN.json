@@ -1,0 +1,23 @@
+{
+  "mcpBlockedUnauthorizedTitle": "需要人工介入：Agent 权限不足",
+  "mcpBlockedUnauthorizedDetail": "Agent「{requester}」无法在 {dut} 上执行「{action}」：缺少对应的 DUT 授权。如需允许，请在「连接管理 → MCP 服务」中开启该权限。",
+  "mcpBlockedUnauthorizedAction": "在「连接管理 → MCP 服务」中授予所需的 DUT 权限，或使用具备该权限的凭据。",
+  "mcpBlockedManualTakeoverTitle": "需要人工介入：已开启人工接管",
+  "mcpBlockedManualTakeoverDetail": "Agent「{requester}」无法在 {dut} 上执行「{action}」：当前处于人工接管模式。准备恢复 Agent 控制时请点击「解除人工接管」。",
+  "mcpBlockedManualTakeoverAction": "等待操作员在 duthub 中解除人工接管。",
+  "mcpBlockedNeedsInspectionTitle": "需要人工介入：DUT 需要安全核检",
+  "mcpBlockedNeedsInspectionDetail": "Agent「{requester}」无法在 {dut} 上执行「{action}」：上次受保护操作结果未知，请先人工检查硬件并在 duthub 中点击「安全恢复」。",
+  "mcpBlockedNeedsInspectionAction": "等待操作员检查硬件并点击「安全恢复」。",
+  "mcpBlockedProtectedTitle": "DUT 正在执行受保护操作",
+  "mcpBlockedProtectedDetail": "Agent「{requester}」暂时无法在 {dut} 上执行「{action}」：正在执行受保护操作「{op}」。",
+  "mcpBlockedProtectedAction": "等待受保护操作（如固件烧录）完成后重试。",
+  "mcpBlockedGuiHeldTitle": "需要人工介入：桌面端持有控制权",
+  "mcpBlockedGuiHeldDetail": "Agent「{requester}」无法在 {dut} 上执行「{action}」：桌面端当前持有控制权。请点击「释放控制权」让 Agent 继续。",
+  "mcpBlockedGuiHeldAction": "请操作员在 duthub 中点击「释放控制权」，或在无人值守模式下使用 --release-gui-lease 启动。",
+  "mcpBlockedMultiAgentTitle": "需要人工介入：多 Agent 争抢 DUT",
+  "mcpBlockedMultiAgentDetail": "Agent「{requester}」在 {dut} 上等待「{action}」已达 {waited_ms}ms，仍被「{holder}」占用（等待队列 {queue_len}）。请检查 Agent 冲突或手动释放控制。",
+  "mcpBlockedMultiAgentAction": "等待当前 Agent 释放租约，增大 waitMs，或等待人工介入。",
+  "mcpBlockedGenericTitle": "DUT 访问受限",
+  "mcpBlockedGenericDetail": "Agent「{requester}」无法在 {dut} 上执行「{action}」：{error_msg}",
+  "mcpBlockedGenericAction": "检查 dut_status，获取或续期控制租约后重试。"
+}

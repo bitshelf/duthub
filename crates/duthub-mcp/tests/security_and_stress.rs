@@ -21,6 +21,7 @@ use duthub_core::agent_access::{
 use duthub_core::audit::AuditSink;
 use duthub_core::lease::{ControlLeaseManager, LeaseHolder, WriteIdentity};
 use duthub_mcp::auth_http::AccessContext;
+use duthub_mcp::i18n::McpLocale;
 use duthub_mcp::notify::{NotifyOutcome, NotifyRequest, UserNotifier};
 use duthub_mcp::state::{
     AdbDeviceDto, ApprovalErr, ApprovalIssueResult, ControlStatusDto, DutInfo, DutSummary,
@@ -28,6 +29,9 @@ use duthub_mcp::state::{
     RelayBrief, RelayChannelsBrief, SerialBindInfo,
 };
 use duthub_mcp::transport::{MAX_MCP_REQUEST_BYTES, spawn_http_listener_on};
+
+const TEST_DUT_ID: &str = "dut-test";
+const TEST_DUT_NAME: &str = "Test Board";
 
 struct NoopNotifier;
 impl UserNotifier for NoopNotifier {
@@ -45,6 +49,7 @@ struct InteractiveTestState {
     marks: Mutex<Vec<String>>,
     control_log: Mutex<Vec<String>>,
     tx_log: Mutex<Vec<String>>,
+    locale: Mutex<McpLocale>,
 }
 
 impl InteractiveTestState {
@@ -71,11 +76,12 @@ impl InteractiveTestState {
             relay_brief: Mutex::new(relay),
             lines: Mutex::new(vec![LogLineDto {
                 seq: 1,
-                text: "Linux rk3576 login: ".into(),
+                text: "Linux test-board login: ".into(),
             }]),
             marks: Mutex::new(Vec::new()),
             control_log: Mutex::new(Vec::new()),
             tx_log: Mutex::new(Vec::new()),
+            locale: Mutex::default(),
         }
     }
 
@@ -90,10 +96,14 @@ impl InteractiveTestState {
 }
 
 impl McpState for InteractiveTestState {
+    fn locale(&self) -> McpLocale {
+        *self.locale.lock().unwrap()
+    }
+
     fn list_duts(&self) -> Vec<DutSummary> {
         vec![DutSummary {
-            dut_id: "dut-rk3576".into(),
-            name: "RK3576-Board".into(),
+            dut_id: TEST_DUT_ID.into(),
+            name: TEST_DUT_NAME.into(),
             source: "device".into(),
             port: "COM8".into(),
             baud: 1_500_000,
@@ -101,12 +111,12 @@ impl McpState for InteractiveTestState {
     }
 
     fn dut_info(&self, dut_id: &str) -> Option<DutInfo> {
-        if dut_id != "dut-rk3576" {
+        if dut_id != TEST_DUT_ID {
             return None;
         }
         Some(DutInfo {
-            dut_id: "dut-rk3576".into(),
-            name: "RK3576-Board".into(),
+            dut_id: TEST_DUT_ID.into(),
+            name: TEST_DUT_NAME.into(),
             source: "device".into(),
             serial: SerialBindInfo {
                 host: "local".into(),
@@ -114,7 +124,7 @@ impl McpState for InteractiveTestState {
                 baud: 1_500_000,
                 format: "8N1".into(),
             },
-            adb_serial: Some("RK3576001".into()),
+            adb_serial: Some("TESTADB001".into()),
             relay: Some(self.relay_brief.lock().unwrap().clone()),
             mcp_label: None,
             session_lines: self.lines.lock().unwrap().last().map(|l| l.seq),
@@ -213,11 +223,12 @@ impl McpState for InteractiveTestState {
             generation: status.generation,
             queue_len: status.queue_len,
             protected_op: status.protected_op,
+            protected_file: status.protected_file,
         })
     }
 
     fn serial_read(&self, dut_id: &str, since_seq: u64, limit: usize) -> Option<LogReadResult> {
-        if dut_id != "dut-rk3576" {
+        if dut_id != TEST_DUT_ID {
             return None;
         }
         let guard = self.lines.lock().unwrap();
@@ -230,7 +241,7 @@ impl McpState for InteractiveTestState {
         let last_seq = lines.last().map_or(since_seq, |l| l.seq);
         Some(LogReadResult {
             dut_id: dut_id.into(),
-            session_id: Some("sess-dut-rk3576".into()),
+            session_id: Some("sess-dut-test".into()),
             last_seq,
             lines,
         })
@@ -265,9 +276,9 @@ impl McpState for InteractiveTestState {
 
     fn adb_list(&self) -> Vec<AdbDeviceDto> {
         vec![AdbDeviceDto {
-            serial: "RK3576001".into(),
+            serial: "TESTADB001".into(),
             state: "device".into(),
-            model: Some("rk3576".into()),
+            model: Some("test-board".into()),
         }]
     }
 
@@ -302,7 +313,7 @@ impl McpState for InteractiveTestState {
         }
         self.control_log.lock().unwrap().push("reset".into());
         // Simulate U-Boot autoboot banner appearing right after relay reset.
-        self.push_rx("U-Boot 2017.09 RK3576\r\nHit any key to stop autoboot:  2\r\n");
+        self.push_rx("U-Boot 2017.09 Test Board\r\nHit any key to stop autoboot:  2\r\n");
         Ok(())
     }
 
@@ -381,7 +392,7 @@ impl McpState for InteractiveTestState {
         let path = duthub_core::dut_artifacts::resolve_owned_file(
             &self.artifact_root,
             dut_id,
-            "RK3576-Board",
+            TEST_DUT_NAME,
             file_id,
         )
         .map_err(|err| format!("file fence rejected firmware image: {err}"))?;
@@ -429,7 +440,7 @@ impl McpState for InteractiveTestState {
                 let dst = duthub_core::dut_artifacts::prepare_owned_destination(
                     &self.artifact_root,
                     dut_id,
-                    "RK3576-Board",
+                    TEST_DUT_NAME,
                     fid,
                 )
                 .map_err(|err| format!("file fence rejected pull destination: {err}"))?;
@@ -450,7 +461,7 @@ impl McpState for InteractiveTestState {
                 let _src = duthub_core::dut_artifacts::resolve_owned_file(
                     &self.artifact_root,
                     dut_id,
-                    "RK3576-Board",
+                    TEST_DUT_NAME,
                     fid,
                 )
                 .map_err(|err| format!("file fence rejected push source: {err}"))?;
@@ -549,8 +560,8 @@ async fn mcp_file_fence_blocks_traversal_junctions_and_outside_writes() {
     // Prepare owned DUT artifact inside duthub_root.
     let (mut f, _) = duthub_core::dut_artifacts::create_file(
         &duthub_root,
-        "dut-rk3576",
-        "RK3576-Board",
+        TEST_DUT_ID,
+        TEST_DUT_NAME,
         "boot.log",
     )
     .unwrap();
@@ -560,7 +571,7 @@ async fn mcp_file_fence_blocks_traversal_junctions_and_outside_writes() {
     // Plant a Windows NTFS junction inside the DUT folder pointing to `outside_dir`.
     #[cfg(windows)]
     {
-        let junction = duthub_root.join("RK3576-Board").join("escape_link");
+        let junction = duthub_root.join(TEST_DUT_NAME).join("escape_link");
         let status = std::process::Command::new("cmd")
             .args([
                 "/C",
@@ -592,14 +603,14 @@ async fn mcp_file_fence_blocks_traversal_junctions_and_outside_writes() {
             token: token.clone(),
             enabled: true,
             grants: vec![DutGrant {
-                dut_id: "dut-rk3576".into(),
+                dut_id: TEST_DUT_ID.into(),
                 actions: vec![DutAction::Read],
             }],
         }],
         listeners: vec![AgentListener {
             id: "listener-dut".into(),
             port: 0,
-            dut_id: Some("dut-rk3576".into()),
+            dut_id: Some(TEST_DUT_ID.into()),
         }],
         ..Default::default()
     });
@@ -610,7 +621,7 @@ async fn mcp_file_fence_blocks_traversal_junctions_and_outside_writes() {
         state,
         Some(access),
         Some(Arc::from("listener-dut")),
-        Some(Arc::from("dut-rk3576")),
+        Some(Arc::from(TEST_DUT_ID)),
         Some(Arc::new(NoopNotifier)),
     )
     .unwrap();
@@ -645,7 +656,7 @@ async fn mcp_file_fence_blocks_traversal_junctions_and_outside_writes() {
     let read_ok = call_json(
         &client,
         "dut_file_read",
-        json!({"dutId": "dut-rk3576", "fileId": "boot.log"}),
+        json!({"dutId": TEST_DUT_ID, "fileId": "boot.log"}),
     )
     .await
     .unwrap();
@@ -674,7 +685,7 @@ async fn mcp_file_fence_blocks_traversal_junctions_and_outside_writes() {
         let err = call_json(
             &client,
             "dut_file_read",
-            json!({"dutId": "dut-rk3576", "fileId": hostile}),
+            json!({"dutId": TEST_DUT_ID, "fileId": hostile}),
         )
         .await
         .expect_err(&format!("hostile fileId must be rejected: {hostile}"));
@@ -712,16 +723,16 @@ async fn mcp_file_fence_blocks_traversal_junctions_and_outside_writes() {
 
     let tail_res = client
         .read_resource(rmcp::model::ReadResourceRequestParams::new(
-            "duthub://dut/dut-rk3576/serial/tail",
+            "duthub://dut/dut-test/serial/tail",
         ))
         .await
         .unwrap();
     let tail_json = serde_json::to_value(&tail_res).unwrap();
-    assert!(tail_json.to_string().contains("Linux rk3576 login"));
+    assert!(tail_json.to_string().contains("Linux test-board login"));
 
     let file_res = client
         .read_resource(rmcp::model::ReadResourceRequestParams::new(
-            "duthub://dut/dut-rk3576/files/boot.log",
+            "duthub://dut/dut-test/files/boot.log",
         ))
         .await
         .unwrap();
@@ -733,8 +744,8 @@ async fn mcp_file_fence_blocks_traversal_junctions_and_outside_writes() {
     );
 
     for hostile_uri in [
-        "duthub://dut/dut-rk3576/files/../windows-outside-secret/secret.txt",
-        "duthub://dut/dut-rk3576/files/escape_link/secret.txt",
+        "duthub://dut/dut-test/files/../windows-outside-secret/secret.txt",
+        "duthub://dut/dut-test/files/escape_link/secret.txt",
         "duthub://dut/dut-other/serial/tail",
         "file:///C:/Windows/win.ini",
     ] {
@@ -792,7 +803,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
                 token: readonly_token.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
-                    dut_id: "dut-rk3576".into(),
+                    dut_id: TEST_DUT_ID.into(),
                     actions: vec![DutAction::Read],
                 }],
             },
@@ -803,7 +814,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
                 token: control_token.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
-                    dut_id: "dut-rk3576".into(),
+                    dut_id: TEST_DUT_ID.into(),
                     actions: vec![
                         DutAction::Read,
                         DutAction::SerialWrite,
@@ -846,7 +857,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     let status = call_json(
         &readonly_client,
         "dut_status",
-        json!({"dutId": "dut-rk3576"}),
+        json!({"dutId": TEST_DUT_ID}),
     )
     .await
     .unwrap();
@@ -864,7 +875,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     let err = call_json(
         &readonly_client,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "reset"}),
+        json!({"dutId": TEST_DUT_ID, "action": "reset"}),
     )
     .await
     .expect_err("read-only token cannot reset board");
@@ -873,7 +884,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     let err = call_json(
         &readonly_client,
         "serial_exec",
-        json!({"dutId": "dut-rk3576", "text": "reboot loader\r"}),
+        json!({"dutId": TEST_DUT_ID, "text": "reboot loader\r"}),
     )
     .await
     .expect_err("read-only token cannot write serial");
@@ -899,7 +910,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
         &control_client,
         "serial_exec",
         json!({
-            "dutId": "dut-rk3576",
+            "dutId": TEST_DUT_ID,
             "triggerReset": true,
             "waitFor": "Hit any key to stop autoboot",
             "send": "\r",
@@ -930,7 +941,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     let err = call_json(
         &control_client,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "enter_maskrom"}),
+        json!({"dutId": TEST_DUT_ID, "action": "enter_maskrom"}),
     )
     .await
     .expect_err("unbound maskrom channel must fail clearly");
@@ -941,7 +952,7 @@ async fn mcp_board_control_reset_loader_and_manual_takeover() {
     let err = call_json(
         &control_client,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "reset"}),
+        json!({"dutId": TEST_DUT_ID, "action": "reset"}),
     )
     .await
     .expect_err("manual takeover must block agent reset");
@@ -977,7 +988,7 @@ async fn mcp_http_concurrent_stress_and_oversized_body_defense() {
             token: token.clone(),
             enabled: true,
             grants: vec![DutGrant {
-                dut_id: "dut-rk3576".into(),
+                dut_id: TEST_DUT_ID.into(),
                 actions: vec![DutAction::Read],
             }],
         }],
@@ -1026,7 +1037,7 @@ async fn mcp_http_concurrent_stress_and_oversized_body_defense() {
                 .expect("stress client init");
             let list = call_json(&client, "dut_list", json!({})).await.unwrap();
             assert_eq!(list["duts"].as_array().unwrap().len(), 1);
-            let status = call_json(&client, "dut_status", json!({"dutId": "dut-rk3576"}))
+            let status = call_json(&client, "dut_status", json!({"dutId": TEST_DUT_ID}))
                 .await
                 .unwrap();
             assert_eq!(status["relay"]["channels"]["reset"], 1);
@@ -1034,7 +1045,7 @@ async fn mcp_http_concurrent_stress_and_oversized_body_defense() {
                 let _ = call_json(
                     &client,
                     "serial_read",
-                    json!({"dutId": "dut-rk3576", "tail": 10}),
+                    json!({"dutId": TEST_DUT_ID, "tail": 10}),
                 )
                 .await
                 .unwrap();
@@ -1077,9 +1088,9 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
     // Stage one legitimate firmware image inside the owned DUT folder.
     let (mut f, _) = duthub_core::dut_artifacts::create_file(
         &duthub_root,
-        "dut-rk3576",
-        "RK3576-Board",
-        "rk3576-test.img",
+        TEST_DUT_ID,
+        TEST_DUT_NAME,
+        "test-firmware.img",
     )
     .unwrap();
     std::io::Write::write_all(&mut f, b"RKFW_MOCK_IMAGE").unwrap();
@@ -1103,7 +1114,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
                 token: ro_token.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
-                    dut_id: "dut-rk3576".into(),
+                    dut_id: TEST_DUT_ID.into(),
                     actions: vec![DutAction::Read],
                 }],
             },
@@ -1114,7 +1125,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
                 token: ops_token.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
-                    dut_id: "dut-rk3576".into(),
+                    dut_id: TEST_DUT_ID.into(),
                     actions: vec![DutAction::Read, DutAction::Adb, DutAction::Flash],
                 }],
             },
@@ -1148,7 +1159,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
     let listed = call_json(
         &ro_client,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "flash_list"}),
+        json!({"dutId": TEST_DUT_ID, "action": "flash_list"}),
     )
     .await
     .unwrap();
@@ -1158,7 +1169,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
         call_json(
             &ro_client,
             "dut_control",
-            json!({"dutId": "dut-rk3576", "action": "flash_update", "fileId": "rk3576-test.img"})
+            json!({"dutId": TEST_DUT_ID, "action": "flash_update", "fileId": "test-firmware.img"})
         )
         .await
         .is_err(),
@@ -1168,7 +1179,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
         call_json(
             &ro_client,
             "adb_exec",
-            json!({"dutId": "dut-rk3576", "op": "shell", "command": "uname -a"})
+            json!({"dutId": TEST_DUT_ID, "op": "shell", "command": "uname -a"})
         )
         .await
         .is_err(),
@@ -1189,7 +1200,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
     let flashed = call_json(
         &ops_client,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "flash_update", "fileId": "rk3576-test.img"}),
+        json!({"dutId": TEST_DUT_ID, "action": "flash_update", "fileId": "test-firmware.img"}),
     )
     .await
     .unwrap();
@@ -1205,7 +1216,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
             call_json(
                 &ops_client,
                 "dut_control",
-                json!({"dutId": "dut-rk3576", "action": "flash_update", "fileId": bad})
+                json!({"dutId": TEST_DUT_ID, "action": "flash_update", "fileId": bad})
             )
             .await
             .is_err(),
@@ -1217,7 +1228,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
     let sh = call_json(
         &ops_client,
         "adb_exec",
-        json!({"dutId": "dut-rk3576", "op": "shell", "command": "uname -a"}),
+        json!({"dutId": TEST_DUT_ID, "op": "shell", "command": "uname -a"}),
     )
     .await
     .unwrap();
@@ -1227,7 +1238,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
     let pulled = call_json(
         &ops_client,
         "adb_exec",
-        json!({"dutId": "dut-rk3576", "op": "pull", "remotePath": "/proc/cmdline", "fileId": "cmdline.txt"}),
+        json!({"dutId": TEST_DUT_ID, "op": "pull", "remotePath": "/proc/cmdline", "fileId": "cmdline.txt"}),
     )
     .await
     .unwrap();
@@ -1252,7 +1263,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
             call_json(
                 &ops_client,
                 "adb_exec",
-                json!({"dutId": "dut-rk3576", "op": "pull", "remotePath": "/proc/cmdline", "fileId": bad})
+                json!({"dutId": TEST_DUT_ID, "op": "pull", "remotePath": "/proc/cmdline", "fileId": bad})
             )
             .await
             .is_err(),
@@ -1262,7 +1273,7 @@ async fn mcp_adb_and_flash_respect_grants_and_file_fence() {
             call_json(
                 &ops_client,
                 "adb_exec",
-                json!({"dutId": "dut-rk3576", "op": "push", "remotePath": "/data/local/tmp/x", "fileId": bad})
+                json!({"dutId": TEST_DUT_ID, "op": "push", "remotePath": "/data/local/tmp/x", "fileId": bad})
             )
             .await
             .is_err(),
@@ -1285,6 +1296,41 @@ impl UserNotifier for RecordingNotifier {
         self.notices.lock().unwrap().push(request.clone());
         NotifyOutcome::Queued
     }
+}
+
+async fn assert_localized_block(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>,
+    notifier: &RecordingNotifier,
+    tool: &str,
+    args: serde_json::Value,
+    requester: &str,
+    (title, detail, action): (&str, &str, &str),
+) {
+    let before = notifier.notices.lock().unwrap().len();
+    let params = CallToolRequestParams::new(tool.to_owned())
+        .with_arguments(args.as_object().unwrap().clone());
+    let error = client
+        .call_tool_once(params)
+        .await
+        .expect_err("DUT access must be blocked");
+    let rmcp::service::ServiceError::McpError(error) = error else {
+        panic!("Expected an MCP error, got {error:?}");
+    };
+    let data = error.data.expect("blocked error must carry notice data");
+    assert_eq!(data["humanNotified"], true);
+    assert_eq!(data["requester"], requester);
+    let notices = notifier.notices.lock().unwrap();
+    assert_eq!(notices.len(), before + 1);
+    let notice = notices.last().unwrap();
+    assert_eq!(notice.title.as_deref(), Some(title));
+    assert_eq!(data["reason"], notice.message);
+    assert!(notice.message.contains(detail), "{}", notice.message);
+    assert!(notice.message.contains(requester), "{}", notice.message);
+    assert!(notice.message.contains(TEST_DUT_NAME), "{}", notice.message);
+    assert!(
+        data["suggestedAction"].as_str().unwrap().contains(action),
+        "{data}"
+    );
 }
 
 /// Multi-Agent concurrency arbitration + automatic human-intervention alerts:
@@ -1317,7 +1363,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
                 token: token_a.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
-                    dut_id: "dut-rk3576".into(),
+                    dut_id: TEST_DUT_ID.into(),
                     actions: vec![
                         DutAction::Read,
                         DutAction::SerialWrite,
@@ -1334,7 +1380,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
                 token: token_b.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
-                    dut_id: "dut-rk3576".into(),
+                    dut_id: TEST_DUT_ID.into(),
                     actions: vec![
                         DutAction::Read,
                         DutAction::SerialWrite,
@@ -1350,7 +1396,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
                 token: token_ro.clone(),
                 enabled: true,
                 grants: vec![DutGrant {
-                    dut_id: "dut-rk3576".into(),
+                    dut_id: TEST_DUT_ID.into(),
                     actions: vec![DutAction::Read],
                 }],
             },
@@ -1361,7 +1407,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let handle = spawn_http_listener_on(
         listener,
-        state,
+        state.clone(),
         Some(access),
         None,
         None,
@@ -1392,7 +1438,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let acquired = call_json(
         &client_a,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "acquire_lease", "sessionName": "alpha-flash-session", "waitMs": 2000}),
+        json!({"dutId": TEST_DUT_ID, "action": "acquire_lease", "sessionName": "alpha-flash-session", "waitMs": 2000}),
     )
     .await
     .unwrap();
@@ -1400,7 +1446,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let renewed = call_json(
         &client_a,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "renew_lease", "leaseId": lease_id}),
+        json!({"dutId": TEST_DUT_ID, "action": "renew_lease", "leaseId": lease_id}),
     )
     .await
     .unwrap();
@@ -1410,7 +1456,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let a_cmd = call_json(
         &client_a,
         "adb_exec",
-        json!({"dutId": "dut-rk3576", "op": "shell", "command": "id", "leaseId": lease_id}),
+        json!({"dutId": TEST_DUT_ID, "op": "shell", "command": "id", "leaseId": lease_id}),
     )
     .await
     .unwrap();
@@ -1429,14 +1475,14 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
         call_json(
             &client_b,
             "adb_exec",
-            json!({"dutId": "dut-rk3576", "op": "shell", "command": "uptime", "waitMs": 3000}),
+            json!({"dutId": TEST_DUT_ID, "op": "shell", "command": "uptime", "waitMs": 3000}),
         ),
         async {
             tokio::time::sleep(Duration::from_millis(200)).await;
             call_json(
                 &client_a,
                 "dut_control",
-                json!({"dutId": "dut-rk3576", "action": "release_lease", "leaseId": lease_id}),
+                json!({"dutId": TEST_DUT_ID, "action": "release_lease", "leaseId": lease_id}),
             )
             .await
         }
@@ -1458,7 +1504,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let long_lease = call_json(
         &client_a,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "acquire_lease", "sessionName": "alpha-timeout-session"}),
+        json!({"dutId": TEST_DUT_ID, "action": "acquire_lease", "sessionName": "alpha-timeout-session"}),
     )
     .await
     .unwrap();
@@ -1466,7 +1512,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let err_timeout = call_json(
         &client_b,
         "serial_exec",
-        json!({"dutId": "dut-rk3576", "text": "ls\r", "waitMs": 150}),
+        json!({"dutId": TEST_DUT_ID, "text": "ls\r", "waitMs": 150}),
     )
     .await
     .expect_err("Agent B must fail when Agent A does not release in time");
@@ -1475,7 +1521,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
         let notices = notifier.notices.lock().unwrap();
         assert_eq!(notices.len(), 1, "expected 1 human-intervention alert");
         let n = &notices[0];
-        assert_eq!(n.dut_id.as_deref(), Some("dut-rk3576"));
+        assert_eq!(n.dut_id.as_deref(), Some(TEST_DUT_ID));
         assert!(
             n.message.contains("agent-beta") && n.message.contains("agent-alpha"),
             "alert must identify both requester and holder: {}",
@@ -1487,7 +1533,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let _ = call_json(
         &client_b,
         "serial_exec",
-        json!({"dutId": "dut-rk3576", "text": "ls\r", "waitMs": 60, "notifyOnBlocked": false}),
+        json!({"dutId": TEST_DUT_ID, "text": "ls\r", "waitMs": 60, "notifyOnBlocked": false}),
     )
     .await
     .expect_err("silent probe still fails when busy");
@@ -1500,84 +1546,94 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let _ = call_json(
         &client_a,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "release_lease", "leaseId": long_id}),
+        json!({"dutId": TEST_DUT_ID, "action": "release_lease", "leaseId": long_id}),
     )
     .await
     .unwrap();
 
-    // 5) GUI holding control -> fast-fail (must NOT sleep 5s!) + desktop alert mentioning GUI.
-    lease
-        .acquire("dut-rk3576", &duthub_core::LeaseHolder::Gui, None)
-        .unwrap();
-    let t_gui = Instant::now();
-    let _ = call_json(
-        &client_b,
-        "adb_exec",
-        json!({"dutId": "dut-rk3576", "op": "shell", "command": "uname -a", "waitMs": 5000}),
-    )
-    .await
-    .expect_err("GUI lease must block Agent B");
-    assert!(
-        t_gui.elapsed() < Duration::from_secs(2),
-        "GUI-held lease should fast-fail instead of wasting waitMs: {:?}",
-        t_gui.elapsed()
-    );
-    {
-        let notices = notifier.notices.lock().unwrap();
-        let last = notices.last().unwrap();
-        assert!(
-            last.message.contains("GUI") || last.message.contains("Release control"),
-            "alert must explain GUI holds control: {}",
-            last.message
-        );
-    }
-    lease.release_for_holder("dut-rk3576", &duthub_core::LeaseHolder::Gui);
+    // Exercise all three block reasons in both languages on the same running listener.
+    for (locale, gui, manual, grant) in [
+        (
+            McpLocale::ZhCn,
+            ("需要人工介入：桌面端持有控制权", "释放控制权", "释放控制权"),
+            (
+                "需要人工介入：已开启人工接管",
+                "人工接管模式",
+                "解除人工接管",
+            ),
+            (
+                "需要人工介入：Agent 权限不足",
+                "缺少对应的 DUT 授权",
+                "授予所需的 DUT 权限",
+            ),
+        ),
+        (
+            McpLocale::EnUs,
+            (
+                "Human intervention: GUI holds DUT control",
+                "Click 'Release control'",
+                "Ask the human operator",
+            ),
+            (
+                "Human intervention: Manual takeover active",
+                "manual takeover mode is active",
+                "Release manual control",
+            ),
+            (
+                "Human intervention: Agent permission denied",
+                "missing required DUT grant",
+                "Grant the required DUT permission",
+            ),
+        ),
+    ] {
+        *state.locale.lock().unwrap() = locale;
 
-    // 6) Manual takeover active -> fast-fail + desktop alert explaining manual takeover.
-    lease.set_manual_control(true).unwrap();
-    let _ = call_json(
-        &client_b,
-        "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "reset"}),
-    )
-    .await
-    .expect_err("manual takeover must block reset");
-    {
-        let notices = notifier.notices.lock().unwrap();
-        let last = notices.last().unwrap();
+        lease.acquire(TEST_DUT_ID, &LeaseHolder::Gui, None).unwrap();
+        let t_gui = Instant::now();
+        assert_localized_block(
+            &client_b,
+            &notifier,
+            "adb_exec",
+            json!({"dutId": TEST_DUT_ID, "op": "shell", "command": "uname -a", "waitMs": 5000}),
+            "agent-beta",
+            gui,
+        )
+        .await;
         assert!(
-            last.message
-                .to_ascii_lowercase()
-                .contains("manual takeover"),
-            "alert must explain manual takeover: {}",
-            last.message
+            t_gui.elapsed() < Duration::from_secs(2),
+            "GUI-held lease should fast-fail instead of wasting waitMs: {:?}",
+            t_gui.elapsed()
         );
-    }
-    lease.set_manual_control(false).unwrap();
+        lease.release_for_holder(TEST_DUT_ID, &LeaseHolder::Gui);
 
-    // 7) Missing grant (Agent Gamma lacks Flash permission) -> alert explaining missing permission.
-    let _ = call_json(
-        &client_ro,
-        "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "flash_update", "fileId": "test.img"}),
-    )
-    .await
-    .expect_err("read-only agent must be denied flash");
-    {
-        let notices = notifier.notices.lock().unwrap();
-        let last = notices.last().unwrap();
-        assert!(
-            last.message.contains("agent-gamma") && last.message.contains("grant"),
-            "alert must explain missing grant for agent-gamma: {}",
-            last.message
-        );
+        lease.set_manual_control(true).unwrap();
+        assert_localized_block(
+            &client_b,
+            &notifier,
+            "dut_control",
+            json!({"dutId": TEST_DUT_ID, "action": "reset"}),
+            "agent-beta",
+            manual,
+        )
+        .await;
+        lease.set_manual_control(false).unwrap();
+
+        assert_localized_block(
+            &client_ro,
+            &notifier,
+            "dut_control",
+            json!({"dutId": TEST_DUT_ID, "action": "flash_update", "fileId": "test.img"}),
+            "agent-gamma",
+            grant,
+        )
+        .await;
     }
 
     // 8) Mandatory sessionName on acquire_lease + occupancy visibility via dut_list/dut_status.
     let missing_session = call_json(
         &client_a,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "acquire_lease"}),
+        json!({"dutId": TEST_DUT_ID, "action": "acquire_lease"}),
     )
     .await
     .expect_err("acquire_lease without sessionName must be rejected");
@@ -1589,7 +1645,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let lease_resp = call_json(
         &client_a,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "acquire_lease", "sessionName": "aging-stress-01"}),
+        json!({"dutId": TEST_DUT_ID, "action": "acquire_lease", "sessionName": "aging-stress-01"}),
     )
     .await
     .expect("acquire_lease with sessionName");
@@ -1597,7 +1653,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     assert!(lease_resp["acquiredAtUnixMs"].as_u64().unwrap_or(0) > 0);
     let lease_id = lease_resp["leaseId"].as_str().unwrap().to_owned();
 
-    let status_resp = call_json(&client_ro, "dut_status", json!({"dutId": "dut-rk3576"}))
+    let status_resp = call_json(&client_ro, "dut_status", json!({"dutId": TEST_DUT_ID}))
         .await
         .expect("dut_status");
     assert_eq!(status_resp["control"]["sessionName"], "aging-stress-01");
@@ -1626,7 +1682,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let _ = call_json(
         &client_a,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "release_lease", "leaseId": lease_id}),
+        json!({"dutId": TEST_DUT_ID, "action": "release_lease", "leaseId": lease_id}),
     )
     .await
     .expect("release_lease");
@@ -1636,7 +1692,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
         &client_ro,
         "agent_feedback",
         json!({
-            "dutId": "dut-rk3576",
+            "dutId": TEST_DUT_ID,
             "category": "usability",
             "severity": "medium",
             "title": "Need longer boot wait preset",
@@ -1654,7 +1710,7 @@ async fn mcp_multi_agent_arbitration_and_human_intervention_alerts() {
     let fb_files = call_json(
         &client_ro,
         "dut_files",
-        json!({"dutId": "dut-rk3576", "category": "feedback"}),
+        json!({"dutId": TEST_DUT_ID, "category": "feedback"}),
     )
     .await
     .expect("dut_files filtered by feedback");
@@ -1699,7 +1755,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
             token: token_rw.clone(),
             enabled: true,
             grants: vec![DutGrant {
-                dut_id: "dut-rk3576".into(),
+                dut_id: TEST_DUT_ID.into(),
                 actions: vec![DutAction::Read, DutAction::SerialWrite, DutAction::Reset],
             }],
         }],
@@ -1739,12 +1795,12 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     let l_grant = call_json(
         &client,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "acquire_lease", "sessionName": "smoke-test"}),
+        json!({"dutId": TEST_DUT_ID, "action": "acquire_lease", "sessionName": "smoke-test"}),
     )
     .await
     .unwrap();
     let lease_id = l_grant["leaseId"].as_str().unwrap().to_owned();
-    let st_busy = call_json(&client, "dut_status", json!({"dutId": "dut-rk3576"}))
+    let st_busy = call_json(&client, "dut_status", json!({"dutId": TEST_DUT_ID}))
         .await
         .unwrap();
     assert_eq!(st_busy["dutState"], "busy_agent");
@@ -1758,22 +1814,22 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     let _ = call_json(
         &client,
         "dut_control",
-        json!({"dutId": "dut-rk3576", "action": "release_lease", "leaseId": lease_id}),
+        json!({"dutId": TEST_DUT_ID, "action": "release_lease", "leaseId": lease_id}),
     )
     .await
     .unwrap();
 
     lease
-        .acquire("dut-rk3576", &duthub_core::LeaseHolder::Gui, None)
+        .acquire(TEST_DUT_ID, &duthub_core::LeaseHolder::Gui, None)
         .unwrap();
-    let st_gui = call_json(&client, "dut_status", json!({"dutId": "dut-rk3576"}))
+    let st_gui = call_json(&client, "dut_status", json!({"dutId": TEST_DUT_ID}))
         .await
         .unwrap();
     assert_eq!(st_gui["dutState"], "busy_gui");
-    lease.release_for_holder("dut-rk3576", &duthub_core::LeaseHolder::Gui);
+    lease.release_for_holder(TEST_DUT_ID, &duthub_core::LeaseHolder::Gui);
 
     lease.set_manual_control(true).unwrap();
-    let st_manual = call_json(&client, "dut_status", json!({"dutId": "dut-rk3576"}))
+    let st_manual = call_json(&client, "dut_status", json!({"dutId": TEST_DUT_ID}))
         .await
         .unwrap();
     assert_eq!(st_manual["dutState"], "manual_takeover");
@@ -1784,7 +1840,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     let screen_resp = call_json(
         &client,
         "serial_read",
-        json!({"dutId": "dut-rk3576", "mode": "screen"}),
+        json!({"dutId": TEST_DUT_ID, "mode": "screen"}),
     )
     .await
     .unwrap();
@@ -1799,7 +1855,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
 
     let res = client
         .read_resource(rmcp::model::ReadResourceRequestParams::new(
-            "duthub://dut/dut-rk3576/serial/screen",
+            "duthub://dut/dut-test/serial/screen",
         ))
         .await
         .expect("serial/screen resource");
@@ -1813,7 +1869,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     let stream_resp = call_json(
         &client,
         "serial_read",
-        json!({"dutId": "dut-rk3576", "tail": 20}),
+        json!({"dutId": TEST_DUT_ID, "tail": 20}),
     )
     .await
     .unwrap();
@@ -1831,7 +1887,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
 
     let tail_res = client
         .read_resource(rmcp::model::ReadResourceRequestParams::new(
-            "duthub://dut/dut-rk3576/serial/tail",
+            "duthub://dut/dut-test/serial/tail",
         ))
         .await
         .expect("serial/tail resource");
@@ -1850,13 +1906,13 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     let state_bg = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(80)).await;
-        state_bg.push_rx("root@rk3576-buildroot:/# \r\n");
+        state_bg.push_rx("root@test-board-buildroot:/# \r\n");
     });
     let waited = call_json(
         &client,
         "serial_read",
         json!({
-            "dutId": "dut-rk3576",
+            "dutId": TEST_DUT_ID,
             "sinceSeq": cursor,
             "waitRegex": "root@.*#",
             "timeoutMs": 3000
@@ -1872,7 +1928,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     let bad_key = call_json(
         &client,
         "serial_exec",
-        json!({"dutId": "dut-rk3576", "keys": ["ctrl+c", "win+r"]}),
+        json!({"dutId": TEST_DUT_ID, "keys": ["ctrl+c", "win+r"]}),
     )
     .await
     .expect_err("invalid key must fail batch");
@@ -1889,7 +1945,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     let key_ok = call_json(
         &client,
         "serial_exec",
-        json!({"dutId": "dut-rk3576", "keys": ["ctrl+c"]}),
+        json!({"dutId": TEST_DUT_ID, "keys": ["ctrl+c"]}),
     )
     .await
     .unwrap();
@@ -1903,15 +1959,15 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
     let state_re = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(60)).await;
-        state_re.push_rx("Linux rk3576 6.1.118 aarch64\r\n");
+        state_re.push_rx("Linux test-board 6.1.118 aarch64\r\n");
     });
     let re_ok = call_json(
         &client,
         "serial_exec",
         json!({
-            "dutId": "dut-rk3576",
+            "dutId": TEST_DUT_ID,
             "text": "uname -a\r",
-            "expectRegex": "Linux rk3576 [0-9]+\\.[0-9]+",
+            "expectRegex": "Linux test-board [0-9]+\\.[0-9]+",
             "timeoutMs": 3000
         }),
     )
@@ -1930,7 +1986,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
         &client,
         "serial_exec",
         json!({
-            "dutId": "dut-rk3576",
+            "dutId": TEST_DUT_ID,
             "text": "dmesg | tail\r",
             "settleMs": 220,
             "timeoutMs": 3000
@@ -1946,7 +2002,7 @@ async fn dut_state_screen_wait_and_logical_keys_work_end_to_end() {
         &client,
         "serial_exec",
         json!({
-            "dutId": "dut-rk3576",
+            "dutId": TEST_DUT_ID,
             "text": "silent_cmd",
             "expect": "NEVER_ARRIVES",
             "timeoutMs": 320,

@@ -323,11 +323,6 @@ impl Workbench {
             tray.hide_main()
         };
         if !hidden_ok {
-            // Best effort: drop a partially added icon so a later hide starts
-            // from a clean desired state.
-            if let Some(tray) = self.tray.as_ref() {
-                let _ = tray.set_icon_visible(false);
-            }
             self.hidden = false;
             self.notify_toast(crate::i18n::label("trayHideFailed"));
             cx.notify();
@@ -356,7 +351,6 @@ impl Workbench {
     pub(super) fn show_from_tray(&mut self, cx: &mut Context<Self>) {
         if let Some(tray) = self.tray.as_ref() {
             let _ = tray.show_main();
-            let _ = tray.set_icon_visible(false);
             tray.stop_taskbar_flash();
             tray.set_alert(false);
         }

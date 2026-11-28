@@ -22,9 +22,9 @@
 //!
 //! - The icon is identified by a GUID derived from the executable path, so two
 //!   copies of the app in different folders cannot delete each other's icon.
-//! - The icon only exists while the main window is hidden. `install` creates
-//!   the thread and window but adds no icon; `hide_main` adds it, `show_main`
-//!   (via `set_icon_visible(false)`) removes it.
+//! - The workbench registers the icon after installing the host on first
+//!   render. It stays registered across window visibility changes and is
+//!   removed during shutdown.
 //! - Icon operations run on the tray thread and report their real result over a
 //!   bounded reply channel, so `hide_main` can refuse to hide the window when
 //!   the shell rejected the icon. A hidden window with no icon would be
